@@ -1235,3 +1235,41 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches)
         win_cpu = cpu;
     }
 }
+
+/* ── The display's rate and the host flip grid ───────────── */
+
+/* Plain volatile 64-bit words, as s_disp_ns: one writer each. */
+static volatile LONGLONG s_display_mhz;      /* millihertz, 0 unknown */
+static volatile LONGLONG s_flip_host_ns;     /* 0: flips on the vblank */
+
+void xbox_DisplayRateSet(double hz)
+{
+    LONGLONG v = hz > 0.0 && hz < 2000.0 ? (LONGLONG)(hz * 1000.0 + 0.5) : 0;
+    if (s_display_mhz == v)
+        return;
+    s_display_mhz = v;
+    if (v)
+        XR_NOTICE("[PACING] the display refreshes at %.3f Hz\n", hz);
+}
+
+double xbox_DisplayRate(void)
+{
+    return (double)s_display_mhz / 1000.0;
+}
+
+void xbox_FlipHostRate(double hz)
+{
+    LONGLONG ns = hz >= 24.0 && hz <= 1000.0 ? (LONGLONG)(1e9 / hz + 0.5) : 0;
+    if (s_flip_host_ns == ns)
+        return;
+    s_flip_host_ns = ns;
+    if (ns)
+        XR_NOTICE("[PACING] flips held to a %.3f Hz host grid\n", hz);
+    else
+        XR_NOTICE("[PACING] flips held to the vblank again\n");
+}
+
+uint64_t xbox_FlipHostPeriodNs(void)
+{
+    return (uint64_t)s_flip_host_ns;
+}

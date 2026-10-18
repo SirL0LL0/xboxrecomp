@@ -229,6 +229,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "How strong the game's own motion blur is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
     /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game drops to 30 fps in its crash and takedown cameras. On keeps them at 60. Needs a fast machine: if 60 can't be held, the game itself slows down, not just the picture. Leave it off on a Steam Deck or other handheld.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "Two-player split screen runs at 30 fps in the original. On runs it at 60 and draws the scene twice per frame. Needs a fast machine: if 60 can't be held, the game itself slows down. Leave it off on a Steam Deck or other handheld. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_HIGH_REFRESH */ { "High refresh rate", "Draws the game at your display's refresh rate instead of 60 fps, for 120, 144 Hz and faster displays. The game itself still runs at its own 60 steps a second; cars and the camera move smoothly between them. Needs 60 fps crash cameras and 60 fps split screen on. Needs a fast machine: every frame is drawn at the full render scale.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The original plays no music in split screen. On plays EA GAMES TRAX or your custom music in two-player Race and Road Rage, as in one-player. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto uses -0.5 at 2x and -1.0 at 4x.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "Faint noise added when scaling to the window, to hide banding in smooth gradients such as the sky. Metal only for now. Text and HUD at their exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
@@ -1054,6 +1055,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_CRASH_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
             SET(XS_GRAPHICS_SPLIT_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_HIGH_REFRESH)->key))
+            SET(XS_GRAPHICS_HIGH_REFRESH);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_RACE_CLOCK)->key))
             SET(XS_GAME_RACE_CLOCK);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
@@ -1496,6 +1499,22 @@ static void changed()
     s_save_at = now_ms() + 600;
 }
 
+/* A setting that works only with others on: locked until they are.
+ * High refresh rate needs both 60 fps switches (the title's 30 Hz phases
+ * would otherwise run their simulation once a frame at the display's rate). */
+static bool needs_unmet(xs_id id)
+{
+    if (id == XS_GRAPHICS_HIGH_REFRESH)
+        return xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0.0
+            || xbox_SettingValue(XS_GRAPHICS_SPLIT_60FPS) == 0.0;
+    return false;
+}
+
+static bool row_locked(xs_id id)
+{
+    return xbox_SettingGet(id)->locked || needs_unmet(id);
+}
+
 /* Left/right on a setting (dir -1/+1). */
 static void adjust(xs_id id, int dir)
 {
@@ -1503,7 +1522,7 @@ static void adjust(xs_id id, int dir)
     const Meta &m = k_meta[id];
     double v = s->value;
 
-    if (s->locked)
+    if (row_locked(id))
         return;
     switch (s->type) {
     case XS_BOOL:
@@ -3631,7 +3650,7 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     const xs_setting *s = xbox_SettingGet(r.id);
     const Meta &m = k_meta[r.id];
     char v[96];
-    const bool dim = s->locked;
+    const bool dim = row_locked(r.id);
     const ImU32 vc = dim ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text);
     value_text(r.id, v, sizeof v);
     {

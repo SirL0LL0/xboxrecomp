@@ -84,7 +84,7 @@ extern "C" {
     X(PRESENT_OVERSCAN,  CONFIG, "RECOMP_PRESENT_OVERSCAN",  NULL, "crop: show the 640x448 area a TV showed (y 16..464), cropping the sides alike so the aspect holds (Vulkan, Metal windows)") \
     X(PRESENT_FIT,       CONFIG, "RECOMP_PRESENT_FIT",       NULL, "fill16x10: fill the window's height, cropping the frame's sides (the Deck's 16:10 panel) (Vulkan, Metal windows)") \
     X(PRESENT_EARLY,     CONFIG, "RECOMP_PRESENT_EARLY",     NULL, "1: frames go to the host at FLIP_STALL, before the vblank hold (lower latency, same pacing)") \
-    X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); default off") \
+    X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); host:<Hz>: the same, and the rate of the host grid a title asks for (xbox_FlipHostRate) in place of the display's, for a run without a display; default off") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
     X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
@@ -129,6 +129,7 @@ extern "C" {
     X(GFX_BLOOM,         CONFIG, "RECOMP_GFX_BLOOM",         NULL, "0 to 1: the strength of the title's own bloom (glow); 0 skips its passes, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
     X(GFX_MOTION_BLUR,   CONFIG, "RECOMP_GFX_MOTION_BLUR",   NULL, "0 to 1: the strength of the title's own motion blur; 0 is not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
     X(GFX_CRASH_60FPS,   CONFIG, "RECOMP_GFX_CRASH_60FPS",   NULL, "1: the title's 30 Hz phases (crash and takedown cameras) run at 60, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
+    X(GFX_HIGH_REFRESH,  CONFIG, "RECOMP_GFX_HIGH_REFRESH",  NULL, "1: frames at the display's refresh rate, the simulation at its own 60 steps a second and the pictures between steps blended, for a title whose build has that behind a switch (recomp_patch.h); default 0, as shipped") \
     X(GFX_SPLIT_60FPS,   CONFIG, "RECOMP_GFX_SPLIT_60FPS",   NULL, "1: the title's 30 Hz split screen runs at 60, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(AUDIO_SPLIT_MUSIC, CONFIG, "RECOMP_AUDIO_SPLIT_MUSIC", NULL, "1: the title's music plays in split screen too, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped (no music there)") \
     X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \

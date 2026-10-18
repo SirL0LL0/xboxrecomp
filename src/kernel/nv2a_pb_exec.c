@@ -5993,6 +5993,18 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
  * from the kernel's vblank clock, so this needs RECOMP_VBLANK; without a
  * vblank arriving the wait gives up and the pacing turns itself off. */
 static int      s_flip_pacing = -1;   /* -1 unread, 0 off, 1 on */
+/* The host grid: while the title asks for it (xbox_FlipHostRate,
+ * kernel_pacing.h: graphics.high_refresh), a flip is held to a grid of host
+ * time at the display's rate instead of to the swap's vblank;
+ * RECOMP_FLIP_PACING=host:<Hz> gives the rate instead (a run without a
+ * display) and is vblank pacing otherwise. The emulated vblank goes on at
+ * 60 Hz for everything else that counts it (the XMV player, D3D's vblank
+ * counter); only the flip is no longer tied to it. For a title whose
+ * simulation keeps its own clock between flips: one that steps once a flip
+ * runs fast. */
+static uint64_t s_host_env_ns;        /* RECOMP_FLIP_PACING=host:<Hz>, 0 none */
+static uint64_t s_host_due_ns;        /* the grid's next edge */
+static int      s_host_pending;       /* the pending swap is on the grid */
 /* RECOMP_TRACE=pacing: what the swaps asked for and what the executor did,
  * per window of flips (pace_report). Counted whether pacing is on or not. */
 static struct {
@@ -6041,7 +6053,19 @@ static int flip_pacing_on(void)
     }
     if (s_flip_pacing < 0) {
         const char *e = recomp_env(RENV_FLIP_PACING);
-        s_flip_pacing = e && !strcmp(e, "vblank");
+        /* host:<Hz> is vblank pacing too, while the title asks for no grid. */
+        s_flip_pacing = e && (!strcmp(e, "vblank") || !strncmp(e, "host:", 5));
+        if (e && !strncmp(e, "host:", 5)) {
+            double hz = atof(e + 5);
+            if (hz >= 24.0 && hz <= 1000.0) {
+                s_host_env_ns = (uint64_t)(1e9 / hz + 0.5);
+                fprintf(stderr, "  [GPU] flip pacing: a %.3f Hz host grid while the title"
+                        " asks for one (RECOMP_FLIP_PACING=%s)\n", hz, e);
+            } else {
+                fprintf(stderr, "  [GPU] RECOMP_FLIP_PACING=%s: the rate is 24 to 1000 Hz;"
+                        " the display's is used\n", e);
+            }
+        }
         if (s_flip_pacing)
             fprintf(stderr, "  [GPU] flip pacing: FLIP_STALL holds until the"
                     " swap's vblank (RECOMP_FLIP_PACING=vblank)\n");
@@ -6081,8 +6105,33 @@ static void flip_pacing_swap(uint32_t param)
     s_pace.swaps++;
     s_last_iv = arg & 7;
     s_last_late = 0;
-    if (!flip_pacing_on())
-        return;
+    {
+        int vb = flip_pacing_on();
+        uint64_t per = xbox_FlipHostPeriodNs();
+
+        /* host:<Hz> stands in for the display's rate, while the title asks. */
+        if (per && s_host_env_ns)
+            per = s_host_env_ns;
+
+        if (per && (arg & 7)) {
+            /* The next edge of the host grid; a frame later than a whole
+             * period starts the grid again from now, as a late swap does. */
+            uint64_t t = xbox_HostNowNs();
+            s_host_due_ns += per;
+            if (s_host_due_ns + per < t || s_host_due_ns > t + 2 * per) {
+                s_pace.late++;
+                s_last_late = 1;
+                s_host_due_ns = t;
+            }
+            s_host_pending = 1;
+            s_swap_pending = 1;
+            /* The vblank schedule starts again from now when the grid ends. */
+            s_swap_last = xbox_VblankCount();
+            return;
+        }
+        if (!vb)
+            return;
+    }
     now = xbox_VblankCount();
     target = s_swap_last + (arg & 7);
     s_swap_asked = target;
@@ -6108,6 +6157,17 @@ static void flip_pacing_stall(void)
         return;
     s_swap_pending = 0;
     t0 = xbox_HostNowNs();
+    if (s_host_pending) {
+        s_host_pending = 0;
+        /* Sleep to a millisecond before the edge, then spin: a sleep
+         * alone wakes up to a millisecond late, a whole frame at 1000 Hz. */
+        uint64_t t;
+        while ((t = xbox_HostNowNs()) < s_host_due_ns) {
+            if (s_host_due_ns - t > 1500000ull)
+                xbox_HostSleepNs(s_host_due_ns - t - 1000000ull);
+        }
+        goto done;
+    }
     /* present.pacing=sleep: block on the vblank's condition variable (the
      * timer thread signals it) instead of polling every 250 us. */
     /* And in a run that does not wait for the clock (host_time.h): the
