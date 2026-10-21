@@ -107,6 +107,18 @@ void xbox_PacingFlipCadence(uint32_t interval, int late, uint64_t hold_total,
  * makes its frame-queue keeper start over: called on the executor's thread
  * at a reset, it sets flags and returns. At most 4. */
 void xbox_PacingResetHook(void (*fn)(void));
+
+/* The display the window is on refreshes at this rate (Hz, 0 unknown): the
+ * presenter's event loop sets it from the window's display mode, again when
+ * the window moves to another display or the mode changes. */
+void   xbox_DisplayRateSet(double hz);
+double xbox_DisplayRate(void);
+
+/* A title that keeps its simulation's own clock between flips asks for its
+ * flips to be held to a host grid at this rate (Hz) instead of to the swap's
+ * vblank (graphics.high_refresh); 0 goes back to the vblank. Any thread. */
+void     xbox_FlipHostRate(double hz);
+uint64_t xbox_FlipHostPeriodNs(void);   /* the grid's period, 0 none */
 /* Reset the pacing state now (a settings change: Frame pacing, Power mode):
  * the keeper hooks and the display lock, at the executor's next flip. Any
  * thread. One always-printed line, "<why>: ... start over". */

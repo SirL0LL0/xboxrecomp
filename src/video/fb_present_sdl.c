@@ -118,6 +118,29 @@
 
 extern uint64_t xbox_PacingFrameVblankNs(void);   /* src/kernel/kernel_pacing.c */
 extern void xbox_PacingSetVisible(int visible);   /* src/kernel/kernel_pacing.c */
+extern void xbox_DisplayRateSet(double hz);       /* src/kernel/kernel_pacing.c */
+
+/* The refresh rate of the display the window is on, for a title that holds
+ * its flips to it (graphics.high_refresh): read twice a second, so a window
+ * moved to another display or a mode change is followed. An exclusive
+ * fullscreen window's own mode, else the display's. SDL2 gives whole Hz
+ * (175 for a 174.96 Hz panel). */
+static void display_rate_poll(SDL_Window *win)
+{
+    static Uint32 last;
+    Uint32 now = SDL_GetTicks();
+    SDL_DisplayMode dm;
+    int di;
+
+    if (!win || (last && now - last < 500))
+        return;
+    last = now;
+    di = SDL_GetWindowDisplayIndex(win);
+    if ((SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN
+            ? SDL_GetWindowDisplayMode(win, &dm) == 0
+            : di >= 0 && SDL_GetCurrentDisplayMode(di, &dm) == 0)
+        xbox_DisplayRateSet(dm.refresh_rate > 0 ? (double)dm.refresh_rate : 0.0);
+}
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
@@ -1488,6 +1511,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
 #endif
     while (!quit && !guest_done) {
+        display_rate_poll(win);
         if (__atomic_load_n(&s_gfx_lost, __ATOMIC_ACQUIRE) == 1) {
             __atomic_store_n(&s_gfx_lost, 2, __ATOMIC_RELEASE);
             gfx_lost_say();
