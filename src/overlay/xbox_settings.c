@@ -10,6 +10,7 @@
 #include "pad_glyphs.h"
 #include "touch_pad.h"
 #include "kernel_pacing.h"
+#include "kernel.h"             /* xbox_SetLanguage: the EEPROM's language */
 #include "nv2a_backend_common.h"
 #include "nv2a_texscale.h"
 #include "apu_xaudio2.h"
@@ -56,6 +57,14 @@ static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", N
 static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
+/* The dashboard's languages, in the console's EEPROM order. The title
+ * reads the number and looks it up in its own table, so a title that
+ * renumbers them needs its own (RECOMP_XBOX_LANGUAGE_ENCODING). */
+static const char *const k_language[] = {
+    "english", "french", "german", "italian", "spanish", "japanese",
+    "korean", "chinese_traditional", "chinese_simplified", "portuguese",
+    "dutch", "swedish", NULL
+};
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
 static const char *const k_glyphs[]   = { "auto", "xbox", "xbox_modern", "playstation", "playstation5", "nintendo", "steam", "positional", "keyboard", NULL };
@@ -116,6 +125,10 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GAME_SPEED_UNITS]   = SETTING("game.speed_units", XS_CHOICE, 0, RENV_SPEED_UNITS, k_units, NULL, 0, 0, 0),
     [XS_DISPLAY_HUD_FIX]    = SETTING("display.hud_fix", XS_BOOL, 0, RENV_GFX_HUD_FIX, NULL, NULL, 0, 0, 0),
     [XS_DISPLAY_ULTRAWIDE]  = SETTING("display.ultrawide", XS_CHOICE, 0, RENV_DISPLAY_ULTRAWIDE, k_ultrawide, NULL, 0, 0, 0),
+    /* The dashboard's language: the title reads it from the EEPROM at
+     * start-up and picks the text, the speech and the films of it. A
+     * language the disc does not carry falls back to the title's own. */
+    [XS_DISPLAY_LANGUAGE]   = SETTING("display.language", XS_CHOICE, 0, RENV_XBOX_LANGUAGE, k_language, NULL, 0, 0, 0),
     /* The title's own effects, full strength as shipped (BO-101, BO-212):
      * 0..1 in tenths, 1 the original, 0 not drawn. They were switches: a
      * file's or variable's true / false still reads as 1 / 0. */
@@ -505,6 +518,11 @@ static void apply(xs_id id)
         break;
     case XS_INPUT_CONTROL_SCHEME:
         xbox_InputSetControlScheme((int)v);
+        break;
+    case XS_DISPLAY_LANGUAGE:
+        /* The title reads the language from the EEPROM at start-up, so a
+         * change here shows after a restart. */
+        xbox_SetLanguage(k_language[(int)v]);
         break;
 #if defined(__ANDROID__)
     case XS_INPUT_TOUCH:

@@ -101,6 +101,7 @@ typedef enum {
     XS_GRAPHICS_HDR_DECODE,  /* Vulkan: 2.2 / srgb, how 8-bit values become light (no row) */
     XS_DISPLAY_FRAME_PACING, /* auto / low_latency / smooth: the present queue (fb_present_vulkan.c, BO-110) */
     XS_GAME_RACE_CLOCK,      /* an opt-in guest patch: a race keeps real time on a slow host from its start, off as shipped */
+    XS_DISPLAY_LANGUAGE,     /* the dashboard's language the title reads at start-up */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
