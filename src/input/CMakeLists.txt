@@ -41,29 +41,43 @@ endif()
 
 # The mapping table, deadzone and connection cache, against a fake backend
 # (every host, no device needed).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_map
                  ${CMAKE_CURRENT_BINARY_DIR}/input_map)
+endif()
 # Which button prompts go with the pad in use (every host, pure).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pad_glyphs
                  ${CMAKE_CURRENT_BINARY_DIR}/pad_glyphs)
+endif()
 # The rumble curve: peak, gate, strength, release, the vibrator's steps
 # (every host, pure arithmetic).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_rumble
                  ${CMAKE_CURRENT_BINARY_DIR}/input_rumble)
+endif()
 # The on-screen controls and their merge into port 0 (every host, pure).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_touch
                  ${CMAKE_CURRENT_BINARY_DIR}/input_touch)
+endif()
 # The key map and its README table (every host, no SDL), and the SDL key
 # and focus rules against synthetic events (POSIX).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard
                  ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard)
+endif()
 if(XR_SDL_HOST)
+if(XBOXRECOMP_BUILD_TESTS)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard_sdl
                      ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard_sdl)
+endif()
     if(NOT WIN32 AND NOT ANDROID)
         # The SDL pad backend's rumble against a virtual controller: no gap
         # while held, an end by itself, stopped at every exit.
+if(XBOXRECOMP_BUILD_TESTS)
         add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_rumble_sdl
                          ${CMAKE_CURRENT_BINARY_DIR}/input_rumble_sdl)
+endif()
     endif()
 endif()

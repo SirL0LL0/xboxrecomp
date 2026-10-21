@@ -41,6 +41,12 @@ if(WIN32 AND XBOXRECOMP_WIN_VULKAN)
     add_compile_definitions(XBOXRECOMP_WIN_VULKAN=1)
 endif()
 
+# The toolkit's own unit tests. They are built with the toolkit as a
+# project; a title that pulls it in (add_subdirectory) does not need them,
+# and a few of them do not build on every host (the POSIX-only ones, the SDL
+# main one). OFF skips them.
+option(XBOXRECOMP_BUILD_TESTS "Build the toolkit's own unit tests" ON)
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN

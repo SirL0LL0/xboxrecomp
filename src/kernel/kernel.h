@@ -1217,6 +1217,14 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 void  xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode);
 ULONG xbox_GetVideoSettings(void);
 
+/* The dashboard's language setting (the EEPROM's XC_LANGUAGE). The name is
+ * the language ("english", "italian", "french", ...) or the number of the
+ * EEPROM encoding, in the encoding RECOMP_XBOX_LANGUAGE_ENCODING names
+ * ("ntsc", the console's, by default; "pal", a title that renumbers the
+ * languages). Call it before the guest starts. */
+void  xbox_SetLanguage(const char *name);
+ULONG xbox_GetLanguage(void);
+
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);
 VOID    __stdcall xbox_Unknown_23(void);

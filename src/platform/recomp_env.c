@@ -26,6 +26,22 @@ static const EnvKey s_keys[RENV_COUNT] = {
 const char *recomp_env_value_[RENV_COUNT];
 volatile int recomp_env_ready_;
 
+/* The variable the RECOMP_* name is (RENV_NONE when it is not one of the
+ * runtime's). A title that sets a default from code needs it: the runtime
+ * reads the environment once, so a default set afterwards reaches the
+ * environment but not the runtime's table. */
+recomp_env_id recomp_env_id_of(const char *name)
+{
+    int i;
+
+    if (!name || !*name)
+        return RENV_NONE;
+    for (i = 0; i < RENV_COUNT; i++)
+        if (!strcmp(s_keys[i].name, name))
+            return (recomp_env_id)i;
+    return RENV_NONE;
+}
+
 static const char *const s_list_var[] = { NULL, "RECOMP_TRACE", "RECOMP_DEBUG" };
 
 /* Values are owned copies; on reload the old ones are leaked on purpose (a

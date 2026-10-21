@@ -90,15 +90,21 @@ if(NOT MSVC)
 endif()
 
 # Check for updates: the JSON fields, the tag comparison, the answer.
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/overlay_update
                  ${CMAKE_CURRENT_BINARY_DIR}/overlay_update)
+endif()
 
 # settings.toml: the file, the precedence, the power mode's two knobs.
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/overlay_settings
                  ${CMAKE_CURRENT_BINARY_DIR}/overlay_settings)
+endif()
 
 # The overlay off screen, with synthetic events (macOS): ninja overlay_shot.
 if(APPLE)
+if(XBOXRECOMP_BUILD_TESTS)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/overlay_shot
                      ${CMAKE_CURRENT_BINARY_DIR}/overlay_shot)
+endif()
 endif()

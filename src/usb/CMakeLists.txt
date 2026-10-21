@@ -16,5 +16,7 @@ endif()
 
 # A pad script and a controller on the same pad, against a fake input
 # backend (every host, no device needed).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pad_script
                  ${CMAKE_CURRENT_BINARY_DIR}/pad_script)
+endif()

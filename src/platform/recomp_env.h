@@ -62,6 +62,8 @@ extern "C" {
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
     X(DISPLAY_WIDESCREEN, CONFIG, "RECOMP_DISPLAY_WIDESCREEN", NULL, "enhancements: display.widescreen, the dashboard's 16:9 setting the title reads (1/0)") \
     X(DISPLAY_HDTV,      CONFIG, "RECOMP_DISPLAY_HDTV",      NULL, "enhancements: display.hdtv, the dashboard's HDTV modes: off (stock), 480p, 720p, 1080i (each with those below)") \
+    X(XBOX_LANGUAGE,     CONFIG, "RECOMP_XBOX_LANGUAGE",     NULL, "enhancements: display.language, the dashboard's language the title reads at start-up: english, french, german, italian, spanish, japanese, korean, chinese_traditional, chinese_simplified, portuguese, dutch, swedish") \
+    X(XBOX_LANGUAGE_ENCODING, CONFIG, "RECOMP_XBOX_LANGUAGE_ENCODING", NULL, "the numbering of the languages: ntsc (the console's, by default) or pal (a title that renumbers them)") \
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_ASPECT,    CONFIG, "RECOMP_PRESENT_ASPECT",    NULL, "enhancements: present.aspect, the window's frame shape: auto (stock; 16:9 with display.widescreen), frame, 4:3, 16:9") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
@@ -408,7 +410,8 @@ typedef enum {
 #define RECOMP_ENV_ENUM_(id, tier, name, legacy, help) RENV_##id,
     RECOMP_ENV_KEYS(RECOMP_ENV_ENUM_)
 #undef RECOMP_ENV_ENUM_
-    RENV_COUNT
+    RENV_COUNT,
+    RENV_NONE = -1        /* not a variable of the runtime */
 } recomp_env_id;
 
 /* Read the environment into the cache. Idempotent; the first lookup calls
@@ -424,6 +427,12 @@ void recomp_env_reload(void);
 
 /* Override a value from code (NULL clears it). Takes a copy. */
 void recomp_env_set(recomp_env_id id, const char *value);
+
+/* The variable the RECOMP_* name is (RENV_NONE when it is not one of the
+ * runtime's). A title that sets a default from code needs it: the runtime
+ * reads the environment once, so a default set afterwards reaches the
+ * environment but not the runtime's table. */
+recomp_env_id recomp_env_id_of(const char *name);
 
 extern const char *recomp_env_value_[RENV_COUNT];
 extern volatile int recomp_env_ready_;

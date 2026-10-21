@@ -38,6 +38,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
     enhance_cfg_bind_env("display.widescreen", RENV_DISPLAY_WIDESCREEN);
     enhance_cfg_bind_env("display.hdtv", RENV_DISPLAY_HDTV);
+    enhance_cfg_bind_env("display.language", RENV_XBOX_LANGUAGE);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.aspect", RENV_PRESENT_ASPECT);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);

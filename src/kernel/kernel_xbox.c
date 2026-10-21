@@ -11,7 +11,9 @@
 
 #include "kernel.h"
 #include "apu.h"                /* mcpx_apu_xc_audio: XC_AUDIO */
+#include <ctype.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -127,6 +129,114 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
 
+/* ============================================================================
+ * The dashboard's language setting
+ * ==========================================================================*/
+
+/* The language names the setting is given by, and the number of the Xbox
+ * EEPROM encoding each means. The numbers are the console's: a title reads
+ * the number and looks it up in its own table, so a title that keeps its
+ * own numbering (Burnout 3's PAL build, which reads 6 for Italian) needs
+ * the number of that table, not this one. A title that renumbers tells
+ * the toolkit so (RECOMP_XBOX_LANGUAGE_ENCODING).
+ */
+typedef struct {
+    const char *name;
+    ULONG code;             /* the console's EEPROM encoding */
+    ULONG alt;              /* the same language in the PAL build's encoding */
+} xbox_language_entry;
+
+static const xbox_language_entry s_languages[] = {
+    { "japanese",           0,  2 },
+    { "english",            1,  1 },
+    { "german",             2,  3 },
+    { "french",             3,  4 },
+    { "spanish",            4,  5 },
+    { "italian",            5,  6 },
+    { "korean",             6,  7 },
+    { "chinese_traditional", 7, 8 },
+    { "chinese_simplified", 8,  9 },
+    { "portuguese",         9, 10 },
+    { "dutch",             10, 11 },
+    { "swedish",           11, 12 },
+};
+
+static int word_is(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb)
+            return 0;
+    }
+    return !*a && !*b;
+}
+
+/* The number the EEPROM carries for the language named in `text`.
+ *
+ * The name is matched first ("italian"), then a number, which is taken as
+ * it is (the console's encoding, unless RECOMP_XBOX_LANGUAGE_ENCODING says
+ * the title renumbers, in which case the number is looked up in that
+ * encoding and translated). An unknown name falls back to English. */
+static ULONG xbox_language_code(const char *text)
+{
+    size_t i;
+    int pal_encoding = 0;
+    const char *enc = getenv("RECOMP_XBOX_LANGUAGE_ENCODING");
+    long parsed;
+
+    if (!text || !*text)
+        return 1;                          /* English */
+
+    if (enc && (word_is(enc, "pal") || word_is(enc, "europe")))
+        pal_encoding = 1;
+
+    for (i = 0; i < sizeof s_languages / sizeof s_languages[0]; i++) {
+        if (word_is(text, s_languages[i].name))
+            return pal_encoding ? s_languages[i].alt : s_languages[i].code;
+    }
+
+    /* A number: the console's encoding, or the title's own. */
+    parsed = strtol(text, NULL, 10);
+    if (text[0] >= '0' && text[0] <= '9' && parsed >= 0 && parsed <= 11) {
+        if (pal_encoding) {
+            /* The number is the PAL build's; translate it to the console's. */
+            for (i = 0; i < sizeof s_languages / sizeof s_languages[0]; i++)
+                if (s_languages[i].alt == (ULONG)parsed)
+                    return s_languages[i].code;
+            return (ULONG)parsed;
+        }
+        return (ULONG)parsed;
+    }
+
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
+        "RECOMP_XBOX_LANGUAGE='%s' is not a language; English", text);
+    return 1;                              /* English */
+}
+
+/* The language the EEPROM carries. Set by the title (xbox_SetLanguage),
+ * else RECOMP_XBOX_LANGUAGE, else English. */
+static ULONG g_xc_language = 0xFFFFFFFFu;
+
+void xbox_SetLanguage(const char *name)
+{
+    g_xc_language = xbox_language_code(name);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_XBOX,
+        "EEPROM language: %s -> %u", name ? name : "(none)", (unsigned)g_xc_language);
+}
+
+ULONG xbox_GetLanguage(void)
+{
+    if (g_xc_language != 0xFFFFFFFFu)
+        return g_xc_language;
+    {
+        const char *lang = getenv("RECOMP_XBOX_LANGUAGE");
+        if (lang && *lang)
+            return xbox_language_code(lang);
+    }
+    return 1;                              /* English */
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -138,9 +248,24 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
+        /* The language the dashboard would have set in the EEPROM.
+         *
+         * RECOMP_XBOX_LANGUAGE names it ("english", "italian", "french",
+         * ...) and the number of the Xbox EEPROM encoding is accepted too.
+         * The numbers are the console's (the table the title reads at
+         * 0x3A7BC4 in the NTSC-U executable):
+         *
+         *   0=Japanese 1=English 2=German  3=French 4=Spanish 5=Italian
+         *   6=Korean   7=Chinese (Traditional) 8=Chinese (Simplified)
+         *   9=Portuguese
+         *
+         * A title reads the number and looks it up in its own table, so the
+         * number that means "Italian" is the console's, not the title's.
+         * A title that keeps its own numbering (the PAL build of Burnout 3
+         * reads 6 for Italian) needs its own table; the title says which
+         * numbering it uses (RECOMP_XBOX_LANGUAGE_ENCODING). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_GetLanguage();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

@@ -36,14 +36,20 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
         ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
+if(XBOXRECOMP_BUILD_TESTS)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+endif()
     # D3DCompile under the host's d3dcompiler_47 (Wine's, under Proton).
+if(XBOXRECOMP_BUILD_TESTS)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3dcompile_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3dcompile_smoke)
+endif()
     # The pushbuffer executor's D3D11 backend, driven by a synthetic stream.
+if(XBOXRECOMP_BUILD_TESTS)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d11_backend_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d11_backend_smoke)
+endif()
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_vsh_parse.c
@@ -116,8 +122,10 @@ else()
         # comes with it, as this C program's link would not add it.
         # The GLSL emitters' output through glslang (no device needed).
         if(NOT WIN32)
+if(XBOXRECOMP_BUILD_TESTS)
             add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_glsl_split
                              ${CMAKE_CURRENT_BINARY_DIR}/d3d8_glsl_split)
+endif()
         endif()
         get_target_property(_xr_glslang_type glslang::glslang TYPE)
         if(_xr_glslang_type STREQUAL "STATIC_LIBRARY")
@@ -151,8 +159,10 @@ else()
     # The executor's backend, driven by a synthetic stream: Metal or Vulkan
     # against the CPU rasteriser, frame by frame.
     if(NOT WIN32 AND (APPLE OR XBOXRECOMP_HAVE_VULKAN))
+if(XBOXRECOMP_BUILD_TESTS)
         add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_backend_smoke
                          ${CMAKE_CURRENT_BINARY_DIR}/nv2a_backend_smoke)
+endif()
     endif()
 endif()
 
@@ -161,8 +171,10 @@ target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # The CPU rasteriser's texture cache, driven by a synthetic stream (POSIX:
 # the Proton test set does not run it).
 if(NOT WIN32)
+if(XBOXRECOMP_BUILD_TESTS)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_tex_cache
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_tex_cache)
+endif()
 endif()
 
 # The cut-out textures' levels (src/kernel/nv2a_texmip.c, BO-171) are the
@@ -173,25 +185,33 @@ target_sources(xbox_d3d8 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../kernel/nv2a_texmip
 # Regions of a title's textures replaced at upload (src/kernel/nv2a_texrep.c:
 # the button prompts for the pad in use), against synthetic textures (every
 # host, no GPU).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texrep
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texrep)
+endif()
 
 # A title's 2D art scaled before upload (src/kernel/nv2a_texscale.c,
 # graphics.ui_scale): the scalers and the rule, against synthetic textures
 # (every host, no GPU).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texscale
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texscale)
+endif()
 
 # The lower levels of alpha-tested textures made again with their alpha
 # coverage (src/kernel/nv2a_texmip.c, BO-171), against synthetic textures
 # (every host, no GPU).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texmip
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texmip)
+endif()
 
 # The HLSL the parse -> generate pipeline emits, against recorded hashes
 # (every host: the emitters are API-free).
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_hlsl_split
                  ${CMAKE_CURRENT_BINARY_DIR}/d3d8_hlsl_split)
+endif()
 
 if(MSVC)
     target_compile_options(xbox_d3d8 PRIVATE /W4 /O2)
@@ -200,5 +220,7 @@ else()
 endif()
 # The MSL emitters' (d3d8_msl.h) hash test; it builds on every host, and on
 # macOS also compiles each case with Metal.
+if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_msl_split
                  ${CMAKE_CURRENT_BINARY_DIR}/d3d8_msl_split)
+endif()
