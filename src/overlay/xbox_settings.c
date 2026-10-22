@@ -12,6 +12,7 @@
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_texscale.h"
+#include "nv2a_texup.h"
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
 #include "apu_bus.h"
@@ -43,7 +44,7 @@ static void sx_setenv_keep(const char *n, const char *v)
 static const char *const k_aspects[]  = { "4:3", "16:9", NULL };
 static const char *const k_aspect_env[] = { "0", "1", NULL };
 static const char *const k_filters[]  = { "nearest", "linear", "integer", NULL };
-static const char *const k_overscan[] = { "off", "crop", NULL };
+static const char *const k_overscan[] = { "off", "crop", "fill", NULL };
 static const char *const k_fits[]     = { "letterbox", "fill16x10", NULL };
 static const char *const k_speakers[] = { "auto", "stereo", "5.1", NULL };
 #if defined(__ANDROID__)
@@ -52,6 +53,8 @@ static const char *const k_scale[]    = { "1", "1.5", "2", "3", "4", NULL };
 static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
 static const char *const k_ui_scale[] = { "off", "2x", "4x", NULL };
+static const char *const k_texup[]    = { "off", "fsrcnnx", "nnedi3", NULL };
+static const char *const k_texup_sc[] = { "2x", "4x", NULL };
 static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
@@ -68,9 +71,16 @@ static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_scenery_detail[] = { "original", "far", NULL };
 static const char *const k_score_board[] = { "original", "smooth", NULL };
+static const char *const k_rival_marker[] = { "original", "farther", NULL };
+static const char *const k_crashnav_map[] = { "stretched", "native", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", "auto", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 static const char *const k_timing[]   = { "legacy", "auto", NULL };
+#if defined(__APPLE__)
+#define XS_TIMING_BUILTIN 1   /* auto (BO-239) */
+#else
+#define XS_TIMING_BUILTIN 0
+#endif
 static const char *const k_frame_pacing[] = { "auto", "low_latency", "smooth", NULL };
 static const char *const k_custom_level[] = { "off", "quieter", "match", "louder", NULL };
 static const char *const k_hdr_decode[] = { "2.2", "srgb", NULL };
@@ -127,6 +137,7 @@ static xs_setting s_set[XS_COUNT] = {
     /* Split screen at 60 instead of the title's 30, and with the title's
      * music, which it keeps silent there: the patch is the "1" of each. */
     [XS_GRAPHICS_SPLIT_60FPS] = SETTING("graphics.split_60fps", XS_BOOL, 0, RENV_GFX_SPLIT_60FPS, NULL, NULL, 0, 0, 0),
+    [XS_GRAPHICS_HIGH_REFRESH] = SETTING("graphics.high_refresh", XS_BOOL, 0, RENV_GFX_HIGH_REFRESH, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_SPLIT_MUSIC]  = SETTING("audio.split_music", XS_BOOL, 0, RENV_AUDIO_SPLIT_MUSIC, NULL, NULL, 0, 0, 0),
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
@@ -145,8 +156,9 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_LFE_LOWPASS]  = SETTING("audio.lfe_lowpass", XS_CHOICE, 0, RENV_AUDIO_LFE_LOWPASS, k_lfe_lowpass, NULL, 0, 0, 3),
     /* When frames are presented (present_cadence.h, BO-115): legacy is
      * "when ready", as before; auto aims each frame at one refresh. Taken
-     * while running (the presenter looks twice a second). */
-    [XS_DISPLAY_PRESENT_TIMING] = SETTING("display.present_timing", XS_CHOICE, 0, RENV_PRESENT_TIMING, k_timing, NULL, 0, 0, 0),
+     * while running (the presenter looks twice a second). auto on macOS,
+     * where the Metal presenter takes it as the default too (BO-239). */
+    [XS_DISPLAY_PRESENT_TIMING] = SETTING("display.present_timing", XS_CHOICE, 0, RENV_PRESENT_TIMING, k_timing, NULL, 0, 0, XS_TIMING_BUILTIN),
     [XS_ADVANCED_PERF_STEPS] = SETTING("advanced.perf_steps", XS_BOOL, 0, RENV_OVERLAY_PERF_STEPS, NULL, NULL, 0, 0, 0),
     /* The print gate (xr_log.h, BO-125). The built-in value is the build's:
      * on in a developer build, off in a release (set at load). Live. */
@@ -163,6 +175,14 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's score board (a host hook, BO-165):
      * original as shipped, nothing touched. Live. */
     [XS_DISPLAY_SCORE_BOARD] = SETTING("display.score_board", XS_CHOICE, 0, RENV_GFX_SCORE_BOARD, k_score_board, NULL, 0, 0, 0),
+    /* Where the marker over a rival changes from its far look to its near
+     * one (a guest patch at "farther"); original as shipped. Live. */
+    [XS_DISPLAY_RIVAL_MARKER] = SETTING("display.rival_marker", XS_CHOICE, 0, RENV_GFX_RIVAL_MARKER, k_rival_marker, NULL, 0, 0, 0),
+    /* With display.hud_fix in 16:9, a map screen of the title's (Burnout 3:
+     * Crash Nav's Select Location) drawn across the picture with its route
+     * and markers, or kept 4:3 with the rest of the menu (BO-222). Stretched
+     * as shipped. Live. */
+    [XS_DISPLAY_CRASHNAV_MAP] = SETTING("display.crashnav_map", XS_CHOICE, 0, RENV_DISPLAY_CRASHNAV_MAP, k_crashnav_map, NULL, 0, 0, 0),
     /* The title's own menu sounds in the overlay (BO-190): on as shipped
      * when the port names them. Live. */
     [XS_AUDIO_MENU_SOUNDS]  = SETTING("audio.menu_sounds", XS_BOOL, 0, RENV_AUDIO_MENU_SOUNDS, NULL, NULL, 0, 0, 1),
@@ -176,7 +196,18 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_DISPLAY_FRAME_PACING] = SETTING("display.frame_pacing", XS_CHOICE, 0, RENV_FRAME_PACING, k_frame_pacing, NULL, 0, 0, 0),
     /* The title's wall-clock stepping from a race's start instead of from
      * its first crash camera: the patch is the "1". Off as shipped. */
+    /* BO-245: off as shipped (the title's textures). Live. */
+    [XS_GRAPHICS_TEXUP]     = SETTING("graphics.texture_upscale", XS_CHOICE, 0, RENV_GFX_TEXUP, k_texup, NULL, 0, 0, 0),
+    [XS_GRAPHICS_TEXUP_SCALE] = SETTING("graphics.texture_upscale_scale", XS_CHOICE, 0, RENV_GFX_TEXUP_SCALE, k_texup_sc, NULL, 0, 0, 0),
+    [XS_GRAPHICS_TEXUP_ROADS] = SETTING("graphics.texup_roads", XS_BOOL, 0, RENV_GFX_TEXUP_ROADS, NULL, NULL, 0, 0, 0),
+    /* BO-272: on as shipped; off spreads the jobs through the race. Live. */
+    [XS_GRAPHICS_TEXUP_PRELOAD] = SETTING("graphics.texture_upscale_preload", XS_BOOL, 0, RENV_GFX_TEXUP_PRELOAD, NULL, NULL, 0, 0, 1),
     [XS_GAME_RACE_CLOCK]    = SETTING("game.race_clock", XS_BOOL, 0, RENV_GAME_RACE_CLOCK, NULL, NULL, 0, 0, 0),
+    /* With a music folder set: the title starts on the custom soundtrack the
+     * player last chose in its EA GAMES TRAX screen (the port does it;
+     * audio.custom_music_soundtrack remembers which). On as shipped. Read at
+     * the title's start. */
+    [XS_AUDIO_CUSTOM_AT_START] = SETTING("audio.custom_music_at_start", XS_BOOL, 0, RENV_AUDIO_CUSTOM_AT_START, NULL, NULL, 0, 0, 1),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
     /* The on-screen controls (touch_pad.h, BO-189). Live. */
@@ -212,11 +243,15 @@ static struct {
     recomp_env_id env;
     char val[1024];
     int user, locked;
+    int keep_empty;                   /* an empty value is a value (written as ""); absent is not */
 } s_text[] = {
-    { "audio.custom_music_dir", RENV_AUDIO_MUSIC_DIR, "", 0, 0 },
-    { "display.present_mode", RENV_PRESENT_MODE, "", 0, 0 },
-    { "console.hdd_key", RENV_CONSOLE_HDKEY, "", 0, 0 },
-    { "console.eeprom", RENV_CONSOLE_EEPROM, "", 0, 0 },
+    { "audio.custom_music_dir", RENV_AUDIO_MUSIC_DIR, "", 0, 0, 0 },
+    { "display.present_mode", RENV_PRESENT_MODE, "", 0, 0, 0 },
+    { "console.hdd_key", RENV_CONSOLE_HDKEY, "", 0, 0, 0 },
+    { "console.eeprom", RENV_CONSOLE_EEPROM, "", 0, 0, 0 },
+    /* BO-230: the soundtrack last chosen in the title's screen; "" is EA
+     * GAMES TRAX chosen, no key is nothing chosen yet. */
+    { "audio.custom_music_soundtrack", RENV_AUDIO_CUSTOM_SOUNDTRACK, "", 0, 0, 1 },
 };
 #define TEXT_COUNT ((int)(sizeof s_text / sizeof s_text[0]))
 
@@ -400,7 +435,7 @@ static void apply(xs_id id)
     }
     switch (id) {
     case XS_DISPLAY_OVERSCAN:
-        nv2a_present_set_overscan(v == 1);
+        nv2a_present_set_overscan((int)v);
         break;
     case XS_DISPLAY_FIT:
         nv2a_present_set_fit(v == 1);
@@ -457,6 +492,18 @@ static void apply(xs_id id)
         /* Held off (Android for now): a value stored in the file stays in
          * the file and does nothing; set_factor says so once. */
         nv2a_texscale_set_factor((int)v == 1 ? 2u : (int)v == 2 ? 4u : 0u);
+        break;
+    case XS_GRAPHICS_TEXUP:
+        nv2a_texup_set_algo((int)v);
+        break;
+    case XS_GRAPHICS_TEXUP_SCALE:
+        nv2a_texup_set_scale((int)v == 1 ? 4u : 2u);
+        break;
+    case XS_GRAPHICS_TEXUP_ROADS:
+        nv2a_texup_set_roads(v != 0.0);
+        break;
+    case XS_GRAPHICS_TEXUP_PRELOAD:
+        nv2a_texup_set_preload(v != 0.0);
         break;
     case XS_GRAPHICS_AA:
         nv2a_host_set_post_aa((int)v);
@@ -599,7 +646,7 @@ static void write_texts(FILE *f, const char *sec, int in_section)
         const char *name;
         int opened = 0;
 
-        if (!s_text[t].user || !s_text[t].val[0])
+        if (!s_text[t].user || (!s_text[t].val[0] && !s_text[t].keep_empty))
             continue;
         name = section_of(s_text[t].key, ts, sizeof ts);
         for (i = 0; i < XS_COUNT; i++) {
@@ -611,8 +658,20 @@ static void write_texts(FILE *f, const char *sec, int in_section)
         }
         if (in_section ? strcmp(ts, sec) != 0 : opened)
             continue;
-        if (!in_section)
-            fprintf(f, "\n[%s]\n", ts);
+        if (!in_section) {
+            /* One header for all the texts of a section (console.hdd_key and
+             * console.eeprom; audio.custom_music_dir and _soundtrack): a
+             * second [table] of the same name is an error for TOML. */
+            int u, again = 0;
+            for (u = 0; u < t; u++) {
+                char tu[32];
+                section_of(s_text[u].key, tu, sizeof tu);
+                if (!strcmp(tu, ts) && s_text[u].user && (s_text[u].val[0] || s_text[u].keep_empty))
+                    again = 1;
+            }
+            if (!again)
+                fprintf(f, "\n[%s]\n", ts);
+        }
         fprintf(f, "%s = ", name);
         quote(f, s_text[t].val);
         fputc('\n', f);
@@ -1039,13 +1098,23 @@ void xbox_SettingsSetText(const char *key, const char *value)
     int i;
     for (i = 0; i < TEXT_COUNT; i++)
         if (!strcmp(key, s_text[i].key)) {
-            if (s_text[i].locked || !strcmp(s_text[i].val, value ? value : ""))
+            if (s_text[i].locked || (!strcmp(s_text[i].val, value ? value : "")
+                                     && (s_text[i].user || !s_text[i].keep_empty)))
                 return;
             snprintf(s_text[i].val, sizeof s_text[i].val, "%s", value ? value : "");
             s_text[i].user = 1;
             s_dirty = 1;
             return;
         }
+}
+
+int xbox_SettingsTextIsSet(const char *key)
+{
+    int i;
+    for (i = 0; i < TEXT_COUNT; i++)
+        if (!strcmp(key, s_text[i].key))
+            return s_text[i].user && !s_text[i].locked;
+    return 0;
 }
 
 const char *xbox_SettingsPath(void)

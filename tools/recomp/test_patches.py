@@ -440,6 +440,25 @@ def test_float_store_rewrites_the_stored_value():
     assert report.finish() == []
 
 
+def test_float_compare_rewrites_the_memory_operand():
+    # comiss xmm0, [DATA] ; ret
+    code, report = _translate_f(f"0f2f05{D32}c3", "cmp_f32", "loaded * 2 + 5")
+    want = ('_fcb = RECOMP_PATCH_F32("display.hud_fix", "1", 0, '
+            "((double)(_fcb) * 2.0 + 5.0), _fcb);")
+    assert want in code, code
+    assert code.index("_fcb = MEMF(0x20000);") < code.index(want)
+    assert report.finish() == []
+    # ucomiss too
+    code, report = _translate_f(f"0f2e05{D32}c3", "cmp_f32", "60")
+    assert '_fcb = RECOMP_PATCH_F32("display.hud_fix", "1", 0, ' in code, code
+    assert report.finish() == []
+    # a register compare, or a load, is not this kind
+    for hexcode in ("0f2fc1c3", LOAD_XMM0):
+        code, report = _translate_f(hexcode, "cmp_f32", "loaded")
+        assert "RECOMP_PATCH_F32" not in code
+        assert any("is not a" in e for e in report.finish()), hexcode
+
+
 def test_float_kinds_refuse_other_shapes():
     for hexcode, kind in ((STORE_XMM1, "load_f32"), (LOAD_XMM0, "store_f32"),
                           (LOAD_BYTE, "load_f32"), (STORE, "load_f32")):

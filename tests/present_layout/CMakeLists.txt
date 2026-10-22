@@ -23,3 +23,15 @@ if(NOT WIN32)
 endif()
 enable_testing()
 add_test(NAME present_layout COMMAND present_layout_test)
+
+# present_composite: a frame dump placed by the real layout (composite.c).
+add_executable(present_composite composite.c
+    ../../src/kernel/nv2a_backend_common.c
+    ../../src/platform/recomp_env.c)
+target_include_directories(present_composite PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/platform
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d)
+if(NOT WIN32)
+    target_link_libraries(present_composite PRIVATE m)
+endif()

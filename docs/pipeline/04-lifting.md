@@ -570,7 +570,11 @@ switches to after the first crash camera: `game.race_clock`; the game repository
 A float goes by `"kind": "load_f32"` (after `movss xmm, [mem]`, or a 32-bit
 `mov reg, [mem]` that carries a float as bits) or `"store_f32"` (after
 `movss [mem], xmm` / `mov [mem], reg`: the stored float is rewritten, for a
-value whose register has other uses). Its value is an `"expr"`, arithmetic
+value whose register has other uses) or `"cmp_f32"` (after `comiss` /
+`ucomiss xmm, dword ptr [mem]`: the compare's snapshot of the memory operand,
+`_fcb`, is rewritten, so the branch compares with the value while the
+constant stays in memory for its other readers; Burnout 3's rival marker,
+`display.rival_marker`). Its value is an `"expr"`, arithmetic
 over numbers, `loaded` (the float the instruction moved) and names the host
 sets with `recomp_patch_set_var` before the guest runs, because a layout
 value depends on the picture's shape:

@@ -281,6 +281,18 @@ static void test_scan_and_db(void)
     CHECK("then 'a second' (a folder in it, not below one)", name_is(lib->st[2].name, "a second"));
     CHECK("then 'B album'", name_is(lib->st[3].name, "B album"));
     CHECK("ids from 1", lib->st[0].id == 1 && lib->st[3].id == 4);
+    {
+        /* BO-230: a choice is remembered by name and found again in a list that changed */
+        char nm[64];
+        CHECK("name of 2", xst_soundtrack_name(lib, 2, nm, sizeof nm) && !strcmp(nm, "a second"));
+        CHECK("name of 0", xst_soundtrack_name(lib, 0, nm, sizeof nm) && !strcmp(nm, "lib"));
+        CHECK("no name past the end", !xst_soundtrack_name(lib, 4, nm, sizeof nm) && !nm[0]);
+        CHECK("name cut to the buffer", xst_soundtrack_name(lib, 2, nm, 4) && !strcmp(nm, "a s"));
+        CHECK("find by name", xst_soundtrack_find(lib, "B album") == 3 && xst_soundtrack_find(lib, "a first") == 1);
+        CHECK("find is not found", xst_soundtrack_find(lib, "nope") == -1 && xst_soundtrack_find(lib, "") == -1
+                                   && xst_soundtrack_find(lib, NULL) == -1);
+        CHECK("find on no library", xst_soundtrack_find(NULL, "lib") == -1);
+    }
     CHECK("2 before 10", name_is(lib->songs[0].name, "2 two") && name_is(lib->songs[1].name, "10 ten"));
     CHECK("wav length", lib->songs[0].ms == 200 && lib->songs[1].ms == 300);
     CHECK("soundtrack length", lib->st[0].ms == 500);
@@ -550,22 +562,24 @@ static void test_browse(void)
     CHECK("turn off first", xsb_row_at(0, &r) && r.kind == XSB_OFF);
     CHECK("current folder", xsb_row_at(1, &r) && r.kind == XSB_PLACE
                             && !strcmp(r.label, "Current folder: lib"));
-    CHECK("music", find_row("Music") == 2);
-    CHECK("home", find_row("Home") == 3);
+    CHECK("the folder it is in", xsb_row_at(2, &r) && r.kind == XSB_PLACE
+                                 && !strncmp(r.label, "The folder it is in: ", 21));
+    CHECK("music", find_row("Music") == 3);
+    CHECK("home", find_row("Home") == 4);
     CHECK("no downloads", find_row("Downloads") < 0);
-    CHECK("the user's card", find_row("Drive: SDCARD") == 4);
-    CHECK("a drive", find_row("Drive: USB") == 5);
+    CHECK("the user's card", find_row("Drive: SDCARD") == 5);
+    CHECK("a drive", find_row("Drive: USB") == 6);
     CHECK("not the user's folder itself", find_row("Drive: deck") < 0);
-    CHECK("six places", xsb_rows() == 6);
+    CHECK("seven places", xsb_rows() == 7);
     xsb_where(where, sizeof where);
     CHECK("on the places", where[0] == 0);
     wait_counts();
     /* By name: the broken .flac counts here, a scan leaves it out. */
     CHECK("songs under the current folder", xsb_row_at(1, &r) && r.songs == 22 && !r.more);
-    CHECK("songs under Music", xsb_row_at(2, &r) && r.songs == 3);
-    CHECK("an empty card", xsb_row_at(4, &r) && r.songs == 0);
+    CHECK("songs under Music", xsb_row_at(3, &r) && r.songs == 3);
+    CHECK("an empty card", xsb_row_at(5, &r) && r.songs == 0);
 
-    CHECK("into Music", xsb_activate(2, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    CHECK("into Music", xsb_activate(3, chosen, sizeof chosen, &sel) == XSB_MOVED);
     xsb_where(where, sizeof where);
     CHECK("where", !strcmp(where, in_work("home/deck/Music")));
     CHECK("use, up, then the folders", xsb_rows() == 4 && xsb_row_at(0, &r) && r.kind == XSB_USE
@@ -585,11 +599,11 @@ static void test_browse(void)
     xsb_where(where, sizeof where);
     CHECK("in Music again", !strcmp(where, in_work("home/deck/Music")));
     /* Up from the place's own folder: the places, on that place. */
-    CHECK("back to the places", xsb_back(&sel) == XSB_MOVED && sel == 2 && xsb_rows() == 6);
+    CHECK("back to the places", xsb_back(&sel) == XSB_MOVED && sel == 3 && xsb_rows() == 7);
     CHECK("back from the places closes", xsb_back(&sel) == XSB_CLOSED);
     CHECK("turn off", xsb_activate(0, chosen, sizeof chosen, &sel) == XSB_TURNED_OFF);
     /* Home: its Music is a folder of it; going up from it stays inside Home. */
-    CHECK("into Home", xsb_activate(3, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    CHECK("into Home", xsb_activate(4, chosen, sizeof chosen, &sel) == XSB_MOVED);
     i = find_row("Music");
     CHECK("Music in Home", i == 2 && xsb_activate(i, chosen, sizeof chosen, &sel) == XSB_MOVED);
     CHECK("up to Home", xsb_back(&sel) == XSB_MOVED && sel == 2);
@@ -597,6 +611,37 @@ static void test_browse(void)
     CHECK("Home", !strcmp(where, home));
     xsb_close();
     CHECK("closed", !xsb_is_open() && xsb_rows() == 0);
+
+    /* BO-243: the folder in use is a soundtrack of a folder of them. The
+     * one it is in is the row under it; in the folder in use the cursor is
+     * on "..", which goes to that folder (not back to the places), and up
+     * on from there. */
+    xsb_open(in_work("home/deck/Music/Album"));
+    CHECK("in use: current", xsb_row_at(1, &r) && !strcmp(r.label, "Current folder: Album"));
+    CHECK("in use: the folder it is in", xsb_row_at(2, &r) && !strcmp(r.label, "The folder it is in: Music")
+                                         && !strcmp(r.path, in_work("home/deck/Music")));
+    CHECK("in use: into it", xsb_activate(1, chosen, sizeof chosen, &sel) == XSB_MOVED && sel == 1);
+    xsb_row_at(sel, &r);
+    CHECK("in use: on ..", r.kind == XSB_UP);
+    CHECK("in use: .. to the folder it is in", xsb_activate(sel, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    xsb_where(where, sizeof where);
+    CHECK("in use: in Music", !strcmp(where, in_work("home/deck/Music")));
+    CHECK("in use: on Album", xsb_row_at(sel, &r) && !strcmp(r.label, "Album"));
+    CHECK("in use: choose Music", xsb_activate(0, chosen, sizeof chosen, &sel) == XSB_CHOSEN
+                                  && !strcmp(chosen, in_work("home/deck/Music")));
+    CHECK("in use: up on from it", xsb_back(&sel) == XSB_MOVED);
+    xsb_where(where, sizeof where);
+    CHECK("in use: in home/deck", !strcmp(where, in_work("home/deck")));
+    xsb_close();
+    /* The row under it, entered from the places: one step to the parent. */
+    xsb_open(in_work("home/deck/Music/Album"));
+    CHECK("parent row: into it", xsb_activate(2, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    xsb_where(where, sizeof where);
+    CHECK("parent row: Music", !strcmp(where, in_work("home/deck/Music")));
+    CHECK("parent row: up on", xsb_back(&sel) == XSB_MOVED);
+    xsb_where(where, sizeof where);
+    CHECK("parent row: home/deck", !strcmp(where, in_work("home/deck")));
+    xsb_close();
 
     /* The chosen folder is gone (a card taken out, deleted): no dead
      * "Current folder" row, "turn off" stays, the places as before. */

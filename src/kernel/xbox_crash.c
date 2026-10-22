@@ -267,10 +267,115 @@ typedef struct {
     int rd;                   /* the pipe's read end */
     int out;                  /* where the stream went before (-1: nowhere) */
     volatile int busy;        /* between a read and its ring append */
+#if !defined(_WIN32)
+    /* The disk side (BO-245): the pump only reads the pipe into the ring and
+     * into this queue; a thread of its own writes the queue to `out` and the
+     * run log. Every thread's stderr goes into the pipe, and a pipe that
+     * fills blocks its writer: when the disk is slow (the Deck's SD card,
+     * busy with the texture upscaler's cache files) the render thread's own
+     * log lines waited for it. The pipe is now drained at memory speed; a
+     * full queue drops bytes (counted, said in the log) rather than wait.
+     * Windows keeps the direct write. */
+    char *q;
+    size_t qh, qn;            /* the writer's start, bytes waiting */
+    volatile int qbusy;       /* the writer has bytes out of the queue */
+    unsigned long long lost;  /* bytes dropped, not yet said */
+    pthread_mutex_t qmx;
+    pthread_cond_t qcv;
+#endif
 } TeeChan;
 
 static TeeChan s_tee[2];
 static int s_ntee;
+
+#if !defined(_WIN32)
+#define TEE_Q_BYTES (2u * 1024u * 1024u)
+
+/* Pump thread: 1 when the bytes are the writer's now, 0 to write them here. */
+static int tee_q_put(TeeChan *c, const char *b, size_t n)
+{
+    size_t at, first;
+    if (!c->q)
+        return 0;
+    pthread_mutex_lock(&c->qmx);
+    if (c->qn + n > TEE_Q_BYTES) {
+        c->lost += n;
+        pthread_mutex_unlock(&c->qmx);
+        return 1;
+    }
+    at = (c->qh + c->qn) % TEE_Q_BYTES;
+    first = n < TEE_Q_BYTES - at ? n : TEE_Q_BYTES - at;
+    memcpy(c->q + at, b, first);
+    memcpy(c->q, b + first, n - first);
+    c->qn += n;
+    pthread_cond_signal(&c->qcv);
+    pthread_mutex_unlock(&c->qmx);
+    return 1;
+}
+
+static void tee_disk_write(TeeChan *c, const char *b, size_t n)
+{
+    write_all(c->out, b, n);
+    if (s_log_dir[0]) {
+        RING_LOCK();
+        runlog_write(b, n);
+        RING_UNLOCK();
+    }
+}
+
+static void *tee_q_thread(void *arg)
+{
+    TeeChan *c = (TeeChan *)arg;
+    pthread_mutex_lock(&c->qmx);
+    for (;;) {
+        size_t n;
+        unsigned long long lost;
+        while (!c->qn && !c->lost)
+            pthread_cond_wait(&c->qcv, &c->qmx);
+        lost = c->lost;
+        c->lost = 0;
+        n = c->qn < TEE_Q_BYTES - c->qh ? c->qn : TEE_Q_BYTES - c->qh;
+        c->qbusy = 1;
+        pthread_mutex_unlock(&c->qmx);
+        /* The bytes [qh, qh + n) are this thread's until it moves qh. */
+        if (n)
+            tee_disk_write(c, c->q + c->qh, n);
+        if (lost) {
+            char line[160];
+            int k = snprintf(line, sizeof line, "[LOG] %llu bytes of the log dropped:"
+                             " the disk was too slow to take them\n", lost);
+            if (k > 0 && (size_t)k < sizeof line)
+                tee_disk_write(c, line, (size_t)k);
+        }
+        pthread_mutex_lock(&c->qmx);
+        c->qh = (c->qh + n) % TEE_Q_BYTES;
+        c->qn -= n;
+        c->qbusy = 0;
+    }
+    return NULL;
+}
+
+static void tee_q_start(TeeChan *c)
+{
+    pthread_t th;
+    pthread_mutex_init(&c->qmx, NULL);
+    pthread_cond_init(&c->qcv, NULL);
+    c->q = (char *)malloc(TEE_Q_BYTES);
+    if (!c->q)
+        return;
+    if (pthread_create(&th, NULL, tee_q_thread, c) != 0) {
+        free(c->q);
+        c->q = NULL;
+        return;
+    }
+    pthread_detach(th);
+}
+
+static int tee_q_idle(TeeChan *c)
+{
+    return !c->q || (!c->qbusy && !c->qn);
+}
+#endif
 
 static void tee_pump(TeeChan *c)
 {
@@ -308,7 +413,10 @@ static void tee_pump(TeeChan *c)
         }
 #if !defined(_WIN32)
         c->busy = 1;
-#endif
+        ring_append(buf, (size_t)n);
+        if (!tee_q_put(c, buf, (size_t)n))
+            tee_disk_write(c, buf, (size_t)n);
+#else
         write_all(c->out, buf, (size_t)n);
         ring_append(buf, (size_t)n);
         if (s_log_dir[0]) {
@@ -316,6 +424,7 @@ static void tee_pump(TeeChan *c)
             runlog_write(buf, (size_t)n);
             RING_UNLOCK();
         }
+#endif
         c->busy = 0;
     }
 }
@@ -351,9 +460,14 @@ void xbox_crash_log_flush(unsigned max_ms)
         return;
     for (;;) {
         int idle = 1;
-        for (i = 0; i < s_ntee; i++)
+        for (i = 0; i < s_ntee; i++) {
             if (s_tee[i].busy || tee_pending(&s_tee[i]) > 0)
                 idle = 0;
+#if !defined(_WIN32)
+            if (!tee_q_idle(&s_tee[i]))
+                idle = 0;
+#endif
+        }
         if (idle || waited >= max_ms)
             return;
         sleep_ms(1);
@@ -469,6 +583,7 @@ static void tee_start(void)
                 CloseHandle(h);
 #else
             pthread_t th;
+            tee_q_start(&s_tee[i]);
             if (pthread_create(&th, NULL, tee_thread, &s_tee[i]) == 0)
                 pthread_detach(th);
 #endif

@@ -131,6 +131,13 @@ int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 /* After a rename: later path-based operations on h follow the file. */
 void        w32_handle_set_path(HANDLE h, const char *host_path);
+/* BO-221 trace: does h's fd still name the file it was opened on (1), or
+ * not (0, logged once with a backtrace); a descriptor other code got must
+ * not be one a live handle owns (logged). RECOMP_FD_TRACE=1: every open and
+ * close of a handle's fd too. */
+int         w32_handle_check(HANDLE h, const char *where);
+void        w32_fd_note_foreign(int fd, const char *who);
+int         w32_fd_trace_on(void);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -592,6 +599,9 @@ int  guest_turn_has_code(void);
 void guest_turn_checkpoint(void);
 /* Hand over if another joined thread is waiting, as a yield on one core. */
 void guest_turn_yield(void);
+/* An event's state without taking it (-1: no event), and the thread whose
+ * wait took it since it was last set (0: none). */
+int  w32_event_peek(HANDLE h, DWORD *taker);
 /* Times the holder was interrupted to hand over, and signals sent to ask. */
 void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
 /* The longest a thread that was due to run at once (woken, or time-critical)

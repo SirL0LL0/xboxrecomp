@@ -87,6 +87,18 @@ const char *pc_strategy_name(int strategy);
  * glass), so a frame must be on the glass well inside two frames of its
  * vblank: the depth is never raised past that. */
 #define PC_LATENCY_MAX_NS 30000000ull
+/* PC_LOCK: a frame is handed to the system (presentDrawable:atTime:) this
+ * long after the refresh before its own, not half a refresh before its own
+ * (BO-239): on a display that takes its frames by direct scanout the half
+ * refresh sat on the flip deadline (about 8.3 ms before the refresh at
+ * 60 Hz), and a quarter of the frames missed it. The grid estimate is off by
+ * at most ~1.2 ms (measured), so 3 ms still names the frame's own refresh;
+ * never more than half a refresh (RECOMP_PRESENT_HANDOVER). */
+#define PC_HANDOVER_NS    3000000ull
+/* Frames shown a refresh or more before their target (the system took the
+ * time as "the nearest refresh", not "at or after") that put the hand-over
+ * back at half a refresh for the session. */
+#define PC_EARLIES_BACK   3
 #define PC_LATE_NS        1500000ull     /* PC_TIMED: later than this after the target is late */
 #define PC_LATES_RAISE    6              /* lates in the window that raise the lead */
 #define PC_LEAD_STEP_NS   2000000ull
@@ -115,10 +127,12 @@ typedef struct {
     int      calm;         /* frames since the last slip (late), raise or step back */
     int      decay_frames; /* calm frames a step back needs now */
     int      since_back;   /* frames since the last step back */
+    uint64_t handover_ns;  /* PC_LOCK: hand a frame over this long after the refresh before its own */
+    int      handover_half; /* frames came early: half a refresh before the frame's own instead */
     /* the window's counts */
     int      frames, slips, lates;
     /* since pc_pacer_init */
-    uint32_t slips_all, lates_all, raised, lowered;
+    uint32_t slips_all, lates_all, raised, lowered, earlies_all;
 } pc_pacer;
 
 /* What one present is aimed at. */
@@ -130,11 +144,15 @@ typedef struct {
 
 void pc_pacer_init(pc_pacer *p, int strategy, const pc_display *d,
                    uint64_t phase_ns, uint64_t lead_ns, int depth);
+/* PC_LOCK: the hand-over after the refresh before a frame's own
+ * (PC_HANDOVER_NS by default; at most half a refresh is used). */
+void pc_pacer_set_handover(pc_pacer *p, uint64_t handover_ns);
 /* The frame whose emulated vblank was vblank_ns, picked up at now_ns. */
 void pc_pacer_aim(const pc_pacer *p, uint64_t vblank_ns, uint64_t now_ns, pc_aim *out);
 /* The frame aimed with *aim reached the glass at glass_ns (0: never shown).
  * Returns 1 when the depth or the lead was raised, -1 when a raise was taken
- * back (PC_DECAY_FRAMES calm frames). */
+ * back (PC_DECAY_FRAMES calm frames), 2 when frames came early and the
+ * hand-over went back to half a refresh. */
 int  pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns);
 /* The pacing watchdog's reset (BO-211): the depth and lead back to the
  * setting's, the grace anew. The grid (the display's) is kept: a reset

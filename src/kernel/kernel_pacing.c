@@ -106,6 +106,21 @@ static volatile int s_disp_relearn;
 /* The lock saw the display change its rate: the watchdog's window then
  * decides nothing (pacing_watch.h). */
 static volatile int s_disp_rate_changed;
+/* The window system's refresh period (xbox_VblankDisplayCycle), and the one
+ * the lock last took from it. */
+static volatile LONGLONG s_disp_hint;
+static uint64_t s_disp_hint_used;
+/* The stated refresh is checked against the reports: eight steps
+ * in a row off its grid and it is not the display's (a limiter's target, say:
+ * 16.67 ms stated while the frames come 11.1 ms apart): the lock learns from
+ * the steps instead, until eight in a row are on its grid again. */
+#define DISPLAY_HINT_RUN 8
+static uint64_t s_disp_hint_seen;
+static int s_disp_hint_bad, s_disp_hint_offn, s_disp_hint_onn;
+/* The host flip grid a title asks for (xbox_FlipHostRate, below): while it
+ * runs the reports are learned from even with the lock off, for the grid's
+ * period and phase (xbox_DisplayGrid). */
+static volatile LONGLONG s_flip_host_ns;     /* 0: flips on the vblank */
 
 static int display_lock_on(void)
 {
@@ -151,12 +166,70 @@ static uint64_t steps_gcd(uint64_t a, uint64_t b)
     return 0;
 }
 
+void xbox_VblankDisplayCycle(uint64_t period_ns)
+{
+    if (period_ns && (period_ns < 2000000u || period_ns > 50000000u))
+        period_ns = 0;
+    s_disp_hint = (LONGLONG)period_ns;
+}
+
+int xbox_VblankDisplayCycleOk(void)
+{
+    return s_disp_hint && !s_disp_hint_bad && (uint64_t)s_disp_hint == s_disp_hint_seen;
+}
+
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
 {
     uint64_t prev = (uint64_t)s_disp_ns, cur = (uint64_t)s_disp_period;
+    uint64_t hint = (uint64_t)s_disp_hint;
 
-    if (!display_lock_on() || !when_ns)
+    if ((!display_lock_on() && !s_flip_host_ns) || !when_ns)
         return;
+    if (hint != s_disp_hint_seen) {
+        s_disp_hint_seen = hint;
+        s_disp_hint_bad = s_disp_hint_offn = s_disp_hint_onn = 0;
+    }
+    if (hint && !period_ns && prev && when_ns > prev && when_ns - prev <= 100000000u) {
+        /* Is this step on the stated grid (n refreshes, within an eighth)? */
+        uint64_t d = when_ns - prev, n = (d + hint / 2) / hint;
+        int on = n && (d > n * hint ? d - n * hint : n * hint - d) <= hint / 8;
+        static int said;
+        if (!s_disp_hint_bad) {
+            if (on)
+                s_disp_hint_offn = 0;
+            else if (++s_disp_hint_offn >= DISPLAY_HINT_RUN) {
+                s_disp_hint_bad = 1;
+                s_disp_hint_onn = 0;
+                if (said++ < 20)
+                    fprintf(stderr, "[PACING] display refresh: %d reports in a row off the window"
+                            " system's %.3f ms grid (the last step %.3f ms): learned from the"
+                            " reports instead\n", DISPLAY_HINT_RUN, hint / 1e6, d / 1e6);
+            }
+        } else {
+            if (!on)
+                s_disp_hint_onn = 0;
+            else if (++s_disp_hint_onn >= DISPLAY_HINT_RUN) {
+                s_disp_hint_bad = 0;
+                s_disp_hint_offn = 0;
+                if (said++ < 20)
+                    fprintf(stderr, "[PACING] display refresh: the reports are on the window"
+                            " system's %.3f ms grid again: taken\n", hint / 1e6);
+            }
+        }
+    }
+    if (s_disp_hint_bad)
+        hint = 0;
+    if (s_disp_relearn || hint != s_disp_hint_used) {
+        /* A relearn, or the window system's refresh changed: with the
+         * refresh stated, the period is it from this report on. */
+        if (!s_disp_relearn && hint && cur) {
+            fprintf(stderr, "[PACING] display refresh: the window system says %.3f ms (was"
+                    " %.3f): the display changed its rate\n", hint / 1e6, cur / 1e6);
+            s_disp_rate_changed = 1;
+        }
+        s_disp_relearn = 1;
+        s_disp_hint_used = hint;
+    }
     if (s_disp_relearn) {
         s_disp_relearn = 0;
         s_disp_ns = 0;
@@ -167,6 +240,10 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
         s_disp_offsum = s_disp_onsum = 0;
         s_disp_jitter = 0;
         prev = cur = 0;
+        if (hint) {
+            s_disp_period = (LONGLONG)hint;
+            cur = hint;
+        }
     }
     /* A report may be of a refresh still to come (CVDisplayLink's output
      * time): any point on the display's grid will do. */
@@ -174,6 +251,17 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
         /* A reported period is exact. */
         if (period_ns >= 2000000u && period_ns <= 50000000u)
             s_disp_period = (LONGLONG)period_ns;
+    } else if (hint && prev && when_ns > prev && when_ns - prev <= 100000000u) {
+        /* The window system states the refresh: a step on its grid is
+         * smoothed in (held within 1 % of the stated one); any other is a
+         * missed frame or a late report, never a new period. */
+        uint64_t d = when_ns - prev, n = (d + hint / 2) / hint;
+        if (n && (d > n * hint ? d - n * hint : n * hint - d) <= hint / 8) {
+            uint64_t np = (cur * 15u + d / n) / 16u;
+            if (np > hint + hint / 100) np = hint + hint / 100;
+            if (np < hint - hint / 100) np = hint - hint / 100;
+            s_disp_period = (LONGLONG)np;
+        }
     } else if (prev && when_ns > prev && when_ns - prev <= 100000000u) {
         /* Measured: a step of one or more refreshes, jittered by the
          * reporting thread's wake-up. */
@@ -745,6 +833,10 @@ void xbox_PacingFlipCadence(uint32_t interval, int late, uint64_t hold_total,
         pwatch_void(&s_watch, PWATCH_V_HIDDEN);
     if (xbox_VblankDisplayRateChanged())
         pwatch_void(&s_watch, PWATCH_V_RATE);
+    /* Flips on a host grid at the display's rate (xbox_FlipHostRate): not
+     * the vblank's cadence the watch knows; it decides nothing. */
+    if (s_flip_host_ns)
+        pwatch_void(&s_watch, PWATCH_V_RATE);
     if (!p_now) {
         p_now = now;
         p_hold = hold_total;
@@ -1234,4 +1326,207 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches)
         win_ns = now;
         win_cpu = cpu;
     }
+}
+
+/* ── The display's rate and the host flip grid ───────────── */
+
+/* Plain volatile 64-bit words, as s_disp_ns: one writer each. */
+static volatile LONGLONG s_display_mhz;      /* millihertz, 0 unknown */
+
+void xbox_DisplayRateSet(double hz)
+{
+    LONGLONG v = hz > 0.0 && hz < 2000.0 ? (LONGLONG)(hz * 1000.0 + 0.5) : 0;
+    if (s_display_mhz == v)
+        return;
+    s_display_mhz = v;
+    if (v)
+        XR_NOTICE("[PACING] the display refreshes at %.3f Hz\n", hz);
+}
+
+int xbox_DisplayGrid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns)
+{
+    uint64_t ref = (uint64_t)s_disp_ns, pd = (uint64_t)s_disp_period;
+    uint64_t hint = s_disp_hint_bad ? 0 : (uint64_t)s_disp_hint;
+    uint64_t sdl = (uint64_t)s_display_mhz;
+    int fresh = (display_lock_on() || s_flip_host_ns) && ref && pd && !s_disp_relearn
+                && !(now_ns > ref && now_ns - ref > DISPLAY_STALE_NS);
+
+    /* Measured faster than the mode SDL reads by more than 5 %: a period
+     * folded from two rates (kernel_pacing above), not the display's. */
+    if (fresh && sdl && 1e12 / (double)pd > (double)sdl * 1.05)
+        fresh = 0;
+    /* Measured off the window system's stated refresh: the stated one. */
+    if (fresh && hint && (pd > hint ? pd - hint : hint - pd) > hint / 100)
+        fresh = 0;
+    if (fresh) {
+        *period_ns = pd;
+        /* Irregular reports (a display link extrapolating its timeline,
+         * BO-77): the period holds, the phase does not. */
+        *ref_ns = s_disp_jitter ? 0 : ref;
+        return *ref_ns ? 2 : 1;
+    }
+    if (hint) {
+        *ref_ns = 0;
+        *period_ns = hint;
+        return 1;
+    }
+    return 0;
+}
+
+double xbox_DisplayRate(void)
+{
+    uint64_t ref, pd;
+
+    if (xbox_DisplayGrid(xbox_HostNowNs(), &ref, &pd))
+        return 1e9 / (double)pd;
+    return (double)s_display_mhz / 1000.0;
+}
+
+void xbox_FlipHostRate(double hz)
+{
+    LONGLONG ns = hz >= 24.0 && hz <= 1000.0 ? (LONGLONG)(1e9 / hz + 0.5) : 0;
+    LONGLONG cur = s_flip_host_ns;
+    /* The measured rate moves by a little between reads: a change of 1 %
+     * or less is the same rate (the grid takes its period from the display
+     * anyway, nv2a_pb_exec.c). */
+    if (ns && cur && (ns > cur ? ns - cur : cur - ns) <= cur / 100)
+        return;
+    if (cur == ns)
+        return;
+    /* The lock off: what it learned before (another grid, another display)
+     * is dropped; the grid follows fresh reports. */
+    if (ns && !cur && !display_lock_on())
+        s_disp_relearn = 1;
+    s_flip_host_ns = ns;
+    if (ns)
+        XR_NOTICE("[PACING] flips held to a %.3f Hz host grid\n", hz);
+    else
+        XR_NOTICE("[PACING] flips held to the vblank again\n");
+}
+
+uint64_t xbox_FlipHostPeriodNs(void)
+{
+    return (uint64_t)s_flip_host_ns;
+}
+
+/* The grid's state for the title, a sequence lock: the executor writes, the
+ * title's thread reads. */
+static uint32_t s_grid_seq, s_grid_swaps;
+static uint64_t s_grid_due, s_grid_per;
+
+void xbox_FlipHostGridNote(uint32_t swaps, uint64_t due_ns, uint64_t period_ns)
+{
+    uint32_t q = __atomic_load_n(&s_grid_seq, __ATOMIC_RELAXED);
+
+    __atomic_store_n(&s_grid_seq, q + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_grid_swaps, swaps, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_grid_due, due_ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_grid_per, period_ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_grid_seq, q + 2, __ATOMIC_RELEASE);
+}
+
+int xbox_FlipHostGridState(uint32_t *swaps, uint64_t *due_ns, uint64_t *period_ns)
+{
+    int n;
+
+    for (n = 0; n < 16; n++) {
+        uint32_t a = __atomic_load_n(&s_grid_seq, __ATOMIC_ACQUIRE), b;
+        if (a & 1)
+            continue;
+        *swaps = __atomic_load_n(&s_grid_swaps, __ATOMIC_RELAXED);
+        *due_ns = __atomic_load_n(&s_grid_due, __ATOMIC_RELAXED);
+        *period_ns = __atomic_load_n(&s_grid_per, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        b = __atomic_load_n(&s_grid_seq, __ATOMIC_RELAXED);
+        if (a == b)
+            return a != 0 && *due_ns && *period_ns;
+    }
+    return 0;
+}
+
+/* xbox_FlipHostHanded/Shown/ShownAt: a ring by flip number. An entry is
+ * written by the executor (flip, swap, edge; shown 0 or the stand-in) and
+ * then by the presenter's waiter (shown); its seq is odd while it changes. */
+#define SHOWN_RING 64u
+static struct {
+    uint32_t seq, flip, swap, real;
+    uint64_t edge, shown;
+} s_shown[SHOWN_RING];
+static volatile LONGLONG s_shown_real_ns;   /* the last display time reported */
+
+static void shown_write(uint32_t i, uint32_t flip, uint32_t swap, uint64_t edge,
+                        uint64_t shown, uint32_t real)
+{
+    uint32_t q = __atomic_load_n(&s_shown[i].seq, __ATOMIC_RELAXED);
+
+    __atomic_store_n(&s_shown[i].seq, q | 1u, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_shown[i].flip, flip, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_shown[i].swap, swap, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_shown[i].edge, edge, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_shown[i].shown, shown, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_shown[i].real, real, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_shown[i].seq, (q | 1u) + 1u, __ATOMIC_RELEASE);
+}
+
+void xbox_FlipHostHanded(uint32_t flip, uint32_t swap, uint64_t edge_ns, uint64_t period_ns,
+                         uint64_t handed_ns)
+{
+    static uint64_t anchor;           /* the last on-time frame's edge: a refresh */
+    uint64_t shown = 0, last = (uint64_t)s_shown_real_ns;
+
+    /* No display times for a second: the hand-over stands in, on a display
+     * whose refreshes are where the frames handed over on time are (within
+     * half a millisecond of their edge). A frame handed over later shows at
+     * the first refresh after it. */
+    if (!last || handed_ns > last + 1000000000ull) {
+        if (handed_ns <= edge_ns + 500000u || !anchor || !period_ns
+                || anchor + 500000u >= handed_ns) {
+            anchor = edge_ns;
+            shown = edge_ns;
+        } else {
+            shown = anchor + (handed_ns - 500000u - anchor + period_ns - 1) / period_ns * period_ns;
+        }
+    }
+    /* real's bit 1: handed over on time (by half a ms after its edge). */
+    shown_write(flip % SHOWN_RING, flip, swap, edge_ns, shown,
+                handed_ns <= edge_ns + 500000u ? 2u : 0u);
+}
+
+void xbox_FlipHostShown(uint32_t flip, uint64_t shown_ns)
+{
+    uint32_t i = flip % SHOWN_RING;
+    uint32_t rl = __atomic_load_n(&s_shown[i].real, __ATOMIC_RELAXED);
+
+    s_shown_real_ns = (LONGLONG)shown_ns;
+    if (__atomic_load_n(&s_shown[i].flip, __ATOMIC_RELAXED) != flip || (rl & 1u))
+        return;                       /* not a grid frame, or shown already */
+    shown_write(i, flip, __atomic_load_n(&s_shown[i].swap, __ATOMIC_RELAXED),
+                __atomic_load_n(&s_shown[i].edge, __ATOMIC_RELAXED), shown_ns, rl | 1u);
+}
+
+int xbox_FlipHostShownAt(uint32_t swap, uint64_t *shown_ns, uint64_t *edge_ns, int *real)
+{
+    uint32_t i;
+
+    for (i = 0; i < SHOWN_RING; i++) {
+        uint32_t a = __atomic_load_n(&s_shown[i].seq, __ATOMIC_ACQUIRE), b, sw, rl;
+        uint64_t sh, ed;
+        if (!a || (a & 1u))
+            continue;
+        sw = __atomic_load_n(&s_shown[i].swap, __ATOMIC_RELAXED);
+        sh = __atomic_load_n(&s_shown[i].shown, __ATOMIC_RELAXED);
+        ed = __atomic_load_n(&s_shown[i].edge, __ATOMIC_RELAXED);
+        rl = __atomic_load_n(&s_shown[i].real, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        b = __atomic_load_n(&s_shown[i].seq, __ATOMIC_RELAXED);
+        if (a != b || sw != swap || !sh)
+            continue;
+        *shown_ns = sh;
+        *edge_ns = ed;
+        *real = (int)rl;
+        return 1;
+    }
+    return 0;
 }

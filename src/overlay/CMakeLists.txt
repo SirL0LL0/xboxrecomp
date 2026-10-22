@@ -70,11 +70,11 @@ if(XBOXRECOMP_HAVE_VULKAN)
     target_sources(xbox_overlay PRIVATE
         overlay_vulkan.cpp
         ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
-    target_link_libraries(xbox_overlay PUBLIC Vulkan::Vulkan)
-    if(ANDROID)
-        # Vulkan through android_vk.h's pointers (src/d3d/CMakeLists.txt),
+    target_link_libraries(xbox_overlay PUBLIC xr_vulkan)
+    if(XR_VK_DYNAMIC_HOST)
+        # Vulkan through vk_dyn.h's pointers (src/d3d/CMakeLists.txt),
         # Dear ImGui's backend included.
-        target_compile_options(xbox_overlay PRIVATE -include ${XR_ANDROID_VK_H})
+        target_compile_options(xbox_overlay PRIVATE -include ${XR_VK_DYN_H})
     endif()
 endif()
 

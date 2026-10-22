@@ -66,12 +66,20 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "d3d8_glsl.h"
+#include "../video/hdr_shaders.h"   /* BO-244: the HDR maths shared with Metal */
 #include "d3d8_swizzle.h"
 #include "nv2a_texrep.h"
 #include "nv2a_texscale.h"
 #include "nv2a_texmip.h"
 #include "kernel_pause.h"
+#include "kernel_pacing.h"
+#include "nv2a_texup.h"
+#include "recomp_exe_dir.h"
 static void scale_prepare_loaded(void);
+static void texup_cmd_begin(VkCommandBuffer cb);   /* BO-245 */
+static void texup_cmd_end(VkCommandBuffer cb);
+void xbox_FrametimeGpu(double gpu_ms, double tu_ms, double tu_pred);   /* kernel.h */
+int  xbox_FrametimeOn(void);
 static int ui_scale_log(void);
 #include <dirent.h>
 #include <sys/stat.h>
@@ -283,6 +291,7 @@ typedef struct {
     struct nvk_image  im;
     VkImageView       view2;
     struct nvk_buffer buf;
+    VkDescriptorPool  pool;           /* BO-245: an upscaler job's sets */
     uint64_t          serial;
 } Garbage;
 static Garbage *s_garbage;
@@ -332,7 +341,8 @@ enum { FL_FLIP, FL_READY, FL_REPORT, FL_POLL, FL_RING, FL_SAMPLER, FL_READBACK, 
 typedef struct {
     uint64_t present, t_ns;
     uint32_t flip, draws, passes, p_clear, p_load, p_resumed, p_empty, p_maxdraws,
-             rt_switch, zload, zresumed, pass_draws;
+             rt_switch, zload, zresumed, pass_draws,
+             d_main, d_square, d_other;   /* draws by target: >= 640 wide, square, the rest */
     uint32_t sub[FL_N];
     uint32_t polls, waits, qres, nts, ready_done;
     uint64_t submit_ns, submit_max_ns, qlock_ns, poll_ns, poll_max_ns, wait_ns,
@@ -477,8 +487,8 @@ static int serial_wait(uint64_t v, int site)
     return 1;
 }
 
-static void garbage_push(const struct nvk_image *im, VkImageView view2,
-                         const struct nvk_buffer *buf)
+static void garbage_push_(const struct nvk_image *im, VkImageView view2,
+                          const struct nvk_buffer *buf, VkDescriptorPool pool)
 {
     Garbage *g;
     if (s_ngarbage == s_garbage_cap) {
@@ -492,6 +502,7 @@ static void garbage_push(const struct nvk_image *im, VkImageView view2,
             if (im) { struct nvk_image t = *im; nvk_image_free(&t); }
             if (view2) vkDestroyImageView(s_dev, view2, NULL);
             if (buf) { struct nvk_buffer t = *buf; nvk_buffer_free(&t); }
+            if (pool) vkDestroyDescriptorPool(s_dev, pool, NULL);
             return;
         }
         s_garbage = n;
@@ -504,8 +515,15 @@ static void garbage_push(const struct nvk_image *im, VkImageView view2,
     g->view2 = view2;
     if (buf)
         g->buf = *buf;
+    g->pool = pool;
     /* Whatever was recorded so far is in this or an earlier serial. */
     g->serial = s_next_serial;
+}
+
+static void garbage_push(const struct nvk_image *im, VkImageView view2,
+                         const struct nvk_buffer *buf)
+{
+    garbage_push_(im, view2, buf, VK_NULL_HANDLE);
 }
 
 static void garbage_collect(void)
@@ -524,6 +542,8 @@ static void garbage_collect(void)
             nvk_image_free(&g->im);
         if (g->buf.buf)
             nvk_buffer_free(&g->buf);
+        if (g->pool)
+            vkDestroyDescriptorPool(s_dev, g->pool, NULL);
         s_garbage[i] = s_garbage[--s_ngarbage];
     }
 }
@@ -564,6 +584,8 @@ static void ensure_cmd(void)
     if (!s_cmd) {
         s_cmd = cb_new();
         s_dyn_valid = 0;
+        if (s_cmd)
+            texup_cmd_begin(s_cmd);   /* BO-245: the frame's GPU time */
         if (s_vf && s_vf_qp && s_cmd && s_vf->nts < VF_TS) {
             vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, s_vf_qp,
                                 (uint32_t)((s_vf - s_vfr) * 2 * VF_TS + 2 * s_vf->nts));
@@ -711,6 +733,7 @@ static int flush(int wait, int why)
             s_vf->nts++;
         }
         s_vf_ts_open = 0;
+        texup_cmd_end(s_cmd);
         vkEndCommandBuffer(s_cmd);
         cbs[n++] = s_cmd;
     }
@@ -2029,7 +2052,7 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     key[35] = modes;
     key[36] = signs;
     key[37] = v->shader_ctl & 0x00FF0000u;  /* stage 2 and 3 input stages */
-    key[38] = v->clip_plane_mode;
+    key[38] = v->clip_plane_mode | (nv2a_alpha_kill_mask(s_stage, nv2a_pb_gpu_state()->flips) << 16);
     key[39] = (uint32_t)s_hdr;
     for (n = 0; n < 40; n++)
         kh = (kh ^ key[n]) * 16777619u;
@@ -2045,6 +2068,7 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
         st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
         st.clip_mode[n] = (uint8_t)((v->clip_plane_mode >> (4 * n)) & 0xFu);
     }
+    st.alpha_kill = (uint8_t)nv2a_alpha_kill_mask(s_stage, nv2a_pb_gpu_state()->flips);
     st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
     st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     hash = fnv(&st, sizeof st);
@@ -2425,6 +2449,10 @@ typedef struct {
     uint8_t          solo;          /* BO-203: nv2a_texrep_hdr_stage0_only of its bytes */
     uint32_t         pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t         skey;          /* nv2a_texscale_key of the texels uploaded */
+    /* graphics.texture_upscale (BO-245), as Metal's */
+    uint8_t          tu, tu_slot, tu_add, tu_demote;
+    uint32_t         tgen, tu_flip;
+    uint64_t         tu_hash, tu_bytes;
     int              live;
     struct nvk_image im;
 } TexEntry;
@@ -2657,8 +2685,11 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
         return 1;
     }
     t1 = s_pc_trace ? now_ns() : 0;
+    /* TRANSFER_SRC: graphics.texture_upscale blits the title's levels out of
+     * it (tu_blit_levels; BO-245). */
     if (!nvk_image_new(out, RT_FORMAT, t->width, t->height, t->levels,
-                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                        VK_IMAGE_ASPECT_COLOR_BIT))
         return 0;
     t2 = s_pc_trace ? now_ns() : 0;
@@ -2805,16 +2836,1573 @@ static void ui_scale_use(TexEntry *e, const Stage *t, const uint8_t *mem)
             (unsigned long long)s_presents);
 }
 
+/* ---- graphics.texture_upscale (BO-245, nv2a_texup.h), as Metal ------------
+ *
+ * The same steps as nv2a_pb_metal.m's section: a slot per texture, the disk
+ * cache first, else the one compute job in chunks under the governor, the
+ * swap at the next bind once the GPU is done. Here the chunks are recorded
+ * into the upload command buffer right after the frame's submit and
+ * submitted at once (one queue: the frame's work first, then the chunks),
+ * timed with two timestamps; scratch images stay in GENERAL for the job's
+ * life; the result is RGBA8 (a storage format every desktop driver writes),
+ * the title's levels blitted below the model's; the result's level 0 is
+ * copied to a host buffer for the disk cache and read once its serial is
+ * done. A disk result is uploaded into a BGRA8 image (the files are BGRA8)
+ * through the upload ring under the byte budget. Old images go through
+ * garbage_push as every texture does.
+ *
+ * Off: as Metal, texup_bind is not called for an entry that never had a
+ * slot, nothing is timed, nothing is made. */
+
+enum { TU_NONE, TU_SEEN, TU_DISK, TU_WAIT, TU_BUSY, TU_UP, TU_NO };
+
+enum { TP_LUMA, TP_RECOMBINE, TP_NNEDI3, TP_FSR0, TP_N = TP_FSR0 + 13 };
+static const char *const k_tp_file[TP_N] = {
+    "luma", "recombine", "nnedi3",
+    "fsrcnnx_00", "fsrcnnx_01", "fsrcnnx_02", "fsrcnnx_03", "fsrcnnx_04", "fsrcnnx_05",
+    "fsrcnnx_06", "fsrcnnx_07", "fsrcnnx_08", "fsrcnnx_09", "fsrcnnx_10", "fsrcnnx_11",
+    "fsrcnnx_12",
+};
+/* Layout A: binding 0 a sampled image, 1 a storage image, 4 the output (luma,
+ * recombine). Layout B: 0..2 storage images, 4 the output (FSRCNNX, NNEDI3). */
+static int tp_layout(int p) { return p == TP_LUMA || p == TP_RECOMBINE ? 0 : 1; }
+
+static VkDescriptorSetLayout s_tu_dsl[2];
+static VkPipelineLayout      s_tu_pl[2];
+static VkPipeline            s_tu_pipe[TP_N];
+static VkSampler             s_tu_point;
+static int                   s_tu_state;      /* 0 not yet, 1 ready, -1 failed (atomic) */
+
+struct tu_pc { int32_t origin[2], size[2], wrap[2], mode, pad0; };
+
+static int tu_file(const char *dir, const char *name, char **out)
+{
+    char path[1200];
+    FILE *f;
+    long n;
+    snprintf(path, sizeof path, "%s/%s.comp", dir, name);
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    *out = (char *)malloc((size_t)n + 1);
+    if (!*out || fread(*out, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f);
+        free(*out);
+        return 0;
+    }
+    (*out)[n] = 0;
+    fclose(f);
+    return 1;
+}
+
+static void *tu_load_main(void *arg)
+{
+    char *dir = (char *)arg;
+    int i, ok = 1;
+    for (i = 0; i < TP_N && ok; i++) {
+        char *src = NULL, err[1024] = "";
+        const uint32_t *w;
+        size_t n;
+        int compiled;
+        VkShaderModuleCreateInfo mi;
+        VkShaderModule mod = VK_NULL_HANDLE;
+        VkComputePipelineCreateInfo ci;
+        if (!tu_file(dir, k_tp_file[i], &src)) {
+            fprintf(stderr, "[TEXUP] cannot read %s/%s.comp\n", dir, k_tp_file[i]);
+            ok = 0;
+            break;
+        }
+        if (!nvk_glsl_spirv(NVK_STAGE_COMPUTE, src, &w, &n, &compiled, err, sizeof err)) {
+            fprintf(stderr, "[TEXUP] %s: %s\n", k_tp_file[i], err);
+            free(src);
+            ok = 0;
+            break;
+        }
+        free(src);
+        memset(&mi, 0, sizeof mi);
+        mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        mi.codeSize = n * 4;
+        mi.pCode = w;
+        if (vkCreateShaderModule(s_dev, &mi, NULL, &mod) != VK_SUCCESS) {
+            ok = 0;
+            break;
+        }
+        memset(&ci, 0, sizeof ci);
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = s_tu_pl[tp_layout(i)];
+        if (vkCreateComputePipelines(s_dev, VK_NULL_HANDLE, 1, &ci, NULL, &s_tu_pipe[i])
+                != VK_SUCCESS)
+            ok = 0;
+        vkDestroyShaderModule(s_dev, mod, NULL);
+    }
+    fprintf(stderr, "[TEXUP] shaders from %s: %s\n", dir, ok ? "ready" : "failed");
+    __atomic_store_n(&s_tu_state, ok ? 1 : -1, __ATOMIC_RELEASE);
+    free(dir);
+    return NULL;
+}
+
+static int tu_state(void)
+{
+    return __atomic_load_n(&s_tu_state, __ATOMIC_ACQUIRE);
+}
+
+/* The layouts and the sampler here (the render thread), the pipelines on a
+ * thread of their own. */
+static void tu_pipes_async(const char *dir)
+{
+    static int started;
+    VkDescriptorSetLayoutBinding b[5];
+    VkDescriptorSetLayoutCreateInfo li;
+    VkPipelineLayoutCreateInfo pi;
+    VkPushConstantRange pr;
+    VkSamplerCreateInfo sc;
+    pthread_t th;
+    char *d;
+    int l, i;
+
+    if (started)
+        return;
+    started = 1;
+    for (l = 0; l < 2; l++) {
+        uint32_t n = 0;
+        memset(b, 0, sizeof b);
+        for (i = 0; i < 5; i++) {
+            if (i == 3 || (l == 0 && i == 2))
+                continue;
+            b[n].binding = (uint32_t)i;
+            b[n].descriptorType = l == 0 && i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            b[n].descriptorCount = 1;
+            b[n].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            n++;
+        }
+        memset(&li, 0, sizeof li);
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = n;
+        li.pBindings = b;
+        memset(&pr, 0, sizeof pr);
+        pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pr.size = sizeof(struct tu_pc);
+        memset(&pi, 0, sizeof pi);
+        pi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pi.setLayoutCount = 1;
+        pi.pSetLayouts = &s_tu_dsl[l];
+        pi.pushConstantRangeCount = 1;
+        pi.pPushConstantRanges = &pr;
+        if (vkCreateDescriptorSetLayout(s_dev, &li, NULL, &s_tu_dsl[l]) != VK_SUCCESS
+                || vkCreatePipelineLayout(s_dev, &pi, NULL, &s_tu_pl[l]) != VK_SUCCESS) {
+            s_tu_state = -1;
+            return;
+        }
+    }
+    memset(&sc, 0, sizeof sc);
+    sc.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sc.magFilter = sc.minFilter = VK_FILTER_NEAREST;
+    sc.addressModeU = sc.addressModeV = sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(s_dev, &sc, NULL, &s_tu_point) != VK_SUCCESS) {
+        s_tu_state = -1;
+        return;
+    }
+    d = strdup(dir);
+    if (!d || pthread_create(&th, NULL, tu_load_main, d) != 0) {
+        free(d);
+        s_tu_state = -1;
+        return;
+    }
+    pthread_detach(th);
+}
+
+/* ── a job ─────────────────────────────────────────────────────────────── */
+
+#define TU_STEPS 40
+typedef struct {
+    int      pipe, cls, mode;
+    VkDescriptorSet set;
+    VkImage  out_img;                 /* the image the step writes (for its barrier) */
+    uint32_t dom_w, dom_h, size_w, size_h, group, row, col;
+} TuStep;
+
+typedef struct {
+    struct nvk_image src;             /* the title's: the entry's until it lets go (src_owned) */
+    struct nvk_image dst;             /* RGBA8, levels: the model's + the title's */
+    VkImageView      lv[2];           /* dst's levels 0 and 1 */
+    struct nvk_image scratch[16];
+    int              nscratch;
+    VkDescriptorPool pool;
+    struct nvk_buffer rb;             /* level 0 (and 1) for the disk cache, then the title's
+                                       * level 0 (the result check) */
+    VkDeviceSize      rb_model;       /* the model's bytes at its start */
+    struct nvk_buffer db;             /* RECOMP_DEBUG=texup_dump: the luma and SUBCONV1 */
+    uint32_t w, h, levels, scale, wrap;
+    int      algo, nstep, cur, started, finished;
+    int      src_owned;               /* the entry let go of src: freed with the job */
+    int      rb_idle;                 /* rb's copy is done and read: it may go to the pool */
+    TuStep   step[TU_STEPS];
+} TuJob;
+
+/* BO-272: the jobs' scratch images and readback buffers are kept for the
+ * next job instead of being made and freed for each (on Windows a job's
+ * nine vkAllocateMemory calls cost 2.6-3.6 ms of the render thread). One
+ * queue runs every job in order and each job's chunks begin with a full
+ * compute/transfer barrier, so a later job may write what an earlier one
+ * read; a buffer is handed back only when its job's copy is done and read.
+ * At most TU_POOL_BYTES are kept; the oldest go through the garbage. */
+#define TU_POOL      48
+#define TU_POOL_BYTES (96ull << 20)
+static struct { struct nvk_image im; uint64_t t; } s_tu_pim[TU_POOL];
+static struct { struct nvk_buffer b; uint64_t t; } s_tu_pbuf[16];
+static uint64_t s_tu_pool_bytes, s_tu_pool_t, s_tu_pool_hits, s_tu_pool_miss;
+
+static void tu_pool_trim(void)
+{
+    while (s_tu_pool_bytes > TU_POOL_BYTES) {
+        int i, old = -1, buf = 0;
+        for (i = 0; i < TU_POOL; i++)
+            if (s_tu_pim[i].im.img && (old < 0 || s_tu_pim[i].t < (buf ? s_tu_pbuf[old].t
+                                                                      : s_tu_pim[old].t))) {
+                old = i;
+                buf = 0;
+            }
+        for (i = 0; i < 16; i++)
+            if (s_tu_pbuf[i].b.buf && (old < 0 || s_tu_pbuf[i].t < (buf ? s_tu_pbuf[old].t
+                                                                       : s_tu_pim[old].t))) {
+                old = i;
+                buf = 1;
+            }
+        if (old < 0)
+            break;
+        if (buf) {
+            s_tu_pool_bytes -= s_tu_pbuf[old].b.size;
+            garbage_push(NULL, VK_NULL_HANDLE, &s_tu_pbuf[old].b);
+            memset(&s_tu_pbuf[old], 0, sizeof s_tu_pbuf[old]);
+        } else {
+            s_tu_pool_bytes -= s_tu_pim[old].im.bytes;
+            garbage_push(&s_tu_pim[old].im, VK_NULL_HANDLE, NULL);
+            memset(&s_tu_pim[old], 0, sizeof s_tu_pim[old]);
+        }
+    }
+}
+
+static void tu_pool_put_image(const struct nvk_image *im)
+{
+    int i, old = 0;
+    if (!im->img)
+        return;
+    for (i = 0; i < TU_POOL && s_tu_pim[i].im.img; i++)
+        if (s_tu_pim[i].t < s_tu_pim[old].t)
+            old = i;
+    if (i == TU_POOL) {
+        i = old;
+        s_tu_pool_bytes -= s_tu_pim[i].im.bytes;
+        garbage_push(&s_tu_pim[i].im, VK_NULL_HANDLE, NULL);
+    }
+    s_tu_pim[i].im = *im;
+    s_tu_pim[i].t = ++s_tu_pool_t;
+    s_tu_pool_bytes += im->bytes;
+    tu_pool_trim();
+}
+
+static int tu_pool_get_image(struct nvk_image *out, VkFormat fmt, uint32_t w, uint32_t h)
+{
+    int i;
+    for (i = 0; i < TU_POOL; i++)
+        if (s_tu_pim[i].im.img && s_tu_pim[i].im.format == fmt && s_tu_pim[i].im.w == w
+                && s_tu_pim[i].im.h == h) {
+            *out = s_tu_pim[i].im;
+            s_tu_pool_bytes -= out->bytes;
+            memset(&s_tu_pim[i], 0, sizeof s_tu_pim[i]);
+            s_tu_pool_hits++;
+            return 1;
+        }
+    s_tu_pool_miss++;
+    return 0;
+}
+
+static void tu_pool_put_buffer(const struct nvk_buffer *b)
+{
+    int i, old = 0;
+    if (!b->buf)
+        return;
+    for (i = 0; i < 16 && s_tu_pbuf[i].b.buf; i++)
+        if (s_tu_pbuf[i].t < s_tu_pbuf[old].t)
+            old = i;
+    if (i == 16) {
+        i = old;
+        s_tu_pool_bytes -= s_tu_pbuf[i].b.size;
+        garbage_push(NULL, VK_NULL_HANDLE, &s_tu_pbuf[i].b);
+    }
+    s_tu_pbuf[i].b = *b;
+    s_tu_pbuf[i].t = ++s_tu_pool_t;
+    s_tu_pool_bytes += b->size;
+    tu_pool_trim();
+}
+
+/* A buffer of at least size bytes and at most twice that. */
+static int tu_pool_get_buffer(struct nvk_buffer *out, VkDeviceSize size)
+{
+    int i, best = -1;
+    for (i = 0; i < 16; i++)
+        if (s_tu_pbuf[i].b.buf && s_tu_pbuf[i].b.size >= size && s_tu_pbuf[i].b.size <= size * 2
+                && (best < 0 || s_tu_pbuf[i].b.size < s_tu_pbuf[best].b.size))
+            best = i;
+    if (best < 0) {
+        s_tu_pool_miss++;
+        return 0;
+    }
+    *out = s_tu_pbuf[best].b;
+    s_tu_pool_bytes -= out->size;
+    memset(&s_tu_pbuf[best], 0, sizeof s_tu_pbuf[best]);
+    s_tu_pool_hits++;
+    return 1;
+}
+
+static void tu_job_free(TuJob *j)
+{
+    int i;
+    if (!j)
+        return;
+    for (i = 0; i < j->nscratch; i++)
+        garbage_push(&j->scratch[i], VK_NULL_HANDLE, NULL);
+    for (i = 0; i < 2; i++)
+        if (j->lv[i])
+            garbage_push(NULL, j->lv[i], NULL);
+    if (j->dst.img)
+        garbage_push(&j->dst, VK_NULL_HANDLE, NULL);
+    if (j->rb.buf && j->rb_idle)
+        tu_pool_put_buffer(&j->rb);   /* its copy is done and read (BO-272) */
+    else if (j->rb.buf)
+        garbage_push(NULL, VK_NULL_HANDLE, &j->rb);
+    if (j->db.buf)
+        garbage_push(NULL, VK_NULL_HANDLE, &j->db);
+    if (j->src_owned)
+        garbage_push(&j->src, VK_NULL_HANDLE, NULL);
+    /* Its sets are in command buffers that may still be out: the pool goes
+     * with the images, once the GPU is done with them. */
+    if (j->pool)
+        garbage_push_(NULL, VK_NULL_HANDLE, NULL, j->pool);
+    free(j);
+}
+
+static VkImageView tu_level_view(VkImage img, VkFormat fmt, uint32_t level)
+{
+    VkImageViewCreateInfo vi;
+    VkImageView v = VK_NULL_HANDLE;
+    memset(&vi, 0, sizeof vi);
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = fmt;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.baseMipLevel = level;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(s_dev, &vi, NULL, &v) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return v;
+}
+
+static struct nvk_image *tu_scratch(TuJob *j, uint32_t w, uint32_t h)
+{
+    struct nvk_image *im;
+    if (j->nscratch >= 16)
+        return NULL;
+    im = &j->scratch[j->nscratch];
+    if (!tu_pool_get_image(im, VK_FORMAT_R16G16B16A16_SFLOAT, w, h)
+            && !nvk_image_new(im, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
+                              VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+        return NULL;
+    j->nscratch++;
+    return im;
+}
+
+/* A step: its descriptor set from the job's pool. in: views (0: sampled for
+ * layout A), out: the storage view. */
+static TuStep *tu_add(TuJob *j, int pipe, int cls, uint32_t dw, uint32_t dh, uint32_t sw,
+                      uint32_t sh, uint32_t group, const VkImageView *in, int nin, VkImageView out,
+                      VkImage out_img, int mode)
+{
+    VkDescriptorSetAllocateInfo ai;
+    VkWriteDescriptorSet wr[5];
+    VkDescriptorImageInfo ii[5];
+    TuStep *s;
+    int l = tp_layout(pipe), k, n = 0;
+    if (j->nstep >= TU_STEPS)
+        return NULL;
+    s = &j->step[j->nstep];
+    memset(s, 0, sizeof *s);
+    memset(&ai, 0, sizeof ai);
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = j->pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &s_tu_dsl[l];
+    if (vkAllocateDescriptorSets(s_dev, &ai, &s->set) != VK_SUCCESS)
+        return NULL;
+    memset(wr, 0, sizeof wr);
+    memset(ii, 0, sizeof ii);
+    for (k = 0; k <= nin; k++) {
+        int b = k == nin ? 4 : k;
+        int sampled = l == 0 && b == 0;
+        ii[n].sampler = sampled ? s_tu_point : VK_NULL_HANDLE;
+        ii[n].imageView = k == nin ? out : in[k];
+        ii[n].imageLayout = sampled && in[k] == j->src.view ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                           : VK_IMAGE_LAYOUT_GENERAL;
+        wr[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[n].dstSet = s->set;
+        wr[n].dstBinding = (uint32_t)b;
+        wr[n].descriptorCount = 1;
+        wr[n].descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[n].pImageInfo = &ii[n];
+        n++;
+    }
+    vkUpdateDescriptorSets(s_dev, (uint32_t)n, wr, 0, NULL);
+    s->pipe = pipe;
+    s->cls = cls;
+    s->mode = mode;
+    s->dom_w = dw;
+    s->dom_h = dh;
+    s->size_w = sw;
+    s->size_h = sh;
+    s->group = group;
+    s->out_img = out_img;
+    j->nstep++;
+    return s;
+}
+
+/* One 2x round: in (sampled view, w x h) to out (a storage view of dst). */
+static int tu_round(TuJob *j, VkImageView in, VkImageView out, uint32_t w, uint32_t h)
+{
+    struct nvk_image *y = tu_scratch(j, w, h);
+    VkImageView v[3];
+    if (!y)
+        return 0;
+    v[0] = in;
+    if (!tu_add(j, TP_LUMA, NV2A_TEXUP_P_LUMA, w, h, w, h, 16, v, 1, y->view, y->img, 0))
+        return 0;
+    if (j->algo == NV2A_TEXUP_FSRCNNX) {
+        struct nvk_image *f1 = tu_scratch(j, w, h), *f2 = tu_scratch(j, w, h);
+        struct nvk_image *a1 = tu_scratch(j, w, h), *a2 = tu_scratch(j, w, h);
+        struct nvk_image *b1 = tu_scratch(j, w, h), *b2 = tu_scratch(j, w, h);
+        struct nvk_image *io[13][4];
+        static const int cls[13] = {
+            NV2A_TEXUP_P_FSR_FEATURE, NV2A_TEXUP_P_FSR_FEATURE,
+            NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_MODEL,
+            NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_MODEL,
+            NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_MODEL,
+            NV2A_TEXUP_P_FSR_MODEL, NV2A_TEXUP_P_FSR_SUBCONV,
+        };
+        int i, k;
+        if (!f1 || !f2 || !a1 || !a2 || !b1 || !b2)
+            return 0;
+        {
+            struct nvk_image *t[13][4] = {
+                { y, NULL, NULL, f1 }, { y, NULL, NULL, f2 },
+                { f1, f2, NULL, a1 }, { f1, f2, NULL, a2 },
+                { a1, a2, NULL, b1 }, { a1, a2, NULL, b2 },
+                { b1, b2, NULL, a1 }, { b1, b2, NULL, a2 },
+                { a1, a2, NULL, b1 }, { a1, a2, NULL, b2 },
+                { b1, b2, f1, a1 }, { b1, b2, f2, a2 },
+                { a1, a2, NULL, b1 },
+            };
+            memcpy(io, t, sizeof io);
+        }
+        for (i = 0; i < 13; i++) {
+            for (k = 0; k < 3 && io[i][k]; k++)
+                v[k] = io[i][k]->view;
+            if (!tu_add(j, TP_FSR0 + i, cls[i], w, h, w, h, 16, v, k, io[i][3]->view,
+                        io[i][3]->img, 0))
+                return 0;
+        }
+        v[0] = in;
+        v[1] = b1->view;
+        return tu_add(j, TP_RECOMBINE, NV2A_TEXUP_P_RECOMBINE, w * 2, h * 2, w, h, 16, v, 2, out,
+                      j->dst.img, 0) != NULL;
+    } else {
+        struct nvk_image *y2 = tu_scratch(j, w * 2, h * 2);
+        if (!y2)
+            return 0;
+        v[0] = y->view;
+        if (!tu_add(j, TP_NNEDI3, NV2A_TEXUP_P_NNEDI3, w, h, w, h, 16, v, 1, y2->view, y2->img, 0))
+            return 0;
+        v[0] = in;
+        v[1] = y2->view;
+        return tu_add(j, TP_RECOMBINE, NV2A_TEXUP_P_RECOMBINE, w * 2, h * 2, w, h, 16, v, 2, out,
+                      j->dst.img, 1) != NULL;
+    }
+}
+
+static TuJob *tu_job_new(const struct nvk_image *src, uint32_t w, uint32_t h, uint32_t levels,
+                         int algo, unsigned scale, unsigned wrap)
+{
+    TuJob *j = (TuJob *)calloc(1, sizeof *j);
+    VkDescriptorPoolSize ps[2];
+    VkDescriptorPoolCreateInfo pci;
+    uint32_t add = scale == 4 ? 2u : 1u;
+    VkDeviceSize rbytes = (VkDeviceSize)w * scale * h * scale * 4u
+                        + (scale == 4 ? (VkDeviceSize)w * 2 * h * 2 * 4u : 0);
+    VkDeviceSize rmodel = rbytes;
+    rbytes += (VkDeviceSize)w * h * 4u;   /* the title's level 0, as dst holds it */
+    if (!j)
+        return NULL;
+    j->src = *src;
+    j->w = w;
+    j->h = h;
+    j->levels = levels;
+    j->scale = scale;
+    j->wrap = wrap;
+    j->algo = algo;
+    j->rb_model = rmodel;
+    memset(ps, 0, sizeof ps);
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps[0].descriptorCount = 8;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    ps[1].descriptorCount = 4 * TU_STEPS;
+    memset(&pci, 0, sizeof pci);
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = TU_STEPS;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(s_dev, &pci, NULL, &j->pool) != VK_SUCCESS)
+        goto fail;
+    if (!nvk_image_new(&j->dst, VK_FORMAT_R8G8B8A8_UNORM, w * scale, h * scale, levels + add,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT))
+        goto fail;
+    j->lv[0] = tu_level_view(j->dst.img, VK_FORMAT_R8G8B8A8_UNORM, 0);
+    if (!j->lv[0])
+        goto fail;
+    if (!tu_pool_get_buffer(&j->rb, rbytes)
+            && !nvk_buffer_new(&j->rb, rbytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                               | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        goto fail;
+    j->rb_idle = 1;                   /* nothing recorded into it yet */
+    {
+        static int dumped;
+        const char *dd = recomp_env(RENV_TEXUP_DUMP);
+        if (dd && *dd && algo == NV2A_TEXUP_FSRCNNX && dumped < 3
+                && nvk_buffer_new(&j->db, (VkDeviceSize)w * h * 16u, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0))
+            dumped++;
+    }
+    if (scale == 2) {
+        if (!tu_round(j, src->view, j->lv[0], w, h))
+            goto fail;
+    } else {
+        j->lv[1] = tu_level_view(j->dst.img, VK_FORMAT_R8G8B8A8_UNORM, 1);
+        if (!j->lv[1] || !tu_round(j, src->view, j->lv[1], w, h)
+                || !tu_round(j, j->lv[1], j->lv[0], w * 2, h * 2))
+            goto fail;
+    }
+    return j;
+fail:
+    tu_job_free(j);
+    return NULL;
+}
+
+static double tu_job_cost(const TuJob *j)
+{
+    double c = 0;
+    int i;
+    for (i = 0; i < j->nstep; i++)
+        c += nv2a_texup_pass_cost(j->step[i].cls, (double)j->step[i].dom_w * j->step[i].dom_h);
+    return c;
+}
+
+static void tu_mem_barrier(VkCommandBuffer cb)
+{
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof mb);
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                     | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+/* The title's levels into dst's levels add.. (a blit: dst may be RGBA8, the
+ * title's BGRA8). src stays in its read layout around it; dst ends in
+ * dst_final. */
+static void tu_blit_levels(VkCommandBuffer cb, struct nvk_image *src, struct nvk_image *dst,
+                           uint32_t w, uint32_t h, uint32_t levels, uint32_t add,
+                           VkImageLayout dst_final)
+{
+    VkImageLayout src_was = src->layout;
+    uint32_t l;
+    nvk_image_to(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (dst->layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+        nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    for (l = 0; l < levels; l++) {
+        VkImageBlit b;
+        int32_t lw = (int32_t)nv2a_tex_level_dim(w, l), lh = (int32_t)nv2a_tex_level_dim(h, l);
+        memset(&b, 0, sizeof b);
+        b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.mipLevel = l;
+        b.dstSubresource.mipLevel = l + add;
+        b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+        b.srcOffsets[1].x = b.dstOffsets[1].x = lw;
+        b.srcOffsets[1].y = b.dstOffsets[1].y = lh;
+        b.srcOffsets[1].z = b.dstOffsets[1].z = 1;
+        vkCmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    }
+    nvk_image_to(cb, src, src_was);
+    nvk_image_to(cb, dst, dst_final);
+}
+
+static void tu_dispatch(VkCommandBuffer cb, const TuJob *j, const TuStep *s, uint32_t col0,
+                        uint32_t row0, uint32_t cols, uint32_t rows)
+{
+    struct tu_pc pc;
+    int l = tp_layout(s->pipe);
+    memset(&pc, 0, sizeof pc);
+    pc.origin[0] = (int32_t)col0;
+    pc.origin[1] = (int32_t)row0;
+    pc.size[0] = (int32_t)s->size_w;
+    pc.size[1] = (int32_t)s->size_h;
+    pc.wrap[0] = (j->wrap & 1) != 0;
+    pc.wrap[1] = (j->wrap & 2) != 0;
+    pc.mode = s->mode;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_tu_pipe[s->pipe]);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_tu_pl[l], 0, 1, &s->set, 0,
+                            NULL);
+    vkCmdPushConstants(cb, s_tu_pl[l], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cb, (cols + s->group - 1) / s->group, (rows + s->group - 1) / s->group, 1);
+}
+
+/* As nv2a_texup_metal.m's tum_job_encode: whole rows while they fit, else
+ * tiles of one group's rows. The first call sets the images up; the last
+ * copies the result out for the disk cache and leaves it readable. */
+static double tu_job_encode(TuJob *j, VkCommandBuffer cb, double budget, double factor)
+{
+    double used = 0;
+    if (!j->started) {
+        uint32_t i;
+        for (i = 0; i < (uint32_t)j->nscratch; i++)
+            nvk_image_to(cb, &j->scratch[i], VK_IMAGE_LAYOUT_GENERAL);
+        tu_blit_levels(cb, &j->src, &j->dst, j->w, j->h, j->levels, j->scale == 4 ? 2u : 1u,
+                       VK_IMAGE_LAYOUT_GENERAL);
+        j->started = 1;
+    }
+    tu_mem_barrier(cb);   /* the chunks of earlier submits */
+    while (j->cur < j->nstep) {
+        TuStep *s = &j->step[j->cur];
+        double per = nv2a_texup_pass_cost(s->cls, 1.0) * factor;
+        uint32_t left = s->dom_h - s->row, rows = 0, cols, band;
+        double room = budget - used;
+        if (per <= 0)
+            per = 1e-9;
+        if (!s->col) {
+            rows = room > 0 ? (uint32_t)(room / (per * s->dom_w)) : 0;
+            rows = rows / s->group * s->group;
+            if (rows > left)
+                rows = left;
+        }
+        if (rows) {
+            tu_dispatch(cb, j, s, 0, s->row, s->dom_w, rows);
+            used += per * s->dom_w * rows;
+            s->row += rows;
+        } else {
+            band = s->group < left ? s->group : left;
+            cols = room > 0 ? (uint32_t)(room / (per * band)) : 0;
+            cols = cols / s->group * s->group;
+            if (!cols)
+                break;
+            if (cols > s->dom_w - s->col)
+                cols = s->dom_w - s->col;
+            tu_dispatch(cb, j, s, s->col, s->row, cols, band);
+            used += per * cols * band;
+            s->col += cols;
+            if (s->col >= s->dom_w) {
+                s->col = 0;
+                s->row += band;
+            }
+        }
+        if (s->row >= s->dom_h) {
+            j->cur++;
+            tu_mem_barrier(cb);
+        }
+    }
+    if (j->cur >= j->nstep && !j->finished) {
+        VkBufferImageCopy bc[3];
+        uint32_t n = 1, W = j->w * j->scale, H = j->h * j->scale;
+        memset(bc, 0, sizeof bc);
+        bc[0].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bc[0].imageSubresource.layerCount = 1;
+        bc[0].imageExtent.width = W;
+        bc[0].imageExtent.height = H;
+        bc[0].imageExtent.depth = 1;
+        if (j->scale == 4) {
+            bc[1] = bc[0];
+            bc[1].bufferOffset = (VkDeviceSize)W * H * 4u;
+            bc[1].imageSubresource.mipLevel = 1;
+            bc[1].imageExtent.width = W / 2;
+            bc[1].imageExtent.height = H / 2;
+            n = 2;
+        }
+        /* The title's level 0, below the model's: the result check. */
+        bc[n] = bc[0];
+        bc[n].bufferOffset = j->rb_model;
+        bc[n].imageSubresource.mipLevel = j->scale == 4 ? 2u : 1u;
+        bc[n].imageExtent.width = j->w;
+        bc[n].imageExtent.height = j->h;
+        n++;
+        vkCmdCopyImageToBuffer(cb, j->dst.img, VK_IMAGE_LAYOUT_GENERAL, j->rb.buf, n, bc);
+        if (j->db.buf && j->nscratch > 5) {
+            /* RECOMP_DEBUG=texup_dump: the first round's luma and SUBCONV1
+             * (FSRCNNX's last hook), RGBA16F, w x h each. */
+            VkBufferImageCopy dc;
+            memset(&dc, 0, sizeof dc);
+            dc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            dc.imageSubresource.layerCount = 1;
+            dc.imageExtent.width = j->w;
+            dc.imageExtent.height = j->h;
+            dc.imageExtent.depth = 1;
+            vkCmdCopyImageToBuffer(cb, j->scratch[0].img, VK_IMAGE_LAYOUT_GENERAL, j->db.buf, 1, &dc);
+            dc.bufferOffset = (VkDeviceSize)j->w * j->h * 8u;
+            vkCmdCopyImageToBuffer(cb, j->scratch[5].img, VK_IMAGE_LAYOUT_GENERAL, j->db.buf, 1, &dc);
+        }
+        nvk_image_to(cb, &j->dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        j->finished = 1;
+        j->rb_idle = 0;               /* the copy above writes it; idle again once read */
+        /* BO-272: its scratch for the next job (recorded after this one on
+         * the same queue, behind the barrier its chunks begin with). */
+        if (!j->db.buf) {
+            int i;
+            for (i = 0; i < j->nscratch; i++)
+                tu_pool_put_image(&j->scratch[i]);
+            j->nscratch = 0;
+        }
+    }
+    return used;
+}
+
+/* ── slots, timing, the flip ───────────────────────────────────────────── */
+
+#define TU_SLOTS 8
+typedef struct {
+    int       used;
+    TexEntry *e;
+    struct nv2a_texup_key k;
+    unsigned  scale;
+    TuJob    *job;
+    struct nvk_image tex;             /* from the disk */
+    uint32_t *px;
+    size_t    bytes;
+    uint64_t  serial;                 /* the submit that completes it; 0: not yet */
+    uint64_t  done_flip;
+    uint64_t  start_flip;             /* taken */
+    int       saved;
+    int       verdict;                /* the result check: 0 not yet, 1 kept, -1 refused */
+} TuSlot;
+static TuSlot   s_tu[TU_SLOTS];
+static int      s_tu_job = -1;
+static int      s_tu_fifo[TEX_CACHE];
+static unsigned s_tu_fh, s_tu_fn;
+static struct nv2a_texup_gov s_gov;
+static size_t   s_tu_bytes_left = 32u << 20;
+static unsigned s_tu_3d;
+static int      s_tu_draw_3d, s_bind_tu, s_tu_inited, s_tu_timing;
+static uint64_t s_tu_resident;
+static double   s_tu_last_pred;
+static int      s_tu_disk_pending[TU_SLOTS], s_tu_ndisk;   /* disk results recorded this flip */
+/* RECOMP_DEBUG=texup_log: the upscaler's own render-thread time in a flip,
+ * by part (ns), said when it passes 1 ms: binds (disk-result uploads,
+ * swaps), the readback copy for the disk cache, new jobs, recording, the
+ * submit. */
+static uint64_t s_tu_ns_bind, s_tu_ns_save, s_tu_ns_new, s_tu_ns_enc, s_tu_ns_sub;
+
+/* Timestamps: the frames' (a pair per submit, up to 8 a frame, 8 frames)
+ * and the chunk buffers' (16 pairs). */
+#define TQ_FRAME 8
+#define TQ_SUB   8
+#define TQ_CHUNK 16
+static VkQueryPool s_tq;
+static unsigned    s_tq_n[TQ_FRAME];             /* pairs used by frame f */
+static int         s_tq_open = -1;               /* the pair the open s_cmd began */
+static uint64_t    s_tq_chunk_serial[TQ_CHUNK];  /* 0: free */
+static double      s_tq_chunk_pred[TQ_CHUNK];
+static int         s_tq_chunk_algo[TQ_CHUNK];
+static unsigned    s_tq_chunk_next;
+
+static int tu_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_TEXUP_LOG) != NULL;
+    return on;
+}
+
+static void tq_init(void)
+{
+    VkQueryPoolCreateInfo qi;
+    if (s_tq || C->props.limits.timestampPeriod <= 0.0f)
+        return;
+    memset(&qi, 0, sizeof qi);
+    qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = (TQ_FRAME * TQ_SUB + TQ_CHUNK) * 2;
+    if (vkCreateQueryPool(s_dev, &qi, NULL, &s_tq) != VK_SUCCESS)
+        s_tq = VK_NULL_HANDLE;
+    else
+        vkResetQueryPool(s_dev, s_tq, 0, qi.queryCount);
+}
+
+/* ensure_cmd: a new frame command buffer begins. */
+static void texup_cmd_begin(VkCommandBuffer cb)
+{
+    unsigned f = (unsigned)(s_presents % TQ_FRAME);
+    s_tq_open = -1;
+    if (!s_tu_timing || !s_tq || s_tq_n[f] >= TQ_SUB)
+        return;
+    s_tq_open = (int)(f * TQ_SUB + s_tq_n[f]++);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_tq, (uint32_t)s_tq_open * 2);
+}
+
+/* flush: the frame command buffer ends. */
+static void texup_cmd_end(VkCommandBuffer cb)
+{
+    if (s_tq_open >= 0)
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_tq,
+                            (uint32_t)s_tq_open * 2 + 1);
+    s_tq_open = -1;
+}
+
+/* Frame f's GPU ms (the sum of its submits), -1 when not all are there. */
+static double tq_frame(unsigned f)
+{
+    uint64_t ts[TQ_SUB * 2];
+    double ms = 0;
+    unsigned n = s_tq_n[f], i;
+    if (!n)
+        return -1;
+    if (vkGetQueryPoolResults(s_dev, s_tq, f * TQ_SUB * 2, n * 2, sizeof ts, ts, 8,
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return -1;
+    for (i = 0; i < n; i++)
+        if (ts[i * 2 + 1] > ts[i * 2])
+            ms += (double)(ts[i * 2 + 1] - ts[i * 2]) * C->props.limits.timestampPeriod / 1e6;
+    vkResetQueryPool(s_dev, s_tq, f * TQ_SUB * 2, n * 2);
+    s_tq_n[f] = 0;
+    return ms;
+}
+
+static unsigned tu_add_of(unsigned scale)
+{
+    return scale == 4 ? 2u : scale == 2 ? 1u : 0u;
+}
+
+static void texup_init_once(void);
+
+/* Called at every texture bind while the setting is on, so only the flag
+ * is read here. The work in texup_init_once (getenv, recomp_exe_dir, the
+ * path buffers) used to run before that test at every bind; on Windows
+ * ucrt's getenv takes a lock and walks the environment, which cost about
+ * 2-3 ms a frame on the render thread (BO-273). */
+static void texup_init(void)
+{
+    if (!s_tu_inited)
+        texup_init_once();
+}
+
+static void texup_init_once(void)
+{
+    char sh[1024], dir[900], sub[1000], ver[64] = "";
+    char c0[1024] = "", c1[1024] = "", c2[1024] = "";
+    const char *cand[4];
+    const char *exe = recomp_exe_dir(), *xd = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    FILE *f;
+    s_tu_inited = 1;
+    nv2a_texup_gov_init(&s_gov);
+    tq_init();
+    if (xd && *xd)
+        snprintf(c0, sizeof c0, "%s/%s/shaders/upscale", xd, nv2a_pcache_app());
+    else if (home && *home)
+        snprintf(c0, sizeof c0, "%s/.local/share/%s/shaders/upscale", home, nv2a_pcache_app());
+    if (exe && *exe) {
+        snprintf(c1, sizeof c1, "%s/shaders/upscale", exe);
+        snprintf(c2, sizeof c2, "%s/../share/takedawn/shaders/upscale", exe);
+    }
+    cand[0] = c0; cand[1] = c1; cand[2] = c2; cand[3] = NULL;
+    if (!nv2a_texup_shader_dir(cand, sh, sizeof sh)) {
+        fprintf(stderr, "[TEXUP] no shader files found: texture upscale stays off\n");
+        s_tu_state = -1;
+        return;
+    }
+    snprintf(sub, sizeof sub, "%s/VERSION", sh);
+    if ((f = fopen(sub, "rb")) != NULL) {
+        if (!fgets(ver, sizeof ver, f))
+            ver[0] = 0;
+        fclose(f);
+    }
+    nv2a_texup_set_shaders(sh, strtoull(ver, NULL, 16));
+    tu_pipes_async(sh);
+    if (nvk_cache_dir(dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/texup", dir);
+        nv2a_texup_store_dir(sub);
+    }
+}
+
+static void tu_slot_free(int i)
+{
+    TuSlot *s = &s_tu[i];
+    if (s->e && s->e->tu_slot == i + 1)
+        s->e->tu_slot = 0;
+    if (s->job)
+        tu_job_free(s->job);   /* everything it has through the garbage */
+    if (s->tex.img)
+        garbage_push(&s->tex, VK_NULL_HANDLE, NULL);
+    free(s->px);
+    if (s_tu_job == i)
+        s_tu_job = -1;
+    memset(s, 0, sizeof *s);
+}
+
+static TuSlot *tu_slot_of(const TexEntry *e)
+{
+    return e->tu_slot ? &s_tu[e->tu_slot - 1] : NULL;
+}
+
+static void tu_detach(TexEntry *e, int dynamic)
+{
+    TuSlot *s = tu_slot_of(e);
+    if (s) {
+        s->e = NULL;
+        e->tu_slot = 0;
+    }
+    if (e->tu_add) {
+        s_tu_resident -= e->tu_bytes;
+        nv2a_texup_stats_rw()->upscaled--;
+    }
+    e->tu = (uint8_t)(dynamic ? TU_NO : TU_NONE);
+    e->tu_add = 0;
+    e->tu_demote = 0;
+    e->tu_bytes = 0;
+}
+
+static void tu_fifo_push(TexEntry *e)
+{
+    if (s_tu_fn < TEX_CACHE) {
+        s_tu_fifo[(s_tu_fh + s_tu_fn) % TEX_CACHE] = (int)(e - s_tc);
+        s_tu_fn++;
+    }
+    nv2a_texup_stats_rw()->queued = s_tu_fn;
+}
+
+static int tu_room(uint64_t bytes, const TexEntry *keep)
+{
+    uint64_t cap = nv2a_texup_cap_bytes();
+    while (s_tu_resident + bytes > cap) {
+        TexEntry *lru = NULL;
+        int i;
+        for (i = 0; i < TEX_CACHE; i++) {
+            TexEntry *c = &s_tc[i];
+            if (c->live && c->tu_add && !c->tu_demote && c != keep
+                    && (!lru || c->used < lru->used))
+                lru = c;
+        }
+        if (!lru)
+            return 0;
+        lru->tu_demote = 1;
+        s_tu_resident -= lru->tu_bytes;
+        lru->tu_bytes = 0;
+        nv2a_texup_stats_rw()->demoted++;
+    }
+    return 1;
+}
+
+/* An entry lets go of its image (a new upload, another texture in the
+ * entry, a scaled picture, an upscaled one). A job made from that image
+ * reads it in its first and last passes, chunk by chunk over many flips:
+ * the job takes it over and frees it with its own images, when the GPU is
+ * done with its last chunk. Before, the image went once the frames then out
+ * were done, and the job's next chunks sampled freed memory (a GPU page
+ * fault, then a ring reset or a lost device: the Deck at the car select,
+ * NNEDI3). Otherwise it goes when the frames that may use it are done. */
+static void tex_retire(struct nvk_image *im)
+{
+    int i;
+    if (im->img)
+        for (i = 0; i < TU_SLOTS; i++) {
+            TuJob *j = s_tu[i].used ? s_tu[i].job : NULL;
+            if (j && !j->src_owned && j->src.img == im->img) {
+                j->src_owned = 1;
+                memset(im, 0, sizeof *im);
+                return;
+            }
+        }
+    garbage_push(im, VK_NULL_HANDLE, NULL);
+}
+
+/* The slot's image becomes the entry's (the job's dst or the disk one). */
+static void tu_save(TuSlot *s);
+static int tu_check(TuSlot *s);
+
+static void tu_swap(TexEntry *e, TuSlot *s)
+{
+    uint64_t bytes = (uint64_t)nv2a_tex_texels(e->width * s->scale, e->height * s->scale,
+                                               e->levels + tu_add_of(s->scale)) * 4u;
+    struct nv2a_texup_stats *st = nv2a_texup_stats_rw();
+    struct nvk_image ni;
+    if (!tu_room(bytes, e)) {
+        st->dropped++;
+        e->tu = TU_NO;
+        tu_slot_free((int)(s - s_tu));
+        return;
+    }
+    if (s->job && !tu_check(s)) {
+        e->tu = TU_NO;   /* the title's texture stays */
+        tu_slot_free((int)(s - s_tu));
+        return;
+    }
+    if (s->job) {
+        tu_save(s);   /* its result to the disk cache before the job goes */
+        s->job->rb_idle = 1;   /* done and read: its buffer may serve the next job */
+        ni = s->job->dst;
+        memset(&s->job->dst, 0, sizeof s->job->dst);   /* the entry owns it now */
+    } else {
+        ni = s->tex;
+        memset(&s->tex, 0, sizeof s->tex);
+    }
+    tex_retire(&e->im);
+    e->im = ni;
+    e->tu_add = (uint8_t)tu_add_of(s->scale);
+    e->tu_bytes = bytes;
+    e->tu = TU_UP;
+    s_tu_resident += bytes;
+    st->resident_bytes = s_tu_resident;
+    st->upscaled++;
+    st->swaps++;
+    if (tu_log())
+        fprintf(stderr, "[TEXUP] swap %016llx %ux%u x%u (%s), flip %llu\n",
+                (unsigned long long)e->hash, e->width, e->height, s->scale,
+                s->job ? "computed" : "from disk", (unsigned long long)s_presents);
+    tu_slot_free((int)(s - s_tu));
+}
+
+/* A disk result into a BGRA8 image: its levels by the upload ring, the
+ * title's by a blit, on the upload command buffer. 0: no room or memory. */
+static int tu_from_file(TuSlot *s, TexEntry *e)
+{
+    uint32_t add = tu_add_of(s->scale), W = e->width * s->scale, H = e->height * s->scale;
+    if (!nvk_image_new(&s->tex, RT_FORMAT, W, H, e->levels + add,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT))
+        return 0;
+    if (!upload_level(&s->tex, 0, W, H, s->px, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0)
+            || (add == 2 && !upload_level(&s->tex, 1, W / 2, H / 2, s->px + (size_t)W * H,
+                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0))) {
+        garbage_push(&s->tex, VK_NULL_HANDLE, NULL);
+        memset(&s->tex, 0, sizeof s->tex);
+        return 0;
+    }
+    ensure_up();
+    tu_blit_levels(s_up, &e->im, &s->tex, e->width, e->height, e->levels, add,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return 1;
+}
+
+static void texup_bind_(TexEntry *e, const Stage *t, const uint8_t *mem);
+static void tu_step(TexEntry *e, TuSlot *s);
+
+static void texup_bind(TexEntry *e, const Stage *t, const uint8_t *mem)
+{
+    uint64_t t0 = tu_log() && e->tu >= TU_DISK && e->tu <= TU_BUSY ? now_ns() : 0;
+    texup_bind_(e, t, mem);
+    if (t0)
+        s_tu_ns_bind += now_ns() - t0;
+}
+
+static void texup_bind_(TexEntry *e, const Stage *t, const uint8_t *mem)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    uint32_t gen = nv2a_texup_generation();
+    int algo = nv2a_texup_algo();
+    TuSlot *s;
+
+    if (e->tgen != gen) {
+        tu_detach(e, 0);
+        e->tgen = gen;
+    }
+    if (!algo)
+        return;
+    texup_init();
+    if (tu_state() != 1)
+        return;
+    switch (e->tu) {
+    case TU_NONE: {
+        struct nv2a_texup_tex q;
+        int why;
+        memset(&q, 0, sizeof q);
+        q.size_from_format = nv2a_tex_size_from_format(t->color);
+        q.sign = e->sign != 0;
+        q.cube = t->cube;
+        q.replaced = e->rep != 0 || e->up_scale || e->scale;
+        q.w = t->width;
+        q.h = t->height;
+        q.levels = t->levels;
+        q.draw_3d = s_tu_draw_3d;
+        q.ever_2d = e->ui;
+        why = nv2a_texup_rule(&q);
+        if (why == NV2A_TEXUP_OK) {
+            e->tu = TU_SEEN;
+            e->tu_flip = g->flips;
+            e->tu_hash = e->hash;
+            if (tu_log())    /* first sight: with the swap line, the wait for it */
+                fprintf(stderr, "[TEXUP] seen %016llx %ux%u, flip %llu\n",
+                        (unsigned long long)e->hash, t->width, t->height,
+                        (unsigned long long)s_presents);
+        } else if (why != NV2A_TEXUP_2D || e->ui) {
+            e->tu = TU_NO;
+        }
+        break;
+    }
+    case TU_SEEN: {
+        int i, r;
+        uint32_t *px = NULL;
+        size_t bytes = 0;
+        if (e->hash != e->tu_hash || e->ui) {
+            e->tu = TU_NO;
+            break;
+        }
+        if (g->flips < e->tu_flip + 2)
+            break;
+        if (nv2a_texup_skip(nv2a_texrep_hash(mem + t->offset, t->color, t->width, t->height,
+                                             t->pitch))) {
+            e->tu = TU_NO;
+            break;
+        }
+        for (i = 0; i < (int)nv2a_texup_slots() && s_tu[i].used; i++)
+            ;
+        if (i == (int)nv2a_texup_slots())
+            break;
+        s = &s_tu[i];
+        memset(s, 0, sizeof *s);
+        s->used = 1;
+        s->e = e;
+        s->start_flip = s_presents;
+        s->scale = nv2a_texup_factor_for(t->width, t->height);
+        s->k.hash = e->hash;
+        s->k.w = t->width;
+        s->k.h = t->height;
+        s->k.format = t->color;
+        s->k.algo = (uint32_t)algo;
+        s->k.scale = s->scale;
+        s->k.wrap = ((t->addr_u & 0xF) == 1 ? 1u : 0u) | ((t->addr_v & 0xF) == 1 ? 2u : 0u);
+        s->k.shaders = nv2a_texup_shader_version();
+        e->tu_slot = (uint8_t)(i + 1);
+        e->tu = TU_DISK;
+        nv2a_texup_stats_rw()->jobs++;
+        r = nv2a_texup_load(&s->k, &px, &bytes);
+        if (r == NV2A_TEXUP_ABSENT) {
+            e->tu = TU_WAIT;
+            tu_fifo_push(e);
+        }
+        break;
+    }
+    case TU_DISK:
+    case TU_BUSY:
+        s = tu_slot_of(e);
+        if (!s) {
+            e->tu = TU_NONE;
+            break;
+        }
+        tu_step(e, s);
+        break;
+    default:
+        break;
+    }
+}
+
+/* A slot's next step, at a bind of its entry or at the flip (BO-272: a
+ * result whose texture is not drawn again would otherwise hold its slot
+ * until it is given back, 600 flips later, and the countdown's textures
+ * waited behind the garage's). TU_DISK: the file's read, its upload under
+ * the flip's byte slice, the swap once that upload is done; TU_BUSY: the
+ * swap once the job's last submit is done. */
+static void tu_step(TexEntry *e, TuSlot *s)
+{
+    if (e->tu == TU_DISK) {
+        if (!s->px && !s->tex.img) {
+            int r = nv2a_texup_load(&s->k, &s->px, &s->bytes);
+            size_t want = (size_t)e->width * s->scale * e->height * s->scale * 4u
+                        + (s->scale == 4 ? (size_t)e->width * 2 * e->height * 2 * 4u : 0);
+            if (r == NV2A_TEXUP_ABSENT || (r == NV2A_TEXUP_READY && s->bytes != want)) {
+                if (r == NV2A_TEXUP_ABSENT)
+                    nv2a_texup_stats_rw()->absent++;
+                free(s->px);
+                s->px = NULL;
+                e->tu = TU_WAIT;
+                tu_fifo_push(e);
+                return;
+            }
+        }
+        if (s->px && !s->tex.img && s_tu_ndisk < TU_SLOTS
+                && nv2a_texup_swap_fits(s->bytes, s_tu_bytes_left,
+                                        nv2a_texup_gov_swap_bytes(&s_gov))) {
+            if (!tu_from_file(s, e)) {
+                e->tu = TU_NO;
+                tu_slot_free((int)(s - s_tu));
+                return;
+            }
+            s_tu_bytes_left -= s->bytes < s_tu_bytes_left ? s->bytes : s_tu_bytes_left;
+            free(s->px);
+            s->px = NULL;
+            s_tu_disk_pending[s_tu_ndisk++] = (int)(s - s_tu);
+            nv2a_texup_stats_rw()->from_disk++;
+        }
+        if (s->tex.img && s->serial && serial_done() >= s->serial)
+            tu_swap(e, s);
+    } else if (e->tu == TU_BUSY) {
+        if (s->job && s->job->finished && s->serial && serial_done() >= s->serial)
+            tu_swap(e, s);
+    }
+}
+
+/* A finished job's level 0 (1) from its host buffer to the disk cache. */
+static int tu_check(TuSlot *s)
+{
+    TuJob *j = s->job;
+    if (!s->verdict) {
+        const uint8_t *m = (const uint8_t *)j->rb.map;
+        s->verdict = m && nv2a_texup_result_ok(m, m + j->rb_model, j->w, j->h, j->scale) ? 1 : -1;
+        if (s->verdict < 0) {
+            nv2a_texup_stats_rw()->refused++;
+            fprintf(stderr, "[TEXUP] refused %016llx %ux%u x%u %s: the result does not match the"
+                    " title's texture (alpha or brightness); the title's is kept, nothing saved\n",
+                    (unsigned long long)s->k.hash, j->w, j->h, j->scale,
+                    nv2a_texup_algo_name((int)s->k.algo));
+        }
+    }
+    return s->verdict > 0;
+}
+
+static void tu_save(TuSlot *s)
+{
+    TuJob *j = s->job;
+    size_t bytes = (size_t)j->rb_model;
+    uint64_t t0;
+    if (s->saved || !j->rb.map)
+        return;
+    s->saved = 1;
+    if (!tu_check(s))
+        return;
+    t0 = tu_log() ? now_ns() : 0;
+    if (j->db.map) {
+        /* RECOMP_DEBUG=texup_dump: half floats out as floats. */
+        const char *dd = recomp_env(RENV_TEXUP_DUMP);
+        const uint16_t *hp = (const uint16_t *)j->db.map;
+        int part;
+        for (part = 0; part < 2 && dd; part++) {
+            char path[1200];
+            FILE *f;
+            size_t i, n = (size_t)j->w * j->h * 4u;
+            snprintf(path, sizeof path, "%s/%016llx_%ux%u_w%u_%s.f32", dd,
+                     (unsigned long long)s->k.hash, j->w, j->h, j->wrap, part ? "model" : "luma");
+            if ((f = fopen(path, "wb")) == NULL)
+                continue;
+            for (i = 0; i < n; i++) {
+                float v = hdr_h2f(hp[part * n + i]);
+                fwrite(&v, 4, 1, f);
+            }
+            fclose(f);
+            fprintf(stderr, "[TEXUP] dump %s\n", path);
+        }
+    }
+    nv2a_texup_save_rgba(&s->k, (const uint32_t *)j->rb.map, bytes);
+    if (t0)
+        s_tu_ns_save += now_ns() - t0;
+}
+
+static void texup_flip(void)
+{
+    static uint64_t last_ns, last_uploads;
+    uint64_t now = now_ns();
+    double frame_ms = last_ns ? (double)(now - last_ns) / 1e6 : 16.7, budget, gpu_ms = -1,
+           tu_ms = 0;
+    int algo = nv2a_texup_algo(), computed = s_tu_last_pred > 0, i;
+    struct nv2a_texup_stats *st = nv2a_texup_stats_rw();
+    uint64_t tl0 = 0, tl1;
+
+    nv2a_texup_ctl(s_presents);
+    s_tu_timing = algo != 0 || xbox_FrametimeOn();
+    last_ns = now;
+    if (s_tq) {
+        uint64_t done = serial_done();
+        if (s_presents >= 3)
+            gpu_ms = tq_frame((unsigned)((s_presents - 3) % TQ_FRAME));
+        for (i = 0; i < TQ_CHUNK; i++) {
+            uint64_t ts[2];
+            unsigned q = (TQ_FRAME * TQ_SUB + (unsigned)i) * 2;
+            if (!s_tq_chunk_serial[i] || done < s_tq_chunk_serial[i])
+                continue;
+            if (vkGetQueryPoolResults(s_dev, s_tq, q, 2, sizeof ts, ts, 8,
+                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0]) {
+                double ms = (double)(ts[1] - ts[0]) * C->props.limits.timestampPeriod / 1e6;
+                tu_ms += ms;
+                nv2a_texup_gov_measured(&s_gov, s_tq_chunk_algo[i], s_tq_chunk_pred[i], ms);
+                st->chunk_gpu_ms += ms;
+                st->chunk_pred_ms += s_tq_chunk_pred[i];
+                st->chunk_buffers++;
+            }
+            vkResetQueryPool(s_dev, s_tq, q, 2);
+            s_tq_chunk_serial[i] = 0;
+        }
+    }
+    xbox_FrametimeGpu(gpu_ms, tu_ms, s_tu_last_pred);
+    if (!s_tu_inited) {
+        last_uploads = s_tex_uploads;
+        s_tu_3d = 0;
+        if (s_presents % 300 == 0 && tu_log())
+            fprintf(stderr, "[TEXUP] flip %llu: off, images %.1f MB\n",
+                    (unsigned long long)s_presents, (double)nvk_image_bytes() / 1048576.0);
+        return;
+    }
+    tl0 = tu_log() ? now_ns() : 0;
+    {
+        /* BO-272: where the title is (its loading screen, the countdown);
+         * graphics.texture_upscale_preload off: always play, as before. */
+        int ld = nv2a_texup_preload() ? nv2a_texup_loading() : NV2A_TEXUP_PLAY;
+        if (ld != s_gov.loading && tu_log())
+            fprintf(stderr, "[TEXUP] title: %s, flip %llu\n",
+                    ld == NV2A_TEXUP_LOADING ? "loading" : ld == NV2A_TEXUP_PRESTART ? "prestart"
+                                                                                  : "play",
+                    (unsigned long long)s_presents);
+        nv2a_texup_gov_loading(&s_gov, ld);
+    }
+    nv2a_texup_gov_frame(&s_gov, now, gpu_ms, frame_ms,
+                         nv2a_texup_preload()
+                             ? nv2a_texup_period_ms(xbox_FlipHostPeriodNs(),
+                                                    xbox_HostFlipIntervalAsked())
+                             : nv2a_texup_period_ms(0, xbox_HostFlipIntervalAsked()),
+                         s_tu_3d, (unsigned)(s_tex_uploads - last_uploads), computed);
+    last_uploads = s_tex_uploads;
+    s_tu_3d = 0;
+    s_tu_last_pred = 0;
+    s_tu_bytes_left = nv2a_texup_gov_swap_bytes(&s_gov);
+    /* A finished job: its result to the disk cache once its submit is done. */
+    for (i = 0; i < TU_SLOTS; i++) {
+        TuSlot *s = &s_tu[i];
+        int done;
+        if (!s->used)
+            continue;
+        done = s->serial && serial_done() >= s->serial
+            && (!s->job || s->job->finished);
+        if (done && s->job) {
+            tu_save(s);
+            s->job->rb_idle = 1;
+        }
+        if (done && !s->done_flip)
+            s->done_flip = s_presents;
+        /* BO-272: the next step without waiting for a bind (preload off:
+         * at the bind only, as before). */
+        if (nv2a_texup_preload() && s->e && s->e->live && s->e->tu_slot == i + 1
+                && (s->e->tu == TU_DISK || s->e->tu == TU_BUSY)) {
+            tu_step(s->e, s);
+            if (!s->used)
+                continue;
+        }
+        /* ... and a disk read whose texture was not bound again in 10 s
+         * gives its slot back (read again at the next bind), so a few
+         * such cannot hold all eight. */
+        if ((!s->e && (done || !s->serial) && i != s_tu_job)
+                || (s->done_flip && s_presents - s->done_flip > nv2a_texup_free_flips())
+                || (s->e && s->e->tu == TU_DISK && !s->tex.img && !s->serial
+                    && s_presents - s->start_flip > nv2a_texup_free_flips())) {
+            if (s->e)
+                s->e->tu = TU_NONE;
+            tu_slot_free(i);
+        }
+    }
+    /* RECOMP_DEBUG=texup_stress=n: every n flips the running job's texture
+     * is taken as changed (its entry uploads it again at its next bind), the
+     * way a title's own change goes (the car select's textures): a stress
+     * test of the job's hold on the image it reads. */
+    {
+        static int every = -1;
+        if (every < 0) {
+            const char *x = recomp_env(RENV_TEXUP_STRESS);
+            every = x && *x ? atoi(x) : 0;
+        }
+        if (every > 0 && s_tu_job >= 0 && s_tu[s_tu_job].e && s_tu[s_tu_job].job
+                && s_tu[s_tu_job].job->started && !s_tu[s_tu_job].job->finished
+                && s_presents % (unsigned)every == 0) {
+            TexEntry *e = s_tu[s_tu_job].e;
+            if (tu_log())
+                fprintf(stderr, "[TEXUP] stress: %016llx taken as changed, flip %llu\n",
+                        (unsigned long long)e->hash, (unsigned long long)s_presents);
+            e->hash ^= 1;
+            e->gen = 0;
+        }
+    }
+    if (s_tu_job >= 0 && s_tu[s_tu_job].job && s_tu[s_tu_job].job->finished
+            && s_tu[s_tu_job].serial)
+        s_tu_job = -1;
+    if (algo && tu_state() == 1) {
+        /* The jobs: in play one new job a flip and its chunks under the
+         * budget; before the GO and on the loading screen (BO-272) the
+         * budget is larger and, as long as it and the render-thread
+         * allowance last, a finished job is followed by the next in the
+         * same flip. */
+        unsigned started = 0, maxj = nv2a_texup_gov_jobs(&s_gov);
+        unsigned q = s_tq_chunk_next % TQ_CHUNK;
+        double left, pred_all = 0, rt_ms = nv2a_texup_gov_rt_ms(&s_gov);
+        uint64_t rt0 = now_ns();
+        int timed = 0, algo0 = 0;
+        budget = nv2a_texup_gov_budget(&s_gov, now);
+        left = budget;
+        for (;;) {
+            TuSlot *s;
+            double pred;
+            uint64_t tn;
+            if (s_tu_job >= 0 && s_tu[s_tu_job].job && s_tu[s_tu_job].job->finished
+                    && s_tu[s_tu_job].serial)
+                s_tu_job = -1;
+            while (s_tu_job < 0 && s_tu_fn && started < maxj
+                   && (!started || (double)(now_ns() - rt0) / 1e6 < rt_ms)) {
+                TexEntry *e = &s_tc[s_tu_fifo[s_tu_fh]];
+                s = tu_slot_of(e);
+                s_tu_fh = (s_tu_fh + 1) % TEX_CACHE;
+                s_tu_fn--;
+                if (!e->live || e->tu != TU_WAIT || !s || s->e != e)
+                    continue;
+                tn = tl0 ? now_ns() : 0;
+                s->job = tu_job_new(&e->im, e->width, e->height, e->levels, (int)s->k.algo,
+                                    s->scale, s->k.wrap);
+                if (tn)
+                    s_tu_ns_new += now_ns() - tn;
+                if (!s->job) {
+                    e->tu = TU_NO;
+                    tu_slot_free((int)(s - s_tu));
+                    continue;
+                }
+                e->tu = TU_BUSY;
+                s_tu_job = (int)(s - s_tu);
+                st->computed++;
+                started++;
+                if (tu_log())
+                    fprintf(stderr, "[TEXUP] job %016llx %ux%u x%u %s: %.2f ms predicted%s\n",
+                            (unsigned long long)e->hash, e->width, e->height, s->scale,
+                            nv2a_texup_algo_name((int)s->k.algo), tu_job_cost(s->job),
+                            s_gov.loading ? " (before the race)" : "");
+            }
+            if (s_tu_job < 0 || left <= 0 || s_tu[s_tu_job].job->finished)
+                break;
+            s = &s_tu[s_tu_job];
+            tn = tl0 ? now_ns() : 0;
+            ensure_up();
+            if (!timed && s_tq && !s_tq_chunk_serial[q]) {
+                vkCmdWriteTimestamp(s_up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_tq,
+                                    (TQ_FRAME * TQ_SUB + q) * 2);
+                timed = 1;
+                algo0 = (int)s->k.algo;
+            }
+            pred = tu_job_encode(s->job, s_up, left, s_gov.factor[s->k.algo]);
+            left -= pred;
+            pred_all += pred;
+            if (tn)
+                s_tu_ns_enc += now_ns() - tn;
+            /* Submitted at once, behind the frame: its serial is the next. */
+            if (!s->job->finished)
+                break;                   /* the budget ended inside it */
+            s->serial = s_next_serial;
+        }
+        st->queued = s_tu_fn;
+        if (timed) {
+            vkCmdWriteTimestamp(s_up, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_tq,
+                                (TQ_FRAME * TQ_SUB + q) * 2 + 1);
+            s_tq_chunk_serial[q] = s_next_serial;
+            s_tq_chunk_pred[q] = pred_all;
+            s_tq_chunk_algo[q] = algo0;
+            s_tq_chunk_next++;
+        }
+        s_tu_last_pred = pred_all;
+    }
+    if (s_tu_ndisk) {
+        for (i = 0; i < s_tu_ndisk; i++)
+            s_tu[s_tu_disk_pending[i]].serial = s_next_serial;
+        s_tu_ndisk = 0;
+    }
+    if (s_up) {
+        uint64_t tn = tl0 ? now_ns() : 0;
+        flush(0, FL_FLIP);
+        if (tn)
+            s_tu_ns_sub += now_ns() - tn;
+    }
+    if (tl0) {
+        tl1 = now_ns() - tl0 + s_tu_ns_bind;
+        if (tl1 > 1000000u)
+            fprintf(stderr, "[TEXUP] flip %llu: render thread %.2f ms (binds %.2f; readback"
+                    " copies %.2f, at a bind or here; new jobs %.2f, recording %.2f, submit %.2f)\n",
+                    (unsigned long long)s_presents, tl1 / 1e6, s_tu_ns_bind / 1e6,
+                    s_tu_ns_save / 1e6, s_tu_ns_new / 1e6, s_tu_ns_enc / 1e6, s_tu_ns_sub / 1e6);
+        s_tu_ns_bind = s_tu_ns_save = s_tu_ns_new = s_tu_ns_enc = s_tu_ns_sub = 0;
+    }
+    st->resident_bytes = s_tu_resident;
+    if (s_presents % 300 == 0 && (algo || tu_log())) {
+        struct nv2a_texup_stats x;
+        nv2a_texup_stats(&x);
+        fprintf(stderr, "[TEXUP] flip %llu: %s, images %.1f MB, %u upscaled (%.1f MB), %u waiting;"
+                " jobs %llu, from disk %llu, computed %llu, saved %llu, dropped %llu, refused %llu,"
+                " demoted %llu;"
+                " chunks %.1f ms GPU (%.1f predicted) in %llu buffers; factor %.2f; pauses %llu\n",
+                (unsigned long long)s_presents, nv2a_texup_algo_name(algo),
+                (double)nvk_image_bytes() / 1048576.0, x.upscaled,
+                (double)x.resident_bytes / 1048576.0, x.queued, (unsigned long long)x.jobs,
+                (unsigned long long)x.from_disk, (unsigned long long)x.computed,
+                (unsigned long long)x.saved, (unsigned long long)x.dropped,
+                (unsigned long long)x.refused,
+                (unsigned long long)x.demoted, x.chunk_gpu_ms, x.chunk_pred_ms,
+                (unsigned long long)x.chunk_buffers, algo ? s_gov.factor[algo] : 0.0,
+                (unsigned long long)s_gov.pauses);
+    }
+}
+
+/* The texture cache's lookup (tex_bind): what makes an entry the stage's,
+ * and a small table from a hash of that key to the entry last found. */
+static int tc_match(const TexEntry *c, const Stage *t)
+{
+    return c->live && c->offset == t->offset && c->color == t->color
+        && c->width == t->width && c->height == t->height
+        && c->pitch == t->pitch && c->palette == t->palette
+        && c->levels == t->levels && c->sign == stage_signed(t);
+}
+
+#define TC_HINT 1024
+static uint16_t s_tc_hint[TC_HINT];   /* entry + 1, 0: none */
+
+static unsigned tc_hint_key(const Stage *t)
+{
+    uint32_t h = t->offset * 0x9E3779B1u;
+    h ^= ((uint32_t)t->color << 24) ^ (t->width << 12) ^ t->height ^ (t->palette * 0x85EBCA6Bu);
+    h ^= h >> 15;
+    return h & (TC_HINT - 1);
+}
+
 static VkImageView tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
+    unsigned hk;
     unsigned want;
     uint32_t cut;
     int algo;
 
+    s_bind_tu = 0;
     s_bind_scale = 0;
     s_bind_zbias = 0.0f;
     s_bind_hgain = NULL;
@@ -2856,18 +4444,23 @@ static VkImageView tex_bind(const Stage *t)
         }
         return s_magenta.view;
     }
-    for (i = 0; i < TEX_CACHE; i++) {
+    /* BO-277: the entry this stage's key found last, checked, before the
+     * walk over all 256 (a texture bind is ~5 a draw, ~6000 a frame: the
+     * walk was ~0.25 ms a frame of the render thread). A miss walks as
+     * before, for the entry or the victim. */
+    hk = tc_hint_key(t);
+    if (s_tc_hint[hk] && tc_match(&s_tc[s_tc_hint[hk] - 1], t))
+        e = &s_tc[s_tc_hint[hk] - 1];
+    for (i = 0; !e && i < TEX_CACHE; i++) {
         TexEntry *c = &s_tc[i];
-        if (c->live && c->offset == t->offset && c->color == t->color
-                && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels && c->sign == stage_signed(t)) {
+        if (tc_match(c, t)) {
             e = c;
             break;
         }
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
+    s_tc_hint[hk] = (uint16_t)((e ? e : victim) - s_tc + 1);
     /* graphics.ui_scale: a texture a 2D draw binds is scaled, from then on
      * and for every draw (off: want is 0 and nothing here differs). */
     want = nv2a_texscale_factor();
@@ -2890,7 +4483,9 @@ static VkImageView tex_bind(const Stage *t)
         /* A replaced texture whose variant changed is uploaded again; so is
          * one whose scale is not the one wanted now. */
         int stale = (e->rep && e->rep != nv2a_texrep_generation())
-                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut;
+                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut
+                 /* BO-245, as Metal */
+                 || (e->tu_add && (e->tgen != nv2a_texup_generation() || e->tu_demote));
         if (s_draw_2d)
             e->ui = 1;
         if (e->gen != g->flips || stale) {
@@ -2899,11 +4494,13 @@ static VkImageView tex_bind(const Stage *t)
             e->gen = g->flips;
             if (h != e->hash || stale) {
                 struct nvk_image ni;
+                if (e->tu || e->tu_slot || e->tu_add)
+                    tu_detach(e, e->tu == TU_SEEN && h != e->hash);
                 e->hash = h;
                 s_tex_changed++;
                 if (!tex_upload(t, want, algo, cut, &ni))
                     return s_black.view;
-                garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+                tex_retire(&e->im);
                 e->rep = s_tex_rep;
                 e->cut = cut;
                 e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width,
@@ -2927,7 +4524,10 @@ static VkImageView tex_bind(const Stage *t)
         struct nvk_image ni;
         e = victim;
         if (e->live)
-            garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+            tex_retire(&e->im);
+        if (e->tu || e->tu_slot || e->tu_add)
+            tu_detach(e, 0);
+        e->tgen = nv2a_texup_generation();
         memset(&e->im, 0, sizeof e->im);
         e->live = 0;
         if (!tex_upload(t, want, algo, cut, &ni))
@@ -2963,6 +4563,11 @@ static VkImageView tex_bind(const Stage *t)
         e->im = ni;
         e->live = 1;
     }
+    /* BO-245: graphics.texture_upscale's steps (Off: only an entry with a
+     * slot still out). */
+    if (nv2a_texup_algo() || e->tu_slot)
+        texup_bind(e, t, mem);
+    s_bind_tu = e->tu_add;
     /* Its scaled picture was being made: asked for once a flip, swapped in
      * when it is there (as Metal). The old image goes when the frames that
      * may use it are done. */
@@ -2979,7 +4584,7 @@ static VkImageView tex_bind(const Stage *t)
                 s_swap_flip = g->flips;   /* one a flip: its upload is the cost */
                 e->pend = 0;
                 if (scaled_image(t, e->scale, &ni)) {
-                    garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+                    tex_retire(&e->im);
                     e->im = ni;
                     e->up_scale = e->scale;
                     s_tex_uploads++;
@@ -3022,7 +4627,7 @@ static VkSamplerAddressMode address_mode(uint32_t m)
 static struct { uint64_t key; VkSampler s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static VkSampler sampler(const Stage *t, unsigned scale)
+static VkSampler sampler(const Stage *t, unsigned scale, int add)
 {
     static int point = -1;
     VkSamplerCreateInfo sc;
@@ -3040,6 +4645,10 @@ static VkSampler sampler(const Stage *t, unsigned scale)
      * between (as Metal). */
     if (scale)
         mip = 2;
+    /* BO-245: an upscaled texture has 'add' levels above the title's; one
+     * the title gave one level is blended down to its own size. */
+    if (add && !mip)
+        mip = 2;
     /* Anisotropy only on a mipmapped sampler with a linear minification
      * filter, as asked (RECOMP_GFX_ANISO), within the device's limit. */
     {
@@ -3053,6 +4662,7 @@ static VkSampler sampler(const Stage *t, unsigned scale)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
     key |= (uint64_t)scale << 40;
+    key |= (uint64_t)add << 44;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
@@ -3070,6 +4680,12 @@ static VkSampler sampler(const Stage *t, unsigned scale)
     /* Not mipmapped: level 0, with the min/mag choice kept (the Vulkan
      * spec's maxLod 0.25 for Metal's MipFilterNotMipmapped). */
     sc.maxLod = scale ? (float)(scale_levels(scale) - 1u) : mip ? (float)t->lod_max : 0.25f;
+    if (add) {
+        /* The title's clamps move down by the levels added, except a
+         * minimum of 0, which keeps the new detail (as Metal). */
+        sc.minLod = t->levels > 1 && t->lod_min ? (float)(t->lod_min + (uint32_t)add) : 0.0f;
+        sc.maxLod = t->levels > 1 ? (float)(t->lod_max + (uint32_t)add) : (float)add;
+    }
     if (vkCreateSampler(s_dev, &sc, NULL, &st) != VK_SUCCESS)
         return s_smp_n ? s_smp[0].s : VK_NULL_HANDLE;
     if (s_smp_n < SMP_MAX) {
@@ -3555,40 +5171,12 @@ static const char s_hf_vs_glsl[] =
     "    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
     "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
     "}\n";
-static const char s_hf_fs_glsl[] =
-    "#version 450\n"
-    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
-    /* a: x the peak in paper whites, y paper white / 10,000 nits, z the
-     * highlight gain, w 1 = the sRGB curve; b: x the shadows' power, y the
-     * shoulder's softness, z the black level / 10,000 nits. */
-    "layout(push_constant) uniform PC { vec4 a; vec4 b; } pc;\n"
-    "layout(location = 0) out vec4 o;\n"
-    "void main() {\n"
-    "    vec3 c = max(texelFetch(src, ivec2(gl_FragCoord.xy), 0).rgb, vec3(0.0));\n"
-    "    vec3 l = pc.a.w < 0.5 ? pow(c, vec3(2.2))\n"
-    "             : mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));\n"
-    "    float y = dot(l, vec3(0.2126, 0.7152, 0.0722));\n"
-    "    if (y > 0.0 && y < 0.18 && pc.b.x != 1.0) l *= 0.18 * pow(y / 0.18, pc.b.x) / y;\n"
-    "    float mx = max(l.r, max(l.g, l.b)), m = max(pc.a.x, 1.0);\n"
-    "    if (mx > 1.0) {\n"
-    "        float x = 1.0 + pc.a.z * (mx - 1.0);\n"
-    "        float v = 1.0;\n"
-    "        if (m > 1.0001) {\n"
-    "            float k = m - 1.0, e = 1.0 + k * (1.0 - exp(-(x - 1.0) / k));\n"
-    /* BO-195 P2: past 2.5x a blend towards a slower rational curve (the
-     * same slope at 1, the same peak), so a 4-6x core keeps a gradient. */
-    "            float r = 1.0 + k * (x - 1.0) / ((x - 1.0) + k);\n"
-    "            v = mix(e, r, pc.b.y * clamp(k - 0.5, 0.0, 1.0) * smoothstep(2.5, 4.0, x));\n"
-    "        }\n"
-    "        l *= v / mx;\n"
-    "    }\n"
-    /* BO-195 P7: black level, nits' = black + (1 - black / peak) x nits */
-    "    l *= pc.a.y;\n"
-    "    l = pc.b.z + (1.0 - pc.b.z / (pc.a.x * pc.a.y)) * l;\n"
-    "    l = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956) * l;\n"
-    "    vec3 q = pow(clamp(l, 0.0, 1.0), vec3(0.1593017578125));\n"
-    "    o = vec4(pow((0.8359375 + 18.8515625 * q) / (1.0 + 18.6875 * q), vec3(78.84375)), 1.0);\n"
-    "}\n";
+/* The maths is video/hdr_shaders.h's (BO-244), shared with the Metal
+ * composite so both give the same nits: a = (the peak in paper whites,
+ * paper white / 10,000 nits, the highlight gain, 1 = the sRGB curve),
+ * b = (the shadows' power, the shoulder's softness, the black level /
+ * 10,000 nits). */
+static const char s_hf_fs_glsl[] = HDR_FLIP_GLSL;
 
 #define HDR_SLOT_FORMAT VK_FORMAT_A2B10G10R10_UNORM_PACK32
 static VkDescriptorSetLayout s_hf_dsl;
@@ -4086,7 +5674,9 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     float *vf;
     void *ip;
     int cull = 0, cull_all = 0, tries;
-    float zbias = 0.0f;
+    float zbias = 0.0f, zb_applied = 0.0f;
+    int zb_split = 0;                 /* BO-253: offset on the front faces only */
+    VkDeviceSize uo_plain = 0;        /* the vertex constants without the offset */
     uint64_t rhash = 0;               /* BO-204 debug */
     const Stage *rstage = NULL;
     const struct nv2a_texrep_hdr_gain *hgain = NULL;
@@ -4198,7 +5788,13 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     {
         int textured = 0;
         s_draw_2d = 0;
-        if (nv2a_texscale_factor() || ui_scale_log()) {
+        s_tu_draw_3d = 0;
+        if (nv2a_texup_algo()) {
+            /* BO-245: the world's draws (a vertex program, the depth test). */
+            s_tu_draw_3d = d->program && v->depth_enable;
+            s_tu_3d += (unsigned)s_tu_draw_3d;
+        }
+        if (nv2a_texscale_factor() || ui_scale_log() || nv2a_texup_algo()) {
             const struct nv2a_pb_present *pr = nv2a_pb_present_state();
             struct nv2a_texscale_draw td2 = { d->program, v->depth_enable,
                                               v->depth_enable && v->depth_mask,
@@ -4209,7 +5805,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             const Stage *t = &s_stage[k];
             uint32_t sw, sh;
             sview[k] = s_black.view;
-            ssmp[k] = sampler(t, 0);
+            ssmp[k] = sampler(t, 0, 0);
             if (!t->mode || t->mode == 4)
                 continue;
             textured = 1;
@@ -4224,8 +5820,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 s_rtt_binds++;
             } else {
                 sview[k] = tex_bind(t);
-                if (s_bind_scale)
-                    ssmp[k] = sampler(t, s_bind_scale);
+                if (s_bind_scale || s_bind_tu)
+                    ssmp[k] = sampler(t, s_bind_scale, s_bind_tu);
                 if (zbias == 0.0f)
                     zbias = s_bind_zbias;
                 if (!rhash) {
@@ -4271,8 +5867,18 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         hdr_texlog(g);
     /* BO-176: a registered decal's depth offset, added to the constant part
      * of the title's own polygon offset (vp_scale.w), as Metal. */
-    if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips))
-        vc.c[3] += zbias / nv2a_zmax(g->format);
+    struct nv2a_vp_consts vc_plain;
+    memset(&vc_plain, 0, sizeof vc_plain);
+    if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips)) {
+        zb_applied = zbias / nv2a_zmax(g->format);
+        /* BO-253: with culling off, the offset only on the face the title
+         * treats as front: this draw with the back faces culled, a second
+         * one without the offset with the front faces culled (as Metal). */
+        zb_split = cull == 0 && nv2a_texrep_zbias_facing(g->flips);
+        if (zb_split)
+            vc_plain = vc;
+        vc.c[3] += zb_applied;
+    }
     /* BO-204 debug: zbias_probe pushes one texture's draws back a flip. */
     if (rhash && v->depth_enable)
         vc.c[3] += nv2a_texrep_zprobe(g->flips, rhash, rstage->color, rstage->width,
@@ -4292,6 +5898,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         if (vf && ip && !ubo_place(1, &vc, VP_C_BYTES, &uo[1]))
             ip = NULL;
         if (vf && ip && !ubo_place(2, &pc, PS_C_BYTES, &uo[2]))
+            ip = NULL;
+        if (vf && ip && zb_split && !ubo_place(1, &vc_plain, VP_C_BYTES, &uo_plain))
             ip = NULL;
         if (fl == s_flushes)
             break;
@@ -4359,7 +5967,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         n.sr = sr;
         n.front = v->front_face != 0x900 ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                          : VK_FRONT_FACE_CLOCKWISE;
-        n.cull = cull == 1 ? VK_CULL_MODE_BACK_BIT
+        n.cull = zb_split ? VK_CULL_MODE_BACK_BIT
+               : cull == 1 ? VK_CULL_MODE_BACK_BIT
                : cull == 2 ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_NONE;
         (void)nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
                                   g->blend_dfactor, g->blend_color, n.bf, &(int){0});
@@ -4421,6 +6030,14 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring[RING_VB].buf, &vb_off);
     vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, ib_off, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
+    if (zb_split) {
+        dyn_off[1] = (uint32_t)uo_plain;
+        vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1,
+                                &s_set0, 3, dyn_off);
+        vkCmdSetCullMode(s_cmd, VK_CULL_MODE_FRONT_BIT);
+        s_dyn.cull = VK_CULL_MODE_FRONT_BIT;
+        vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
+    }
     s_draws++;
     s_sn.draws++;
     s_sn.d2 += s_draw_2d != 0;
@@ -4429,6 +6046,12 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     if (s_vf) {
         s_vf->draws++;
         s_vf->pass_draws++;
+        if (rt->w >= 640)
+            s_vf->d_main++;
+        else if (rt->w == rt->h)
+            s_vf->d_square++;
+        else
+            s_vf->d_other++;
     }
     rt->gen = ++s_rt_seq;
 }
@@ -5172,7 +6795,7 @@ static void frame_advance(void)
  * vk_pipeline_<vendor>_<device>_<first 4 bytes of pipelineCacheUUID>[_t<hash of
  * TU_DEBUG>].bin. The bundled Turnip, a system driver and a custom package of
  * the same GPU report one vendor and device id and differ in the UUID; and
- * TU_DEBUG flags (android_vk.c: sysmem, nobin, noubwc) change what Turnip
+ * TU_DEBUG flags (vk_dyn.c: sysmem, nobin, noubwc) change what Turnip
  * compiles. Each keeps its own file, so switching drivers back and forth
  * throws nothing away. The file is our 32-byte header and the driver's data:
  * the driver checks its own header, this one catches what the driver would
@@ -5249,7 +6872,7 @@ static void pcache_prune(const char *keep)
     closedir(d);
 }
 
-static void pcache_save(void)
+static void pcache_save_locked(void)
 {
     char path[1100], tmp[1200];
     size_t n = 0;
@@ -5288,6 +6911,48 @@ static void pcache_save(void)
         }
     }
     free(data);
+}
+
+/* One save at a time: the flip's periodic one runs on a thread of its own,
+ * the way out's (quiesce, atexit) waits for it. vkGetPipelineCacheData is
+ * safe beside pipeline creation in the same cache (not created externally
+ * synchronised). */
+static pthread_mutex_t s_pcs_mu = PTHREAD_MUTEX_INITIALIZER;
+static int s_pcs_running;                /* a periodic save's thread (atomic) */
+
+static void pcache_save(void)
+{
+    pthread_mutex_lock(&s_pcs_mu);
+    pcache_save_locked();
+    pthread_mutex_unlock(&s_pcs_mu);
+}
+
+static void *pcache_save_main(void *arg)
+{
+    (void)arg;
+    pcache_save();
+    __atomic_store_n(&s_pcs_running, 0, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* The flip's save (BO-245): the cache file is written off the render
+ * thread. On the Deck's SD card that fopen/fwrite/rename could wait tens of
+ * ms behind other writes; the render thread now only starts the thread. */
+static int s_quiesced;                   /* nvk_backend_quiesce saved the cache (below) */
+
+static void pcache_save_async(void)
+{
+    pthread_t th;
+    if (s_quiesced)
+        return;                          /* the way out has saved it */
+    if (__atomic_exchange_n(&s_pcs_running, 1, __ATOMIC_ACQ_REL))
+        return;                          /* one is still writing: next time */
+    if (pthread_create(&th, NULL, pcache_save_main, NULL) != 0) {
+        __atomic_store_n(&s_pcs_running, 0, __ATOMIC_RELEASE);
+        pcache_save();
+        return;
+    }
+    pthread_detach(th);
 }
 
 static int s_blob_cold;                  /* pcache_load: the driver kept nothing */
@@ -6191,6 +7856,23 @@ static int init(void)
             s_vkq ? "queries" : "fixed", s_qprecise ? " (precise)" : "",
             poll_ok() ? "polled (timeline semaphore)" : "from a fence per frame (vk_poll=0)");
     s_failed = 0;
+#if !defined(__ANDROID__)
+    {
+        /* BO-245: graphics.texture_upscale where the device writes the
+         * formats it needs from compute and blits between them (every
+         * desktop driver; Android stays off, no measurement there). */
+        VkFormatProperties f8, f16, fb;
+        vkGetPhysicalDeviceFormatProperties(C->phys, VK_FORMAT_R8G8B8A8_UNORM, &f8);
+        vkGetPhysicalDeviceFormatProperties(C->phys, VK_FORMAT_R16G16B16A16_SFLOAT, &f16);
+        vkGetPhysicalDeviceFormatProperties(C->phys, RT_FORMAT, &fb);
+        nv2a_texup_set_supported(
+            (f8.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+            && (f8.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)
+            && (f16.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+            && (fb.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+            && (fb.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT));
+    }
+#endif
     /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
      * are prepared while the title is held (scale_prepare_loaded). */
     xbox_HostPauseIdleFn(scale_prepare_loaded);
@@ -6269,7 +7951,8 @@ static void vf_open(void)
             "p_maxdraws,rt_switch,zload,zresumed,s_flip,s_ready,s_report,s_poll,s_ring,"
             "s_sampler,s_readback,s_batch,submit_ms,submit_max_ms,qlock_ms,polls,poll_ms,"
             "poll_max_ms,waits,wait_ms,qres,qres_ms,endpass_ms,f_total,f_back,f_copy,"
-            "f_submit,f_pub,f_adv,ready_done,g_n,g_first_ms,g_last_ms,g_active_ms\n");
+            "f_submit,f_pub,f_adv,ready_done,g_n,g_first_ms,g_last_ms,g_active_ms,"
+            "d_main,d_square,d_other\n");
     memset(s_vfr, 0, sizeof s_vfr);
     s_vf = &s_vfr[0];
     fprintf(stderr, LOGP "vk_frame: one line per flip into %s (GPU timestamps %s)\n", path,
@@ -6313,7 +7996,7 @@ static void vf_flip(void)
         }
         fprintf(s_vf_out, "%llu,%u,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"
                 "%.3f,%.3f,%.3f,%u,%.3f,%.3f,%u,%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                "%.3f,%u,%u,%.3f,%.3f,%.3f\n",
+                "%.3f,%u,%u,%.3f,%.3f,%.3f,%u,%u,%u\n",
                 (unsigned long long)w->present, w->flip, w->t_ns / 1e6, w->draws, w->passes,
                 w->p_clear, w->p_load, w->p_resumed, w->p_empty, w->p_maxdraws, w->rt_switch,
                 w->zload, w->zresumed, w->sub[FL_FLIP], w->sub[FL_READY], w->sub[FL_REPORT],
@@ -6323,7 +8006,7 @@ static void vf_flip(void)
                 w->poll_ns / 1e6, w->poll_max_ns / 1e6, w->waits, w->wait_ns / 1e6, w->qres,
                 w->qres_ns / 1e6, w->endpass_ns / 1e6, w->f_total / 1e6, w->f_back / 1e6,
                 w->f_copy / 1e6, w->f_submit / 1e6, w->f_pub / 1e6, w->f_adv / 1e6,
-                w->ready_done, n, first, last, act);
+                w->ready_done, n, first, last, act, w->d_main, w->d_square, w->d_other);
         if ((w->present & 63) == 0)
             fflush(s_vf_out);
     }
@@ -6561,6 +8244,7 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 s_vf->f_total = vn - vt0;
                 vf_flip();
             }
+            texup_flip();   /* BO-245: chunks behind the frame, swaps budgeted */
             if (prof) {
                 s_pa.wait += now_ns() - t;
                 s_pa.waits += s_frame_waits - w0;
@@ -6568,7 +8252,7 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
         }
         if ((s_pso_since_save && (s_presents % 600) == 599)
                 || __atomic_exchange_n(&s_pc_save, 0, __ATOMIC_ACQ_REL))
-            pcache_save();
+            pcache_save_async();
     }
     if (!s_failed) {
         hdr_flip();

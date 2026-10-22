@@ -107,6 +107,51 @@ void xbox_PacingFlipCadence(uint32_t interval, int late, uint64_t hold_total,
  * makes its frame-queue keeper start over: called on the executor's thread
  * at a reset, it sets flags and returns. At most 4. */
 void xbox_PacingResetHook(void (*fn)(void));
+
+/* The display the window is on refreshes at this rate (Hz, 0 unknown): the
+ * presenter's event loop sets it from the window's display mode, again when
+ * the window moves to another display or the mode changes. */
+void   xbox_DisplayRateSet(double hz);
+double xbox_DisplayRate(void);
+
+/* A title that keeps its simulation's own clock between flips asks for its
+ * flips to be held to a host grid at this rate (Hz) instead of to the swap's
+ * vblank (graphics.high_refresh); 0 goes back to the vblank. Any thread. */
+void     xbox_FlipHostRate(double hz);
+uint64_t xbox_FlipHostPeriodNs(void);   /* the period asked for, 0 none */
+
+/* The display's refresh grid as the presenter's reports show it (the vblank
+ * lock's period and anchor: a refresh time, less the presenter's phase on
+ * Metal), learned while the lock is on or a title asks for the host grid;
+ * else the window system's stated refresh (VK_GOOGLE_display_timing) as a
+ * period alone. 2: period and phase (*ref_ns a refresh), 1: the period
+ * only (*ref_ns 0), 0: neither. xbox_DisplayRate is this rate when there
+ * is one, else the SDL display mode's (whole Hz). Any thread. */
+int xbox_DisplayGrid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns);
+
+/* The executor, at every swap (nv2a_pb_exec.c): the swaps seen so far, and
+ * for a swap held to the host grid its edge and the grid's period (0, 0
+ * for one that is not). The title, at the start of a frame: the same, read
+ * consistently; 1 when the last swap was on the grid. With its own count
+ * of swaps issued, the title knows how many frames are on their way and
+ * so the edge the frame it is building will flip at. */
+void xbox_FlipHostGridNote(uint32_t swaps, uint64_t due_ns, uint64_t period_ns);
+int  xbox_FlipHostGridState(uint32_t *swaps, uint64_t *due_ns, uint64_t *period_ns);
+/* When each frame held to the host grid reached the display. The executor,
+ * as it hands one over (nv2a_pb_exec.c): its flip number, its swap number
+ * (the count xbox_FlipHostGridNote gives), its edge and the hand-over time.
+ * A presenter that learns when a frame is on the glass (Vulkan's
+ * present_wait) says so by flip number; without one (headless, a backend
+ * with no display times) the hand-over stands in: the edge, or the first
+ * refresh after it when the frame came later than its edge (by half a ms). The
+ * title, by swap number: 1 and *shown_ns (host ns) and *edge_ns once known,
+ * *real bit 0 when the time is the display's, bit 1 when the frame was
+ * handed over on time (within half a ms of its edge). Any thread; a ring of the last
+ * 64 frames. */
+void xbox_FlipHostHanded(uint32_t flip, uint32_t swap, uint64_t edge_ns, uint64_t period_ns,
+                         uint64_t handed_ns);
+void xbox_FlipHostShown(uint32_t flip, uint64_t shown_ns);
+int  xbox_FlipHostShownAt(uint32_t swap, uint64_t *shown_ns, uint64_t *edge_ns, int *real);
 /* Reset the pacing state now (a settings change: Frame pacing, Power mode):
  * the keeper hooks and the display lock, at the executor's next flip. Any
  * thread. One always-printed line, "<why>: ... start over". */
@@ -153,6 +198,17 @@ int  xbox_VblankDisplayLockOn(void);
  * its own grid until fresh reports lock it again. Any thread; taken at the
  * next report. */
 void xbox_VblankDisplayRelearn(void);
+/* The refresh period the window system states (Vulkan's
+ * VK_GOOGLE_display_timing refresh cycle: gamescope's own), 0 none. While it
+ * is known the lock's period is it: taken at once when it changes and at a
+ * relearn, and steps off its grid do not fold or change it, unless eight
+ * in a row are off it (xbox_VblankDisplayCycleOk) (BO-210: a
+ * 90 <-> 60 change or a Frame pacing switch learned in under a report, not
+ * over seconds of steps). Any thread. */
+void xbox_VblankDisplayCycle(uint64_t period_ns);
+/* 1 while the stated refresh is the one in force: eight reports in a row
+ * off its grid and it is not (until eight are on it again). */
+int  xbox_VblankDisplayCycleOk(void);
 /* 1 once after the lock saw the display change its rate (then 0 until it
  * sees another): the watchdog's window then decides nothing. */
 int  xbox_VblankDisplayRateChanged(void);

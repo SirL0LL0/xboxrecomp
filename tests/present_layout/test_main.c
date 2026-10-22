@@ -137,6 +137,103 @@ static int frame_aspect(void)
     return 0;
 }
 
+/* Overscan "fill" (BO-235): the 640x448 band at the full width, into the
+ * rectangle the whole frame gets. Off and crop are the golden table's. */
+#define R4(r, a, b, c, d) ((r).x == (a) && (r).y == (b) && (r).w == (c) && (r).h == (d))
+static int fill_overscan(void)
+{
+    struct nv2a_rect s, d, s0, d0;
+    double x0, x1;
+    int whole;
+
+    /* 16:9 picture, 16:9 output: the whole window, no border, no side crop. */
+    mode(NV2A_ASPECT_16_9, 2, 0);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 0, 0, 1920, 1080));
+    /* The same output with no overscan: the whole frame in the same box, so
+     * the destination is what Show all has and only the source differs. */
+    mode(NV2A_ASPECT_16_9, 0, 0);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s0, &d0);
+    CHECK(R4(s0, 0, 0, 640, 480) && R4(d0, 0, 0, 1920, 1080));
+    /* 4:3 and the frame's own shape in a 16:9 window: pillarboxed as ever,
+     * the height filled. */
+    mode(NV2A_ASPECT_4_3, 2, 0);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 240, 0, 1440, 1080));
+    mode(NV2A_ASPECT_FRAME, 2, 0);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 240, 0, 1440, 1080));
+    /* A 4:3 window: 4:3 fills it, 16:9 is letterboxed by the window, not by
+     * the title's border. */
+    mode(NV2A_ASPECT_4_3, 2, 0);
+    nv2a_present_layout(640, 480, 1440, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 0, 0, 1440, 1080));
+    mode(NV2A_ASPECT_16_9, 2, 0);
+    nv2a_present_layout(640, 480, 1440, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 0, 135, 1440, 810));
+    /* The picture is about 7% taller than with no overscan (480/448): the
+     * same box height over fewer source rows. */
+    mode(NV2A_ASPECT_16_9, 2, 0);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(d.h == d0.h && s.h == 448 && s0.h == 480);
+    CHECK(480.0 / 448.0 > 1.0714 && 480.0 / 448.0 < 1.0715);
+    /* 21:9 output: bars at the sides, the full width of the picture. */
+    mode(NV2A_ASPECT_16_9, 2, 0);
+    nv2a_present_layout(640, 480, 2560, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 320, 0, 1920, 1080));
+
+    /* The visible columns are the whole width, as with no overscan: the
+     * widescreen HUD lays out by them. */
+    nv2a_present_visible_x(640, 480, &x0, &x1);
+    CHECK(x0 == 0.0 && x1 == 640.0);
+    nv2a_present_visible_x_at(640, 480, NV2A_ASPECT_4_3, &x0, &x1);
+    CHECK(x0 == 0.0 && x1 == 640.0);
+    nv2a_present_visible_x_ratio(640, 480, 64.0 / 27.0, &x0, &x1);
+    CHECK(x0 == 0.0 && x1 == 640.0);
+    CHECK(visible(NV2A_ASPECT_16_9, 2, 0, 1920, 1080, 0, 640, 0, 640));
+    CHECK(visible(NV2A_ASPECT_4_3, 2, 0, 1440, 1080, 0, 640, 0, 640));
+
+    /* With the 16:10 fit on the Deck's 1280x800: the fit crops the sides, as
+     * it does with no overscan (32..608), and the band fills the height. */
+    mode(NV2A_ASPECT_16_9, 2, 1);
+    nv2a_present_layout(640, 480, 1280, 800, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 32, 16, 576, 448) && R4(d, 0, 0, 1280, 800));
+    CHECK(visible(NV2A_ASPECT_16_9, 2, 1, 1280, 800, 32, 608, 0, 640));
+    /* A 4:3 picture there is pillarboxed and nothing is cropped. */
+    mode(NV2A_ASPECT_4_3, 2, 1);
+    nv2a_present_layout(640, 480, 1280, 800, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 16, 640, 448) && R4(d, 106, 0, 1067, 800));
+
+    /* The integer filter: the box is the whole frame's multiple (2x here), the
+     * band is stretched into it, so it is filtered, not nearest ("whole" 0). */
+    mode(NV2A_ASPECT_FRAME, 2, 0);
+    whole = nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_INTEGER, &s, &d);
+    CHECK(whole == 0 && R4(s, 0, 16, 640, 448) && R4(d, 320, 60, 1280, 960));
+    /* A scaled frame (2x render scale): the same share of rows. */
+    mode(NV2A_ASPECT_16_9, 2, 0);
+    nv2a_present_layout(1280, 960, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 32, 1280, 896) && R4(d, 0, 0, 1920, 1080));
+    /* No frame, no rectangle. */
+    nv2a_present_layout(0, 0, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(d.w == 0 && d.h == 0);
+
+    /* A value that is not a mode is no overscan. */
+    nv2a_present_set_overscan(7);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 0, 640, 480));
+    /* The layout cuts something for crop, fill and the fit; nothing for none. */
+    mode(NV2A_ASPECT_16_9, 0, 0);
+    CHECK(nv2a_present_layout_cuts() == 0);
+    mode(NV2A_ASPECT_16_9, 1, 0);
+    CHECK(nv2a_present_layout_cuts() == 1);
+    mode(NV2A_ASPECT_16_9, 2, 0);
+    CHECK(nv2a_present_layout_cuts() == 1);
+    mode(NV2A_ASPECT_16_9, 0, 1);
+    CHECK(nv2a_present_layout_cuts() == 1);
+    mode(NV2A_ASPECT_16_9, 0, 0);
+    return 0;
+}
+
 int main(void)
 {
     double x0, x1;
@@ -179,6 +276,9 @@ int main(void)
     nv2a_present_visible_x(640, 480, &x0, &x1);
     CHECK(x0 == 21.0 && x1 == 619.0);       /* the 2560x1080 present still stands */
 
+    CHECK(same_as_golden());
+    if (fill_overscan())
+        return 1;
     CHECK(same_as_golden());
     if (frame_aspect())
         return 1;

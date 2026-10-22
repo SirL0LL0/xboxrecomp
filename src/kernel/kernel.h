@@ -690,6 +690,11 @@ NTSTATUS __stdcall xbox_NtOpenFile(
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     ULONG ShareAccess, ULONG OpenOptions);
 
+/* For the [READ] diagnostic line (BO-221): where a file handle's position
+ * is (-1 when it is no file) and the host path it opened (NULL when the
+ * backend keeps none). */
+long long   xbox_FileHandleTell(HANDLE FileHandle);
+const char *xbox_FileHandlePath(HANDLE FileHandle);
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
@@ -780,12 +785,23 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHan
  * RECOMP_GUEST_CPUS=all leaves them on every core; xbox_GuestThreadPin puts
  * the calling thread on it. */
 DWORD_PTR xbox_GuestCpuMask(void);
+/* Opt out of the one-core pin by default (before the first guest thread);
+ * RECOMP_DEBUG=guest_cpus=<n>|all still decides when set. See kernel_thread.c
+ * for when a title may (BO-282.10). */
+void      xbox_GuestCpusDefaultUnpinned(void);
 void      xbox_GuestThreadPin(const char *role);
 /* RECOMP_TRACE=frametime (kernel_frametime.c): a guest thread to sample,
  * and the executor's running totals at each flip (ns). */
 void      xbox_FrametimeThread(const char *role);
 void      xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
                              uint64_t scan, uint64_t draw, uint64_t present);
+/* The GPU backend's part of the frame-time line (BO-245): the GPU ms of the
+ * last frame it knows complete (< 0: not known), the texture upscaler's
+ * chunks' GPU ms that completed since the last flip, and the ms of chunks it
+ * predicted for this flip. Columns gpu_ms, tu_ms, tu_pred. Any thread. */
+void      xbox_FrametimeGpu(double gpu_ms, double tu_ms, double tu_pred);
+/* RECOMP_TRACE=frametime is writing a file. */
+int       xbox_FrametimeOn(void);
 
 /* ============================================================================
  * Synchronization (kernel_sync.c)

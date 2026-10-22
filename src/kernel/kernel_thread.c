@@ -495,6 +495,18 @@ void xbox_worker_stack_free(int slot)
  * reason. RECOMP_GUEST_CPUS=all is the A/B, =<n> picks the core (cpu 0
  * takes most of the IRQ work on Linux).
  *
+ * A title may opt out of the pin, before its first guest thread starts,
+ * with xbox_GuestCpusDefaultUnpinned(), once it has evidence that its own
+ * race class is empty; guest_cpus=<n> (or =all) still overrides. Burnout 3
+ * does on Windows (BO-282.10): the Mac has run its guest threads on every
+ * core since the start with no such bug; a lockstep race (BO3_LOCKSTEP,
+ * HR off) gave the same step hashes over all 24705 steps pinned and
+ * unpinned; and on a Ryzen 7 5800X the pin cost it pictures, the title's
+ * thread waiting for its idle core to wake after each hand-off sleep
+ * (3 x 3 interleaved, 120 Hz drift corners: frames over 9 ms 560/609/550
+ * pinned, 316/321/295 unpinned; late flips 56/72/47 against 5/2/2). The
+ * toolkit's default stays the pin: BLiNX 2's light pool above.
+ *
  * =token keeps the same rule where there is no affinity to set: Darwin on
  * Apple Silicon, where SetThreadAffinityMask does nothing and the pin above
  * left every guest thread on every core. The threads that would be pinned
@@ -517,12 +529,23 @@ static int guest_cpus_token(void)
     return mode && !strcmp(mode, "token");
 }
 
+static int s_default_unpinned;
+
+void xbox_GuestCpusDefaultUnpinned(void)
+{
+    s_default_unpinned = 1;
+}
+
 DWORD_PTR xbox_GuestCpuMask(void)
 {
     const char *mode = recomp_env(RENV_GUEST_CPUS);
     DWORD_PTR proc = 0, sys = 0;
 
     if (mode && !strcmp(mode, "all"))
+        return 0;
+    /* A title that opted in (xbox_GuestCpusDefaultUnpinned) runs unpinned
+     * unless guest_cpus asks for a core. */
+    if (s_default_unpinned && (!mode || !*mode))
         return 0;
 #if !defined(_WIN32)
     if (guest_cpus_token())

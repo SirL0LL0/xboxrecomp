@@ -44,6 +44,7 @@ struct nvk_core {
     int                              validation;     /* layers on */
     int                              present_wait;   /* VK_KHR_present_id + _wait on, or the pair below */
     int                              present_wait2;  /* VK_KHR_present_id2 + _wait2 instead (Windows, BO-207) */
+    int                              display_timing; /* VK_GOOGLE_display_timing on: the refresh cycle (gamescope, BO-210) */
     int                              surface_caps2;  /* VK_KHR_get_surface_capabilities2 on (BO-207) */
     int                              colorspace_ext; /* VK_EXT_swapchain_colorspace on (BO-110) */
     int                              hdr_metadata;   /* VK_EXT_hdr_metadata on (BO-110) */
@@ -186,7 +187,10 @@ struct nvk_image {
     VkImageAspectFlags aspect;
     uint32_t       w, h, levels;
     VkImageLayout  layout;      /* as the recorded commands leave it */
+    VkDeviceSize   bytes;       /* its memory (nvk_image_bytes) */
 };
+/* BO-240, BO-245: the memory of every live nvk_image, bytes. */
+uint64_t nvk_image_bytes(void);
 int  nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
                    uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect);
 void nvk_image_free(struct nvk_image *im);

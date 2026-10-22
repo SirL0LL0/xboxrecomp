@@ -229,6 +229,85 @@ hashed or queued, no thread is started, and every path is the one it was. A
 change of the setting reaches a texture at its next bind (the cache entry
 remembers the factor it was uploaded at).
 
+## World texture upscaling (`graphics.texture_upscale`, off by default)
+
+The 3D world's textures upscaled on the GPU while playing, the way PPSSPP
+does it (BO-245, `src/kernel/nv2a_texup.h`, `src/d3d/nv2a_texup_metal.m`):
+FSRCNNX x2 8-0-4-1 or NNEDI3, 2x or 4x (`graphics.texture_upscale_scale`;
+4x is two 2x steps, for textures up to 256 a side). A Steam Deck
+(`SteamDeck=1`, or the Deck's DMI board for a start outside Steam:
+`recomp_host_is_steam_deck`) is offered 2x only: the scale row is hidden there and a 4x
+from settings.toml or the environment runs as 2x (cold 4x stalled the
+executor for 90-240 ms on the Deck). Metal, and Vulkan; the rows show only
+where a backend can do it.
+NNEDI3 is bjin's nns16-win8x4 network (mpv-prescalers) in one compute pass.
+Its result keeps the title's texels at the even positions, a quarter of a
+texel off the grid the texture is drawn on; the recombine pass moves it back
+by half an output texel (as mpv's OFFSET does), so the upscaled texture
+lines up with the original at the same coordinates.
+
+Which textures: a swizzled or DXT colour format, not signed, not a cube map,
+a render target, a video frame or a replaced texture, 16..1024 a side (512
+on handhelds), bound by a 3D draw (a vertex program, the depth test on) and
+never by a 2D one, unchanged for two flips. The title's road surfaces stay
+as they are unless `graphics.texup_roads` is on (a built-in list of texrep
+hashes the title sets with `nv2a_texup_set_skip_list`, plus
+`RECOMP_DEBUG=texup_skip=<file>`).
+
+How: the original is drawn at first; the texture's result is looked up in
+the disk cache on a worker thread; on a miss one compute job at a time runs
+the model in chunks (rows, or tiles of one group's rows) in a command buffer
+of its own committed after the frame. A governor decides each flip how many
+predicted GPU milliseconds may run: at most 0.5 ms while the frame draws 3D,
+4 ms otherwise, and only while the recent GPU p95 plus the chunk fits the
+frame period less 2 ms; nothing for 2 s after a burst of uploads; two late
+frames while computing pause it for 2 s, doubling up to 32. It corrects its
+per-device cost table from the measured GPU times. The swap is a pointer
+change at the texture's next bind once its buffer has completed. Level 0 is
+the model's output (4x: levels 0 and 1), the title's own levels follow, and
+the sampler's LOD clamps move down by the levels added. Colour: the model
+runs on the BT.709 luma; the bilinear colour is moved by the model's luma
+minus its own. Alpha: the title's texel under each one, nearest, never
+filtered (alpha kill, cut-outs and masks are the title's). A memory cap
+(1024 MB, 192 MB on handhelds; `RECOMP_DEBUG=texup_cap_mb`) sends the least
+recently used upscaled textures back to the title's.
+
+Before the race (`graphics.texture_upscale_preload`, "Upscale while loading",
+on by default; BO-272): a title says once a frame where it is
+(`nv2a_texup_set_loading`: play, its countdown before the GO, its loading
+screen; Burnout 3 reads its game state and player 1's event phase). A
+track's textures are first drawn in the countdown, so outside play the
+governor drops the upload-burst rule and the doubling pause (a late frame in
+the countdown skips one frame's compute), allows the frame's GPU room up to
+4 ms (countdown) or 6 ms (loading screen; 2 ms until three buffers are
+measured), up to 4 or 16 new jobs a flip within 1.5 or 6 ms of render
+thread, and a 32 MB swap slice; a finished job or a disk result is swapped
+in at the flip, not only at its texture's next bind; at high refresh the
+period is the host grid's. Silver Lake, first visit, Mac M5, 90 s: in-race
+jobs 217 -> 99 and chunk GPU 219 -> 107 ms, no added load time; what stays
+are the textures first drawn after the GO. Off: every frame is play, the
+jobs spread through the race as before.
+
+Disk cache: `<shader cache directory>/texup/`, one `.tup` file a result,
+named by the content hash, size, format, algorithm, scale, edge rule,
+shader version and policy, with a header and a checksum (a damaged file is
+deleted and the texture made again); 2048 MB, least recently used first
+(`RECOMP_DEBUG=texup_cache_mb`, 0: none).
+
+Shaders: LGPL-3.0-or-later files loaded at runtime
+(`third_party/upscale_shaders/NOTICE.md`: provenance, changes, how to
+replace them; `tools/shaders/upscale_wrap.py` regenerates them).
+
+Debug: `RECOMP_DEBUG=texup_log` (jobs, swaps, every 300 flips the device
+memory and counters), `texup_ctl=<file>` (a test's live switch: "algorithm
+[scale [roads]]"), `texup_cap_ms=<racing>[,<idle>]`, `texup_cost=<x>`,
+`texup_fp32=1`, `texup_max=<n>`, `texup_shaders=<dir>`.
+`RECOMP_TRACE=frametime` has the columns `gpu_ms`, `tu_ms`, `tu_pred`.
+
+Off: no draw is classified for it, nothing is hashed, queued or timed, no
+thread or pipeline is made; a texture that was upscaled goes back to the
+title's at its next bind.
+
 `graphics.dither` adds interleaved gradient noise (Jimenez 2014) of just
 under +-0.5 LSB to the Metal presenter's scale to the window, the last step
 before the 8-bit drawable. A texel that is already an exact 8-bit value
@@ -262,7 +341,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.fullscreen` | `RECOMP_PRESENT_FULLSCREEN` | yes |
 | `display.aspect` (`4:3`, `16:9`) | `RECOMP_DISPLAY_WIDESCREEN` | restart: the title reads the dashboard's video flags at boot |
 | `display.filter` | `RECOMP_PRESENT_FILTER` | yes |
-| `display.overscan` (`off`, `crop`) | `RECOMP_PRESENT_OVERSCAN` | yes |
+| `display.overscan` (`off`, `crop`, `fill`) | `RECOMP_PRESENT_OVERSCAN` | yes |
 | `display.fit` (`letterbox`, `fill16x10`) | `RECOMP_PRESENT_FIT` | yes |
 | `graphics.render_scale` | `RECOMP_RENDER_SCALE` | restart |
 | `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
@@ -271,6 +350,10 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.lod_bias` (`off`, `auto`, `-0.5`, `-1`, `-1.5`) | `RECOMP_GFX_LOD_BIAS` (`0`, `auto` or a number) | yes (a per-draw constant) |
 | `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only. Not in the menu; settings.toml or RECOMP_GFX_DITHER only |
 | `graphics.ui_scale` (`off`, `2x`, `4x`) | `RECOMP_GFX_UI_SCALE` | yes (the texture caches upload a 2D texture again at its next bind) |
+| `graphics.texture_upscale` (`off`, `fsrcnnx`, `nnedi3`) | `RECOMP_GFX_TEXTURE_UPSCALE` | yes (a texture goes to its upscaled or its own form at its next bind); Metal on Apple silicon |
+| `graphics.texture_upscale_scale` (`2x`, `4x`) | `RECOMP_GFX_TEXTURE_UPSCALE_SCALE` | yes |
+| `graphics.texup_roads` (bool) | `RECOMP_GFX_TEXUP_ROADS` | yes |
+| `graphics.texture_upscale_preload` (bool, on) | `RECOMP_GFX_TEXTURE_UPSCALE_PRELOAD` | yes |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins, where they play dry. Not used (and not shown) for a title whose GP effects image is modelled (`src/apu/apu_gp.h`) |
@@ -280,11 +363,15 @@ title's defaults when those change. Keys it does not know are kept.
 | `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). The Audio page's first row, "Custom music folder", with a folder browser (its status line and notes right under it, the page's settings after them), when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
 | `display.frame_pacing` (`auto`, `low_latency`, `smooth`; default `auto`) | `RECOMP_FRAME_PACING` | live (read twice a second); Display page, "Frame pacing", on Linux with the Vulkan presenter. `smooth` keeps one finished frame queued: each frame's present-to-display time (present_wait) gives the queue depth, and three frames in a row at the title's 60 with none queued present the frame once more, three with two queued skip one present (each logged as `[PACING] smooth:`, counted in the `[PRESENT]` exit line). The title's 30 fps stretches and redraws are not measured. +1 refresh of latency against an empty queue; a present up to ~29 ms late still makes its refresh. `low_latency` is FIFO without it (each frame at the first refresh it can make, the depth wherever the last hiccup left it). `auto` is `smooth` under gamescope (Steam Deck Game Mode, Bazzite), `low_latency` elsewhere. Needs FIFO and present_wait, and off gamescope three swapchain images; otherwise it is `low_latency`. Metal (`display.present_timing`), D3D11 and Android: no effect yet (BO-110) |
 | `display.present_mode` (`auto`, `fifo`, `mailbox`) | `RECOMP_PRESENT_MODE` | a text setting, no row in the overlay; after a restart. Vulkan with vsync: `auto` and `fifo` are FIFO, `mailbox` is MAILBOX where the surface offers it. Never picked by itself: under gamescope MAILBOX turned every late present into a repeated frame and replaced early ones (BO-110). The queue under FIFO is `display.frame_pacing` |
-| `audio.custom_music_level` (`off`, `quieter`, `match`, `louder`; default `match`) | `RECOMP_AUDIO_CUSTOM_LEVEL` | live; the level of a title's custom soundtrack against its own music (`src/apu/apu_level.h`): a slow gain on the custom-soundtrack voices only (3 s envelope, -15 to +6 dB, 0.3 s down and 4 s up, frozen in silence), with `quieter` and `louder` at -4 and +4 dB on the target and `off` no processing at all (bit for bit the title's sends). Audio page, under "Custom music folder", only for a title that registered the folder row. Needs the port to name its custom-soundtrack voices (`apu_level_set_classifier`); a title that does not is not touched. `RECOMP_AUDIO_LEVEL_LOG=1` logs the envelope and gain once a second. Separately, always on: a no-look-ahead peak limiter at -0.5 dBFS in front of the 16-bit clamp (`src/apu/apu_limit.h`), 50 ms release, which changes nothing while the mix stays under the ceiling (`RECOMP_AUDIO_SAFETY_LIMITER=0` switches it off, for comparison) |
+| `audio.custom_music_at_start` (bool, default on) | `RECOMP_AUDIO_CUSTOM_AT_START` | with a music folder set, the port starts the title on the custom soundtrack the player last chose (BO-230). Audio page, right under "Custom music folder", greyed out (with a hint) while no folder is set; only for a title that registered the folder row. Read by the port at the title's start |
+| `audio.custom_music_soundtrack` (text, default absent) | `RECOMP_AUDIO_CUSTOM_SOUNDTRACK` | a text setting (`xbox_SettingsText`) the port writes: the name of the soundtrack the player last confirmed in the title's own screen. `""` is kept in the file (it means EA GAMES TRAX was chosen); no key means nothing chosen yet (`xbox_SettingsTextIsSet`). No row |
+| `audio.custom_music_level` (`off`, `quieter`, `match`, `louder`; default `match`) | `RECOMP_AUDIO_CUSTOM_LEVEL` | live; the level of a title's custom soundtrack against its own music (`src/apu/apu_level.h`): a loudness chain on the custom-soundtrack voices only (BO-246: K-weighted 3 s short-term loudness, gated at -50 LUFS and 10 LU under the song's running level; the gain toward the target from the song's gated integrated level, -20 to +15 dB, 3 s; a 2:1 soft-knee compressor 8 dB over the target; `RECOMP_AUDIO_CUSTOM_AGC=old` runs the first leveller of BO-132 instead), with `quieter` and `louder` at -4 and +4 dB on the target and `off` no processing at all (bit for bit the title's sends). Audio page, under "Custom music folder", only for a title that registered the folder row. Needs the port to name its custom-soundtrack voices (`apu_level_set_classifier`); a title that does not is not touched. `RECOMP_AUDIO_LEVEL_LOG=1` logs the readings, the gain, the compressor and the limiter's count once a second. Separately, always on: a no-look-ahead peak limiter at -0.5 dBFS in front of the 16-bit clamp (`src/apu/apu_limit.h`), 50 ms release, which changes nothing while the mix stays under the ceiling (`RECOMP_AUDIO_SAFETY_LIMITER=0` switches it off, for comparison) |
 | `game.speed_units` (`mph`, `kmh`) | `RECOMP_SPEED_UNITS` | live; Display page, only when the title enabled a guest patch for it (`recomp_patch_enable`, lifting: Guest patches) |
 | `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Display page, only when the title enabled a guest patch for it |
 | `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
 | `display.score_board` (`original`, `smooth`) | `RECOMP_GFX_SCORE_BOARD` | live, from the next frame; a title hook on its HUD (Burnout 3: the SCORE board; the port's `src/game/scoreboard.c`): `original` touches nothing, `smooth` fades the board's plate with its text and fades the board in after a camera; Display page, only when the title enabled it (`recomp_patch_enable`) |
+| `display.rival_marker` (`original`, `farther`) | `RECOMP_GFX_RIVAL_MARKER` | live, from the next frame; where the marker over a rival changes from its far look to its near one, by guest patches at `farther` (Burnout 3: the arrow and the race position, 35 units checked every 30 steps as shipped; farther: the position below 60, the arrow past 75, checked every step); Display page, row "Rival marker switch", only when the title enabled a guest patch for it |
+| `display.crashnav_map` (`stretched`, `native`) | `RECOMP_DISPLAY_CRASHNAV_MAP` | live, from the next frame; with `display.hud_fix` on in 16:9, a title's map screen (Burnout 3: Crash Nav's Select Location) across the picture with its route and markers (stretched), or 4:3 with the rest of the menu (native); Display page, row "Crash Nav map", only when the title enabled a switch for it and `display.hud_fix` is on |
 | `graphics.bloom`, `graphics.motion_blur` (0 to 1 in tenths, default 1, a slider in percent; a file's or variable's `false` / `true` reads as 0 / 1) | `RECOMP_GFX_BLOOM`, `RECOMP_GFX_MOTION_BLUR` | live, from the next frame; the title's own effects: a guest patch skips them at `0` and scales their weight in between (BO-212); Graphics page, only when the title enabled a guest patch for them |
 | `graphics.crash_60fps` (bool, default off) | `RECOMP_GFX_CRASH_60FPS` | live, from the title's next frame; the title's own 30 Hz phases (Burnout 3: crash and takedown cameras) at 60, by a guest patch on the title's own rate choice at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
 | `graphics.split_60fps` (bool, default off) | `RECOMP_GFX_SPLIT_60FPS` | from the title's next two-player stage; the title's 30 Hz split screen at 60, by a guest patch at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
@@ -299,7 +386,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `advanced.perf_overlay` | `RECOMP_OVERLAY_PERF` | yes |
 | `advanced.diagnostic_log` (bool; default on, off in a release build) | `RECOMP_LOG_DIAG` | yes; the print gate (`logging.md`). The row shows where the log is and what set it when the environment did |
 | `advanced.perf_steps` (bool) | `RECOMP_OVERLAY_PERF_STEPS` | yes; the graph marks frames of more than one simulation step, when the port reports them (`xbox_PresentCadenceSteps`) |
-| `display.present_timing` (`legacy`, `auto`) | `RECOMP_PRESENT_TIMING` | yes, within half a second; Display page, Metal windows only. `legacy` presents a frame when it is ready; `auto` aims each frame at one refresh (`present-timing.md`) |
+| `display.present_timing` (`legacy`, `auto`; default `auto` on macOS, `legacy` elsewhere) | `RECOMP_PRESENT_TIMING` | yes, within half a second; Display page, Metal windows only. `legacy` presents a frame when it is ready; `auto` aims each frame at one refresh (`present-timing.md`) |
 
 Power modes: *stock* is the busy-wait; *performance* sleeps and spins the
 last 8 ms before each frame (steady frame time, about 10 W on the Deck);

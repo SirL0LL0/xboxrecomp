@@ -32,6 +32,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
+#import <QuartzCore/CAEDRMetadata.h>
+#import <IOKit/IOKitLib.h>
 
 #include <SDL.h>
 #include <SDL_metal.h>
@@ -49,6 +52,7 @@
 #include "fb_present_metal.h"
 #include "latency_trace.h"
 #include "post_shaders.h"
+#include "hdr_shaders.h"      /* BO-244: the HDR maths shared by both presenters */
 #include "smaa.h"
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"
@@ -75,7 +79,19 @@ static id<MTLDevice>               s_dev;
  * paper white. fs_hdr_comp puts the scene's light (the frame where it
  * equals the backend's scene snapshot) through a shoulder towards the peak
  * and the HUD at its own white, live from the settings. */
-static int                         s_hdr_win;    /* the layer is EDR now */
+static int                         s_hdr_win;    /* the layer is HDR now: HDRL_PQ or HDRL_EDR */
+enum { HDRL_OFF, HDRL_EDR, HDRL_PQ };
+static id<MTLRenderPipelineState>  s_hp_edr, s_hp_ovl, s_hp_pat;  /* BO-244 */
+static id<MTLTexture>              s_ovl;        /* BO-244: the overlay before its encode (PQ) */
+static float                       s_meta_peak;  /* BO-244: the peak the layer's HDR10 metadata says */
+static float                       s_edid_peak;  /* BO-244: the display's EDID peak, nits (0 none) */
+static float                       s_pat_r[4];   /* BO-244: where the last pattern went (drawable px) */
+static int                         s_pat_kind = -1;
+static float                       s_pat_ab[2];  /* BO-244: its two levels asked, nits */
+static float                       s_pat_drawn[2]; /* and drawn (the disc's background at the display's level) */
+static void hdr_comp_consts(float hp[12], float pk, float pw, float hw, float sh, float hl, int srgb,
+                            float sf, float bl, int scene);
+static float                       s_probe_now;  /* BO-227: the current headroom, for the probe */
 static id<MTLRenderPipelineState>  s_hp_blit, s_hp_fxaa, s_hp_cas, s_hp_comp;   /* half-float variants */
 static id<MTLTexture>              s_scene[3];   /* per slot: the scene snapshot (nv2a_pb_metal.m) */
 static int                         s_scene_ok[3];
@@ -208,10 +224,9 @@ static int             s_strategy = -1;         /* PC_*; -1 before the first loo
 static os_unfair_lock  s_pc_lock = OS_UNFAIR_LOCK_INIT;
 static atomic_int      s_inflight;              /* presents not on the glass yet */
 static atomic_uint     s_skips;
-static unsigned        s_poll;
 static char            s_disp_name[48];
 static int             s_disp_fullscreen;
-static uint64_t        s_last_commit_ns;        /* main thread */
+static uint64_t        s_last_commit_ns;        /* present thread */
 static unsigned        s_no_drawable;
 static FILE           *s_glass_f;
 static int             s_glass_tried;
@@ -320,8 +335,8 @@ static void timing_pacing_reset(void)
     os_unfair_lock_unlock(&s_pc_lock);
 }
 
-/* Twice a second, on the main thread: the display, the setting, the
- * strategy; what follows from a change. */
+/* Twice a second, on the main thread (fbm_main_tick): the display, the
+ * setting, the strategy; what follows from a change. */
 static void timing_poll(SDL_Window *win)
 {
     static int hooked;
@@ -333,10 +348,21 @@ static void timing_poll(SDL_Window *win)
     char name[sizeof s_disp_name];
     int fs = 0, strategy, changed;
 
-    if (s_strategy >= 0 && s_poll++ % 30)
-        return;
+    {
+        /* Twice a second (it was every 30th present). */
+        uint64_t now = xbox_HostNowNs();
+        static uint64_t next;
+        if (s_strategy >= 0 && now < next)
+            return;
+        next = now + 500000000ull;
+    }
     display_probe(win, &d, name, sizeof name, &fs);
-    strategy = pc_pick(&d, pc_setting(recomp_env(RENV_PRESENT_TIMING)));
+    {
+        /* auto unless the setting says otherwise: on macOS legacy's two
+         * drawables showed every other frame on some displays (BO-239). */
+        const char *t = recomp_env(RENV_PRESENT_TIMING);
+        strategy = pc_pick(&d, t && *t ? pc_setting(t) : PC_SET_AUTO);
+    }
     changed = strategy != s_strategy || d.vrr != s_disp.vrr
               || (int)(d.refresh_hz * 100) != (int)(s_disp.refresh_hz * 100)
               || strcmp(name, s_disp_name) || fs != s_disp_fullscreen;
@@ -351,6 +377,8 @@ static void timing_poll(SDL_Window *win)
                   (uint64_t)(env_ms(RENV_PRESENT_PHASE, 5.0, 0.0, 15.0) * 1e6),
                   (uint64_t)(env_ms(RENV_PRESENT_LEAD, 12.0, 0.0, 33.0) * 1e6),
                   (int)env_ms(RENV_PRESENT_DEPTH, 1.0, 0.0, PC_DEPTH_MAX));
+    pc_pacer_set_handover(&s_pacer, (uint64_t)(env_ms(RENV_PRESENT_HANDOVER,
+                                                      PC_HANDOVER_NS / 1e6, 0.5, 16.0) * 1e6));
     os_unfair_lock_unlock(&s_pc_lock);
     snprintf(s_disp_name, sizeof s_disp_name, "%s", name);
     s_disp_fullscreen = fs;
@@ -381,8 +409,11 @@ static void timing_poll(SDL_Window *win)
     switch (strategy) {
     case PC_LOCK:
         fprintf(stderr, "the vblank %.1f ms before a display refresh, each frame"
-                " shown %d refresh(es) after it, 3 drawables\n",
-                s_pacer.phase_ns / 1e6, s_pacer.depth);
+                " shown %d refresh(es) after it, handed over %.1f ms after the refresh"
+                " before its own, 3 drawables\n",
+                s_pacer.phase_ns / 1e6, s_pacer.depth,
+                (s_pacer.handover_ns < s_pacer.period_ns / 2 ? s_pacer.handover_ns
+                                                             : s_pacer.period_ns / 2) / 1e6);
         break;
     case PC_TIMED:
     case PC_TIMED_ODD:
@@ -461,7 +492,10 @@ static void glass_note(uint32_t flip, uint64_t vblank_ns, uint64_t commit_ns,
     os_unfair_lock_unlock(&s_pc_lock);
     if (report)
         xbox_VblankDisplayRefresh(report, period);
-    if (raised > 0)
+    if (raised == 2)
+        fprintf(stderr, "[PRESENT] timing: frames reached the glass a refresh early; now"
+                " handed over half a refresh before their refresh\n");
+    else if (raised > 0)
         fprintf(stderr, "[PRESENT] timing: frames reached the glass late; now %s\n",
                 strategy == PC_LOCK ? "one refresh more between a frame's vblank and its refresh"
                                     : "2 ms more between a frame's vblank and its present");
@@ -503,55 +537,10 @@ static const char s_blit_msl[] =
     "    }\n"
     "    return float4(c, 1);\n"
     "}\n"
-    /* BO-110: the same scale into an extended-sRGB EDR layer. hr.x is the
-     * peak in paper whites (the display's headroom, or the user's peak if
-     * lower). Values at or below 1.0 pass as they are; above, the brightest
-     * channel in linear light goes through a shoulder with slope 1 at 1.0
-     * that approaches the peak, and the others keep their ratio to it (hue
-     * kept), then back to extended sRGB. */
-    "float3 hdr_lin(float3 c) {\n"
-    "    return select(c / 12.92, pow((max(c, 0.0) + 0.055) / 1.055, 2.4), c > 0.04045);\n"
-    "}\n"
-    "float3 hdr_enc(float3 l) {\n"
-    "    return select(l * 12.92, 1.055 * pow(max(l, 0.0), 1.0 / 2.4) - 0.055, l > 0.0031308);\n"
-    "}\n"
-    /* The composite, at the frame's size: f the frame, g the scene
-     * snapshot (hp.w 1 when there is one). A pixel where the frame is the
-     * snapshot is scene: linear, a shoulder on its brightest channel (slope
-     * 1 at paper white, towards the peak; hue kept), times paper white. One
-     * that differs was drawn over by the HUD or a menu: clamped to 1.0, times
-     * the HUD's white. hp: paper, HUD and peak in EDR units (1.0 = the
-     * system's SDR white), has scene. Out: extended sRGB. */
-    "fragment float4 fs_hdr_comp(VO vo [[stage_in]], texture2d<float> t [[texture(0)]],\n"
-    "                            texture2d<float> sc [[texture(1)]], sampler s [[sampler(0)]],\n"
-    "                            constant float4 *hq [[buffer(0)]]) {\n"
-    /* hq[1]: x the shoulder's softness, y the black level in EDR units (BO-195) */
-    "    float4 hp = hq[0], hb = hq[1];\n"
-    "    float3 f = t.sample(s, vo.t).rgb, l;\n"
-    "    bool scene = false;\n"
-    "    if (hp.w > 0.5) {\n"
-    "        float3 g = sc.sample(s, vo.t).rgb, d = abs(f - g);\n"
-    "        scene = max(d.r, max(d.g, d.b)) < 0.002;\n"
-    "    }\n"
-    "    if (!scene) {\n"
-    "        l = hdr_lin(saturate(f)) * hp.y;\n"
-    "    } else {\n"
-    "        l = hdr_lin(max(f, 0.0));\n"
-    "        float mx = max(l.r, max(l.g, l.b)), m = max(hp.z / hp.x, 1.0);\n"
-    "        if (mx > 1.0) {\n"
-    "            float y = 1.0;\n"
-    "            if (m > 1.0001) {\n"
-    "                float k = m - 1.0, e = 1.0 + k * (1.0 - exp(-(mx - 1.0) / k));\n"
-    "                float r = 1.0 + k * (mx - 1.0) / ((mx - 1.0) + k);\n"
-    "                y = mix(e, r, hb.x * clamp(k - 0.5, 0.0, 1.0) * smoothstep(2.5, 4.0, mx));\n"
-    "            }\n"
-    "            l *= y / mx;\n"
-    "        }\n"
-    "        l *= hp.x;\n"
-    "    }\n"
-    "    l = hb.y + (1.0 - hb.y / hp.z) * l;\n"
-    "    return float4(hdr_enc(l), 1);\n"
-    "}\n"
+    /* BO-110/BO-244: the HDR composite (PQ, or the extended-sRGB fallback),
+     * the overlay's encode and the patterns: video/hdr_shaders.h, the maths
+     * the Vulkan flip pass runs. */
+    HDR_COMP_MSL
     /* The post passes (post_shaders.h): the frame at its own size, one pixel
      * to one texel, so a bilinear fetch at an offset of whole texels is that
      * texel. */
@@ -570,8 +559,65 @@ static const char s_blit_msl[] =
     POST_CAS_BODY
     "}\n";
 
+/* BO-244: the display's peak luminance from its EDID's CTA-861 HDR static
+ * metadata block (max luminance code value v: 50 x 2^(v/32) nits), as the
+ * Linux presenter reads it from DRM. On Apple silicon the EDID of a display
+ * on a USB-C/DisplayPort/Thunderbolt port is the "EDID" property of its
+ * IOPortTransportStateDisplayPort entry; the one whose vendor and product
+ * match the screen's (CGDisplayVendorNumber / ModelNumber) is taken. 0 when
+ * there is none (the built-in panel, HDMI, an EDID without the block). */
+static float edid_peak(const uint8_t *e, size_t n)
+{
+    for (size_t b = 128; b + 128 <= n; b += 128) {
+        const uint8_t *x = e + b;
+        size_t end = x[2];
+        if (x[0] != 0x02 || end < 4 || end > 127)
+            continue;
+        for (size_t i = 4; i < end;) {
+            unsigned tag = x[i] >> 5, len = x[i] & 31u;
+            if (tag == 7 && len >= 4 && x[i + 1] == 6 && x[i + 4])
+                return 50.0f * powf(2.0f, (float)x[i + 4] / 32.0f);
+            i += 1 + len;
+        }
+    }
+    return 0.0f;
+}
+static float screen_edid_peak(NSScreen *scr)
+{
+    NSNumber *sn = [[scr deviceDescription] objectForKey:@"NSScreenNumber"];
+    CGDirectDisplayID did = sn ? (CGDirectDisplayID)[sn unsignedIntValue] : CGMainDisplayID();
+    uint32_t ven = CGDisplayVendorNumber(did), mod = CGDisplayModelNumber(did);
+    io_iterator_t it = 0;
+    io_service_t sv;
+    float pk = 0.0f;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPortTransportStateDisplayPort"),
+                                     &it) != KERN_SUCCESS)
+        return 0.0f;
+    while (pk <= 0.0f && (sv = IOIteratorNext(it)) != 0) {
+        CFTypeRef d = IORegistryEntryCreateCFProperty(sv, CFSTR("EDID"), kCFAllocatorDefault, 0);
+        if (d && CFGetTypeID(d) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)d) >= 256) {
+            const uint8_t *e = CFDataGetBytePtr((CFDataRef)d);
+            uint32_t ev = ((uint32_t)e[8] << 8) | e[9], em = e[10] | ((uint32_t)e[11] << 8);
+            if (ev == ven && em == mod)
+                pk = edid_peak(e, (size_t)CFDataGetLength((CFDataRef)d));
+        }
+        if (d)
+            CFRelease(d);
+        IOObjectRelease(sv);
+    }
+    IOObjectRelease(it);
+    return pk;
+}
+
 /* BO-110: the window's display, for the HDR settings: how far past its SDR
- * white it can go at most and now (EDR headroom; 1.0 none). */
+ * white it can go at most and now (EDR headroom; 1.0 none). BO-244: and its
+ * EDID's peak in nits, logged beside the headroom and used for the default
+ * peak only while no headroom is known (nv2a_host_hdr_levels). HDR10 maps
+ * 100 nits to the system's SDR white, so headroom x 100 is nits: the
+ * PG32UCDP in its True Black 400 mode has potential 5.076 = its EDID's
+ * 507.6 nits / 100; in Peak 1000 macOS says 13.166 while the EDID stays. */
+static NSScreen *s_edid_scr;
+static float     s_edid_pot;
 static void hdr_display(SDL_Window *win)
 {
     NSScreen *scr = [NSScreen mainScreen];
@@ -585,34 +631,129 @@ static void hdr_display(SDL_Window *win)
         pot = (float)scr.maximumPotentialExtendedDynamicRangeColorComponentValue;
         now = (float)scr.maximumExtendedDynamicRangeColorComponentValue;
     }
+    /* Again when the window moves to another screen or the screen's
+     * potential changes (a display mode or the monitor's HDR mode): this
+     * runs every main-loop tick, so the headroom is re-read all the time. */
+    if (scr != s_edid_scr || pot != s_edid_pot) {
+        s_edid_scr = scr;
+        s_edid_pot = pot;
+        s_edid_peak = screen_edid_peak(scr);
+        fprintf(stderr, "[HDR] display %s: EDID peak %.1f nits, EDR headroom potential %.3fx"
+                " (x 100 nits: %.1f)\n", [[scr localizedName] UTF8String], s_edid_peak, pot,
+                pot * 100.0f);
+        nv2a_host_hdr_display_peak(s_edid_peak);
+    }
+    s_probe_now = now;
     nv2a_host_hdr_display(pot, now);
 }
 
-/* BO-110: the layer EDR (RGBA16Float, extended sRGB: the encoding the
- * game's values and the overlay's are in, 1.0 the system's SDR white, past
- * 1.0 brighter) or as before. Live: the slots and the post targets follow
- * the format at their next use. */
+/* BO-110/BO-244: the layer's HDR mode, live (the slots and the post targets
+ * follow the format at their next use):
+ *   HDRL_PQ   the Deck's output (BO-244): RGBA16Float holding ST 2084 PQ code
+ *             values in BT.2020 (kCGColorSpaceITUR_2100_PQ), HDR10 metadata
+ *             (CAEDRMetadata: the display's peak; HDR10 maps 100 nits to the
+ *             system's SDR white), the same composite maths as Vulkan's flip
+ *             pass, in nits. The default.
+ *   HDRL_EDR  the fallback (BO-110/BO-227's): RGBA16Float in extended sRGB,
+ *             1.0 = the system's SDR white = 100 nits. RECOMP_HDR_LAYER=edr.
+ *   HDRL_OFF  BGRA8 sRGB, as before. */
+static int hdr_layer_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("RECOMP_HDR_LAYER");
+        m = e && !strcmp(e, "edr") ? HDRL_EDR : HDRL_PQ;
+    }
+    return m;
+}
+/* BO-244: macOS maps a PQ layer's nits relative to its SDR white, not to
+ * the panel: the HDR10 metadata's opticalOutputScale says how many of the
+ * content's nits make EDR 1.0 (the system's SDR white), 100 by default, and
+ * the compositor puts that at the brightness slider's level. On the
+ * PG32UCDP in Peak 1000 mode with the slider at the top (CoreBrightness:
+ * SDR 265.05 nits, NitsPhysical 265.05, DisplayServicesBrightness 1.0,
+ * MaxNitsEDR 1316.6, AvailableHeadroom 4.967 = 1316.6 / 265.05) a 100-nit
+ * code reached the panel at 265 nits, the peak patch's 250-nit disc at 660
+ * and its 497 background at 1309, everything past ~187 asked nits past the
+ * metadata's max on the way to the panel, and the disc was gone at every
+ * setting; the picture 2.65x brighter than the Deck's for the same levels.
+ * Fix: opticalOutputScale = the SDR white's nits (potential / granted
+ * headroom x 100: potential = the panel's peak / 100, granted = the panel's
+ * peak / the SDR white), so a code of N nits is N nits on the panel as on
+ * the Deck, whatever the slider; the metadata's max = the panel's peak
+ * (potential x 100 = the granted headroom x the SDR white, the compositor's
+ * clip in these absolute nits). The grant does not follow the metadata (the
+ * PG32UCDP: 4.967x with max 500, 1000, 1317, 4000 or none). */
+static float s_meta_scale;      /* the SDR white in nits the metadata says */
+static float hdr_sdr_white(void)
+{
+    float g = nv2a_host_hdr_granted(), p = nv2a_host_hdr_potential();
+    return g > 1.0f && p > g ? p / g * 100.0f : 100.0f;
+}
+static float hdr_meta_peak(void)
+{
+    float p = nv2a_host_hdr_potential();
+    return p > 1.0f ? p * 100.0f : 1000.0f;
+}
+static void hdr_meta(void)
+{
+    float peak = hdr_meta_peak(), scale = hdr_sdr_white();
+    if (s_hdr_win != HDRL_PQ || (peak == s_meta_peak && scale == s_meta_scale))
+        return;
+    s_meta_peak = peak;
+    s_meta_scale = scale;
+    s_layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0.0001f
+                                                          maxLuminance:peak
+                                                    opticalOutputScale:scale];
+    fprintf(stderr, "[PRESENT] HDR10 metadata: max %.0f nits (the display's peak), SDR white %.1f nits"
+            " (EDR 1.0; potential %.3f / granted %.3f): a code of N nits is N nits on the panel\n",
+            peak, scale, nv2a_host_hdr_potential(), nv2a_host_hdr_granted());
+}
 static void hdr_layer(int on)
 {
     CGColorSpaceRef cs;
-    if (on && (!s_hp_blit || !s_hp_comp))
-        on = 0;
-    if (on == s_hdr_win)
+    int mode = on ? hdr_layer_mode() : HDRL_OFF;
+    if (mode == HDRL_PQ && (!s_hp_blit || !s_hp_comp || !s_hp_ovl || !s_hp_pat))
+        mode = HDRL_EDR;
+    if (mode == HDRL_EDR && (!s_hp_blit || !s_hp_edr))
+        mode = HDRL_OFF;
+    if (mode == s_hdr_win)
         return;
-    s_hdr_win = on;
-    cs = CGColorSpaceCreateWithName(on ? kCGColorSpaceExtendedSRGB : kCGColorSpaceSRGB);
-    s_layer.pixelFormat = on ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-    s_layer.wantsExtendedDynamicRangeContent = on ? YES : NO;
+    s_hdr_win = mode;
+    cs = CGColorSpaceCreateWithName(mode == HDRL_PQ ? kCGColorSpaceITUR_2100_PQ
+                                    : mode == HDRL_EDR ? kCGColorSpaceExtendedSRGB : kCGColorSpaceSRGB);
+    /* On the present thread, which has no run loop to commit an implicit
+     * transaction: an explicit one. */
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    s_layer.pixelFormat = mode ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    s_layer.wantsExtendedDynamicRangeContent = mode ? YES : NO;
     s_layer.colorspace = cs;
+    if (mode != HDRL_PQ)
+        s_layer.EDRMetadata = nil;      /* macOS 10.15+; the build's floor is 13 */
+    [CATransaction commit];
     CGColorSpaceRelease(cs);
+    s_meta_peak = 0.0f;
+    s_meta_scale = 0.0f;
+    if (mode == HDRL_PQ)
+        hdr_meta();
+    /* BO-227: macOS 15+ tone maps an extended-range layer into the headroom
+     * it grants (CAToneMapModeAutomatic). The shoulder here already fits the
+     * light to the peak, and the peak patch needs values past the display's
+     * peak clipped, not compressed: no system tone map (PQ as well). */
+    if (@available(macOS 15.0, *)) {
+        if ([s_layer respondsToSelector:@selector(setToneMapMode:)])
+            s_layer.toneMapMode = mode ? CAToneMapModeNever : CAToneMapModeAutomatic;
+    }
     /* SMAA's last pass writes the frame's format: made again. */
     for (int k = 0; k < 3; k++) {
         [s_pso_sm[k] release];
         s_pso_sm[k] = nil;
     }
     s_smaa_state = 0;
-    fprintf(stderr, "[PRESENT] HDR %s: %s layer\n", on ? "on" : "off",
-            on ? "EDR (RGBA16Float, extended sRGB)" : "SDR (BGRA8, sRGB)");
+    fprintf(stderr, "[PRESENT] HDR %s: %s layer\n", mode ? "on" : "off",
+            mode == HDRL_PQ ? "HDR10 (RGBA16Float, ST 2084 PQ, BT.2020)"
+            : mode == HDRL_EDR ? "EDR (RGBA16Float, extended sRGB)" : "SDR (BGRA8, sRGB)");
 }
 
 /* BO-110: the peak calibration patch for the overlay (nv2a_host_hdr_patch):
@@ -624,8 +765,8 @@ static float          s_patch_nits = -1.0f;
 static void *hdr_patch(float nits)
 {
     enum { PW = 128, PH = 64 };
-    if (!s_hdr_win)
-        return NULL;
+    if (s_hdr_win != HDRL_EDR)
+        return NULL;            /* BO-244: PQ draws the patterns itself, as Vulkan */
     if (!s_patch) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
@@ -653,6 +794,271 @@ static void *hdr_patch(float nits)
         s_patch_nits = nits;
     }
     return (void *)s_patch;
+}
+
+/* BO-227/BO-244 (RECOMP_HDR_PROBE=1, a test hook): once a second, after
+ * the overlay, the values this presenter hands macOS: the headroom (now and
+ * potential), the levels, the whole frame (the title's encoded values)
+ * against the composite's output, decoded to nits, and what the Vulkan flip
+ * pass's maths (video/hdr_shaders.h, transcribed below) gives for the same
+ * values: the error, and the light past paper white (pixels, their nits:
+ * median, 99th percentile, max; how many reach 90 % of the peak). Then the
+ * drawable at the pattern's disc and background. The PQ layer in nits; the
+ * extended-sRGB fallback in nits too (EDR x 100). */
+static int hdr_probe_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HDR_PROBE");
+        on = e && *e && strcmp(e, "0") ? 1 : 0;
+    }
+    return on;
+}
+static float probe_lin(float c)
+{
+    float a = fabsf(c), l = a <= 0.04045f ? a / 12.92f : powf((a + 0.055f) / 1.055f, 2.4f);
+    return c < 0 ? -l : l;
+}
+static float probe_pq_nits(float e)
+{
+    float p = powf(fmaxf(e, 0.0f), 1.0f / 78.84375f);
+    return 10000.0f * powf(fmaxf(p - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * p),
+                           1.0f / 0.1593017578125f);
+}
+/* hdr_tone + the scale + hdr_pq's black lift, in C: BT.709 nits, before the
+ * BT.2020 matrix (the probe compares the brightest BT.709 channel's nits). */
+static void probe_ref(const float c0[3], const float hp[12], float out[3])
+{
+    float l[3], y, mx, m;
+    for (int i = 0; i < 3; i++) {
+        float c = fmaxf(c0[i], 0.0f);
+        l[i] = hp[3] < 0.5f ? powf(c, 2.2f)
+             : (c > 0.04045f ? powf((c + 0.055f) / 1.055f, 2.4f) : c / 12.92f);
+    }
+    y = 0.2126f * l[0] + 0.7152f * l[1] + 0.0722f * l[2];
+    if (y > 0.0f && y < 0.18f && hp[4] != 1.0f)
+        for (int i = 0; i < 3; i++) l[i] *= 0.18f * powf(y / 0.18f, hp[4]) / y;
+    mx = fmaxf(l[0], fmaxf(l[1], l[2]));
+    m = fmaxf(hp[0], 1.0f);
+    if (mx > 1.0f) {
+        float x = 1.0f + hp[2] * (mx - 1.0f), v = 1.0f;
+        if (m > 1.0001f) {
+            float k = m - 1.0f, e = 1.0f + k * (1.0f - expf(-(x - 1.0f) / k));
+            float r = 1.0f + k * (x - 1.0f) / ((x - 1.0f) + k);
+            float t = fminf(fmaxf((x - 2.5f) / 1.5f, 0.0f), 1.0f);
+            float w = hp[5] * fminf(fmaxf(k - 0.5f, 0.0f), 1.0f) * t * t * (3.0f - 2.0f * t);
+            v = e + (r - e) * w;
+        }
+        for (int i = 0; i < 3; i++) l[i] *= v / mx;
+    }
+    for (int i = 0; i < 3; i++)
+        out[i] = 10000.0f * (hp[6] + (1.0f - hp[6] / hp[9]) * l[i] * hp[1]);
+}
+static int probe_fcmp(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+static void hdr_probe(id<MTLCommandBuffer> cb, id<MTLTexture> frame, id<MTLTexture> comp,
+                      id<MTLTexture> draw)
+{
+    static uint64_t last;
+    static id<MTLBuffer> fbuf, cbuf, dbuf;
+    static int busy;
+    uint64_t now = xbox_HostNowNs();
+    float pk, pw, hw, sh, hl, sf, bl, hp[12];
+    int srgb;
+    if (!hdr_probe_on() || !s_hdr_win || busy || now - last < 1000000000ull || !comp
+            || [comp width] != [frame width] || [comp height] != [frame height])
+        return;
+    last = now;
+    nv2a_host_hdr_levels(&pk, &pw, &hw);
+    nv2a_host_hdr_tone(&sh, &hl, &srgb);
+    nv2a_host_hdr_shape(&sf, &bl);
+    hdr_comp_consts(hp, pk, pw, hw, sh, hl, srgb, sf, bl, 1);
+    const NSUInteger W = [frame width], H = [frame height];
+    const int fbpp = [frame pixelFormat] == MTLPixelFormatRGBA16Float ? 8 : 4;
+    if (!fbuf || [fbuf length] < W * H * fbpp) {
+        [fbuf release];
+        fbuf = [s_dev newBufferWithLength:W * H * 8 options:MTLResourceStorageModeShared];
+    }
+    if (!cbuf || [cbuf length] < W * H * 8) {
+        [cbuf release];
+        cbuf = [s_dev newBufferWithLength:W * H * 8 options:MTLResourceStorageModeShared];
+    }
+    if (!dbuf)
+        dbuf = [s_dev newBufferWithLength:4 * 8 options:MTLResourceStorageModeShared];
+    if (!fbuf || !cbuf || !dbuf)
+        return;
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:frame sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(W, H, 1) toBuffer:fbuf destinationOffset:0
+   destinationBytesPerRow:W * fbpp destinationBytesPerImage:W * H * fbpp];
+    [b copyFromTexture:comp sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(W, H, 1) toBuffer:cbuf destinationOffset:0
+   destinationBytesPerRow:W * 8 destinationBytesPerImage:W * H * 8];
+    /* the drawable at the last pattern: its centre, inside near the left
+     * edge (the disc's background, or the left half), near the right edge */
+    int have_pat = 0;               /* BO-244: hdr_probe_patch, below, each second on its own */
+    float pr[4];
+    int pkind = s_pat_kind;
+    const float pat_a = s_pat_ab[0], pat_b = s_pat_ab[1], meta = s_meta_peak;
+    memcpy(pr, s_pat_r, sizeof pr);
+    if (have_pat) {
+        float px[3][2] = { { (pr[0] + pr[2]) * 0.5f, (pr[1] + pr[3]) * 0.5f },
+                           { pr[0] + (pr[2] - pr[0]) * 0.06f, (pr[1] + pr[3]) * 0.5f },
+                           { pr[2] - (pr[2] - pr[0]) * 0.06f, (pr[1] + pr[3]) * 0.5f } };
+        for (int j = 0; j < 3; j++) {
+            NSUInteger X = (NSUInteger)fmaxf(0.0f, fminf(px[j][0], [draw width] - 1.0f));
+            NSUInteger Y = (NSUInteger)fmaxf(0.0f, fminf(px[j][1], [draw height] - 1.0f));
+            [b copyFromTexture:draw sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(X, Y, 0)
+                    sourceSize:MTLSizeMake(1, 1, 1) toBuffer:dbuf destinationOffset:(NSUInteger)j * 8
+           destinationBytesPerRow:8 destinationBytesPerImage:8];
+        }
+    }
+    [b endEncoding];
+    const float pot = nv2a_host_hdr_potential(), cur = s_probe_now;
+    const int mode = s_hdr_win;
+    struct { float v[12]; } hq;      /* a block takes no arrays */
+    memcpy(hq.v, hp, sizeof hq.v);
+    busy = 1;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        (void)c;
+        const uint8_t *fp = (const uint8_t *)[fbuf contents];
+        const __fp16 *cp = (const __fp16 *)[cbuf contents];
+        size_t n = (size_t)W * H, nl = 0, nref = 0, nbad = 0, n90 = 0;
+        float *lit = (float *)malloc(n * sizeof(float));
+        float maxerr = 0.0f, omax = 0.0f, fmax_ = 0.0f, sum = 0.0f;
+        for (size_t i = 0; i < n && lit; i++) {
+            float f[3], o[3], r[3];
+            for (int ch = 0; ch < 3; ch++) {
+                f[ch] = fbpp == 8 ? (float)((const __fp16 *)fp)[i * 4 + ch] : fp[i * 4 + (2 - ch)] / 255.0f;
+                float e = (float)cp[i * 4 + ch];
+                o[ch] = mode == HDRL_PQ ? probe_pq_nits(e) : probe_lin(e) * 100.0f;
+            }
+            /* PQ: BT.2020 out; back to BT.709 for the comparison */
+            if (mode == HDRL_PQ) {
+                float r0 = 1.6605f * o[0] - 0.5876f * o[1] - 0.0728f * o[2];
+                float g0 = -0.1246f * o[0] + 1.1329f * o[1] - 0.0083f * o[2];
+                float b0 = -0.0182f * o[0] - 0.1006f * o[1] + 1.1187f * o[2];
+                o[0] = r0; o[1] = g0; o[2] = b0;
+            }
+            float fm = fmaxf(f[0], fmaxf(f[1], f[2])), om = fmaxf(o[0], fmaxf(o[1], o[2]));
+            fmax_ = fmaxf(fmax_, fm);
+            omax = fmaxf(omax, om);
+            sum += 0.2126f * o[0] + 0.7152f * o[1] + 0.0722f * o[2];
+            probe_ref(f, hq.v, r);
+            float rm = fmaxf(r[0], fmaxf(r[1], r[2]));
+            if (rm > 0.5f) {
+                float d = fabsf(om - rm) / rm;
+                nref++;
+                if (d > 0.02f)
+                    nbad++;         /* HUD over light (clamped there), or a real mismatch */
+                else if (d > maxerr)
+                    maxerr = d;
+            }
+            if (fm > 1.0f) {
+                lit[nl++] = om;
+                if (om >= 0.9f * pk)
+                    n90++;
+            }
+        }
+        float p50 = 0, p99 = 0, pmax = 0;
+        if (nl && lit) {
+            qsort(lit, nl, sizeof(float), probe_fcmp);
+            p50 = lit[nl / 2];
+            p99 = lit[(size_t)(nl * 0.99)];
+            pmax = lit[nl - 1];
+        }
+        free(lit);
+        fprintf(stderr, "[HDRPROBE] %s layer, headroom potential %.3f now %.3f; peak %.0f paper %.0f"
+                " hud %.0f nits; frame %lux%lu max enc %.2f; out max %.0f nits, mean %.1f;"
+                " vs the Vulkan maths: max rel. error %.4f over %zu px (%zu px > 2%%: HUD over light);"
+                " past paper white %zu px (%.2f%%): median %.0f, p99 %.0f, max %.0f nits,"
+                " %zu px >= 90%% of the peak\n",
+                mode == HDRL_PQ ? "PQ" : "EDR", pot, cur, pk, pw, hw, (unsigned long)W,
+                (unsigned long)H, fmax_, omax, sum / (float)n, maxerr, nref, nbad, nl,
+                100.0f * (float)nl / (float)n, p50, p99, pmax, n90);
+        if (have_pat) {
+            const __fp16 *dp = (const __fp16 *)[dbuf contents];
+            float v[3];
+            for (int j = 0; j < 3; j++)
+                v[j] = mode == HDRL_PQ ? probe_pq_nits((float)dp[j * 4 + 1]) : probe_lin((float)dp[j * 4 + 1]) * 100.0f;
+            fprintf(stderr, "[HDRPROBE] pattern %d: asked %.0f (%s) and %.0f nits; drawable centre %.1f"
+                    " left %.1f right %.1f nits; HDR10 metadata max %.0f (the display's peak), granted %.3fx:"
+                    " %s\n", pkind, pat_a, pkind == 0 ? "disc" : "left", pat_b, v[0], v[1], v[2], meta,
+                    cur,
+                    pkind != 0 ? "paper white | HUD white"
+                    : pat_a < meta ? "disc below the display's level: visible"
+                    : "disc at or past the display's level: gone");
+        }
+        busy = 0;
+    }];
+}
+
+/* BO-244 (RECOMP_HDR_PROBE=1): while the overlay asks for a pattern (the
+ * peak or paper-white row selected), once a second and apart from the frame
+ * statistics: the levels asked and drawn, the drawable's PQ code values at
+ * the disc (centre) and the background (inside the left and right edges),
+ * as nits, the HDR10 metadata's max, the granted headroom and the layer's
+ * state. */
+static void hdr_probe_patch(id<MTLCommandBuffer> cb, id<MTLTexture> draw)
+{
+    static uint64_t last;
+    static id<MTLBuffer> buf;
+    uint64_t now = xbox_HostNowNs();
+    if (!hdr_probe_on() || s_hdr_win != HDRL_PQ || s_pat_kind < 0 || now - last < 1000000000ull
+            || [draw pixelFormat] != MTLPixelFormatRGBA16Float)
+        return;
+    last = now;
+    if (!buf)
+        buf = [s_dev newBufferWithLength:3 * 8 options:MTLResourceStorageModeShared];
+    if (!buf)
+        return;
+    float pr[4];
+    memcpy(pr, s_pat_r, sizeof pr);
+    const int kind = s_pat_kind;
+    const float a = s_pat_ab[0], b = s_pat_ab[1], da = s_pat_drawn[0], db = s_pat_drawn[1];
+    const float meta = s_meta_peak, scale = s_meta_scale, cur = s_probe_now, pot = nv2a_host_hdr_potential();
+    s_pat_kind = -1;
+    float px[3][2] = { { (pr[0] + pr[2]) * 0.5f, (pr[1] + pr[3]) * 0.5f },
+                       { pr[0] + (pr[2] - pr[0]) * 0.06f, (pr[1] + pr[3]) * 0.5f },
+                       { pr[2] - (pr[2] - pr[0]) * 0.06f, (pr[1] + pr[3]) * 0.5f } };
+    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+    for (int j = 0; j < 3; j++) {
+        NSUInteger X = (NSUInteger)fmaxf(0.0f, fminf(px[j][0], [draw width] - 1.0f));
+        NSUInteger Y = (NSUInteger)fmaxf(0.0f, fminf(px[j][1], [draw height] - 1.0f));
+        [be copyFromTexture:draw sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(X, Y, 0)
+                 sourceSize:MTLSizeMake(1, 1, 1) toBuffer:buf destinationOffset:(NSUInteger)j * 8
+        destinationBytesPerRow:8 destinationBytesPerImage:8];
+    }
+    [be endEncoding];
+    char layer[200];
+    const char *tm = "n/a";
+    if (@available(macOS 15.0, *))
+        tm = [s_layer.toneMapMode UTF8String];
+    snprintf(layer, sizeof layer, "layer RGBA16Float PQ, wantsEDR %d, metadata %s, toneMap %s",
+             s_layer.wantsExtendedDynamicRangeContent ? 1 : 0, s_layer.EDRMetadata ? "HDR10" : "none", tm);
+    NSString *ls = [NSString stringWithUTF8String:layer];
+    [ls retain];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        (void)c;
+        const __fp16 *d = (const __fp16 *)[buf contents];
+        float code[3], nits[3];
+        for (int j = 0; j < 3; j++) {
+            code[j] = (float)d[j * 4 + 1];
+            nits[j] = probe_pq_nits(code[j]);
+        }
+        fprintf(stderr, "[HDRPROBE] patch %s: asked %.0f / %.0f nits, drawn %.0f / %.0f; drawable PQ"
+                " codes centre %.4f (%.1f nits), left %.4f (%.1f), right %.4f (%.1f); metadata max %.0f"
+                " (the display's peak), SDR white %.1f nits, headroom now %.3f of %.3f; %s; %s\n",
+                kind == 0 ? "peak disc / background" : "paper | HUD white", a, b, da, db, code[0], nits[0],
+                code[1], nits[1], code[2], nits[2], meta, scale, cur, pot, [ls UTF8String],
+                kind != 0 ? "two halves"
+                : fabsf(code[0] - code[1]) < 0.0005f ? "disc and background the same code: the disc is gone"
+                : "disc and background differ: the disc shows");
+        [ls release];
+    }];
 }
 
 static int fail(char *err, size_t n, const char *what)
@@ -694,13 +1100,27 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_blit"] autorelease];
         s_hp_blit = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
-        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_hdr_comp"] autorelease];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_hdr_pq"] autorelease];
         s_hp_comp = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_hdr_edr"] autorelease];
+        s_hp_edr = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_hdr_pat"] autorelease];
+        s_hp_pat = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        /* BO-244: the overlay's encode, blended over the PQ drawable by its
+         * alpha (the drawable's alpha kept), as fb_present_vulkan.c's. */
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_hdr_ovl"] autorelease];
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+        s_hp_ovl = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.colorAttachments[0].blendingEnabled = NO;
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_fxaa"] autorelease];
         s_hp_fxaa = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_cas"] autorelease];
         s_hp_cas = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
-        if (!s_hp_blit || !s_hp_comp)
+        if (!s_hp_blit || !s_hp_comp || !s_hp_edr || !s_hp_ovl || !s_hp_pat)
             XR_ERROR( "[PRESENT] HDR passes unavailable: %s\n",
                     e ? [[e localizedDescription] UTF8String] : "?");
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_blit"] autorelease];
@@ -751,7 +1171,7 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         hdr_display(win);           /* BO-110: what the display can show */
         nv2a_host_set_hdr_patch_fn(hdr_patch);
         hdr_layer(nv2a_host_hdr_active());
-        s_layer.framebufferOnly = shots ? NO : YES;
+        s_layer.framebufferOnly = shots || hdr_probe_on() ? NO : YES;
         s_layer.displaySyncEnabled = vsync ? YES : NO;
         /* Two drawables: at most one frame queued ahead of the display
          * (the BO-74 latency measurement's recommendation, with display
@@ -1234,8 +1654,145 @@ static id<MTLTexture> post_chain(id<MTLCommandBuffer> *cbp, id<MTLTexture> src)
     return src;
 }
 
+/* BO-244: the composite's constants. hq[0] = a, hq[1] = b as the Vulkan
+ * flip pass's push constants (nv2a_pb_vulkan.c), hq[2] = (the HUD's white /
+ * 10,000, the peak / 10,000, 1 = a scene snapshot). */
+static void hdr_comp_consts(float hp[12], float pk, float pw, float hw, float sh, float hl, int srgb,
+                            float sf, float bl, int scene)
+{
+    hp[0] = pk / pw;
+    hp[1] = pw / 10000.0f;
+    hp[2] = hl;
+    hp[3] = srgb ? 1.0f : 0.0f;
+    hp[4] = sh;
+    hp[5] = sf;
+    hp[6] = bl / 10000.0f;
+    hp[7] = 0.0f;
+    hp[8] = hw / 10000.0f;
+    hp[9] = pk / 10000.0f;
+    hp[10] = scene ? 1.0f : 0.0f;
+    hp[11] = 0.0f;
+}
+
+static float pq_of_nits(float n)
+{
+    float m = powf(fminf(fmaxf(n, 0.0f), 10000.0f) / 10000.0f, 0.1593017578125f);
+    return powf((0.8359375f + 18.8515625f * m) / (1.0f + 18.6875f * m), 78.84375f);
+}
+
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+/* BO-244: the overlay over a PQ drawable, as fb_present_vulkan.c does it:
+ * drawn into s_ovl (BGRA8, cleared to transparent), then encoded (gamma
+ * 2.2, x the HUD's white, BT.2020, PQ) and blended over the drawable by its
+ * alpha; then the calibration pattern it asked for, if any, in PQ. Ends
+ * `enc` and returns the drawable's new encoder. */
+static id<MTLRenderCommandEncoder> hdr_overlay(id<MTLCommandBuffer> cb, id<MTLRenderCommandEncoder> enc,
+                                               id<MTLTexture> draw)
+{
+    NSUInteger w = [draw width], h = [draw height];
+    MTLRenderPassDescriptor *op, *dp;
+    id<MTLRenderCommandEncoder> oe;
+    float pk, pw, hw, hp[4] = { 0 }, r[4], a, b;
+    int kind;
+    [enc endEncoding];
+    if (!target_texture(&s_ovl, MTLPixelFormatBGRA8Unorm, w, h))
+        s_ovl = nil;
+    if (s_ovl) {
+        op = [MTLRenderPassDescriptor renderPassDescriptor];
+        op.colorAttachments[0].texture = s_ovl;
+        op.colorAttachments[0].loadAction = MTLLoadActionClear;
+        op.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        op.colorAttachments[0].storeAction = MTLStoreActionStore;
+        oe = [cb renderCommandEncoderWithDescriptor:op];
+        xbox_OverlayMetalDraw((void *)s_dev, (void *)cb, (void *)op, (void *)oe);
+        [oe endEncoding];
+    }
+    dp = [MTLRenderPassDescriptor renderPassDescriptor];
+    dp.colorAttachments[0].texture = draw;
+    dp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    dp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    enc = [cb renderCommandEncoderWithDescriptor:dp];
+    if (s_ovl) {
+        MTLViewport vp = { 0, 0, (double)w, (double)h, 0.0, 1.0 };
+        nv2a_host_hdr_levels(&pk, &pw, &hw);
+        hp[0] = hw / 10000.0f;
+        [enc setViewport:vp];
+        [enc setRenderPipelineState:s_hp_ovl];
+        [enc setFragmentTexture:s_ovl atIndex:0];
+        [enc setFragmentBytes:hp length:sizeof hp atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+    if (nv2a_host_hdr_pattern_take(&kind, r, &a, &b)) {
+        s_pat_ab[0] = a;
+        s_pat_ab[1] = b;
+        if (r[0] < 0) r[0] = 0;
+        if (r[1] < 0) r[1] = 0;
+        if (r[2] > (float)w) r[2] = (float)w;
+        if (r[3] > (float)h) r[3] = (float)h;
+        if (r[2] > r[0] + 1.0f && r[3] > r[1] + 1.0f) {
+            MTLScissorRect sc = { (NSUInteger)r[0], (NSUInteger)r[1], (NSUInteger)(r[2] - r[0]),
+                                  (NSUInteger)(r[3] - r[1]) };
+            MTLViewport vp = { 0, 0, (double)w, (double)h, 0.0, 1.0 };
+            /* BO-244: the peak disc's background at the display's peak (the
+             * HDR10 metadata's max, the compositor's clip in absolute nits:
+             * hdr_meta), not 10000 nits: macOS treats content past that max
+             * as it likes; at exactly the display's level the disc shows
+             * below it and is gone at or past it, whatever macOS does past
+             * the max. The levels as the Vulkan pattern takes them: 10-bit
+             * PQ codes. */
+            if (kind == 0 && s_meta_peak > 0.0f && b > s_meta_peak)
+                b = s_meta_peak;
+            if (kind == 0 && a > b)
+                a = b;
+            s_pat_drawn[0] = a;
+            s_pat_drawn[1] = b;
+            float pp[8] = { floorf(pq_of_nits(a) * 1023.0f + 0.5f) / 1023.0f,
+                            floorf(pq_of_nits(b) * 1023.0f + 0.5f) / 1023.0f,
+                            (r[0] + r[2]) * 0.5f, (r[1] + r[3]) * 0.5f,
+                            kind == 0 ? (r[3] - r[1]) * 0.22f : -1.0f, 0.0f, 0.0f, 0.0f };
+            [enc setViewport:vp];
+            [enc setScissorRect:sc];
+            [enc setRenderPipelineState:s_hp_pat];
+            [enc setFragmentBytes:pp length:sizeof pp atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            memcpy(s_pat_r, r, sizeof s_pat_r);
+
+            s_pat_kind = kind;
+        }
+    }
+    return enc;
+}
+#endif
+
+/* Each turn of the main loop (the window's thread: AppKit and the layer's
+ * geometry stay there, BO-210), and once before the first present: the
+ * drawable's size, checked every turn and not only on resize events (a move
+ * between displays of another scale need not arrive as SIZE_CHANGED); the
+ * display's HDR headroom (macOS changes it with the brightness); the
+ * display and the timing strategy, twice a second. At most every 8 ms (the
+ * loop turns every 1-2 ms while frames come): it was once a present. */
+void fbm_main_tick(SDL_Window *win)
+{
+    @autoreleasepool {
+        static uint64_t next;
+        uint64_t now = xbox_HostNowNs();
+        int dw = 0, dh = 0;
+        CGSize cur;
+        if (!s_layer || now < next)
+            return;
+        next = now + 8000000ull;
+        cur = s_layer.drawableSize;
+        SDL_Metal_GetDrawableSize(win, &dw, &dh);
+        if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
+            s_layer.drawableSize = CGSizeMake(dw, dh);
+        hdr_display(win);
+        timing_poll(win);
+    }
+}
+
 /* Slot k (fw x fh) into the window. 0 when no drawable came (timeout, display
- * asleep, window hidden): the caller keeps the frame and tries again. */
+ * asleep, window hidden): the caller keeps the frame and tries again. On the
+ * present thread (fb_present_sdl.c). */
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 const char *shot_path, uint32_t flip, uint64_t vblank_ns)
 {
@@ -1250,19 +1807,14 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         id<MTLBuffer> shot = nil;
         struct nv2a_rect r;
         int whole, dw = 0, dh = 0;
-        CGSize cur = s_layer.drawableSize;
-
-        /* Checked every present, not only on resize events: a move between
-         * displays of another scale need not arrive as SIZE_CHANGED. */
-        SDL_Metal_GetDrawableSize(win, &dw, &dh);
-        if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
-            s_layer.drawableSize = CGSizeMake(dw, dh);
         uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
         pc_aim aim;
         int timed;
 
+        (void)win;
         memset(&aim, 0, sizeof aim);
-        timing_poll(win);
+        /* The drawable's size, the display and the timing strategy are the
+         * main thread's (fbm_main_tick): this runs on the present thread. */
         timed = s_strategy != PC_LEGACY;
         /* Never wait for a drawable: with two presents still on their way
          * to the glass the third drawable is the one on it. A new game
@@ -1305,8 +1857,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
          * before the scale to the window; the overlay below is drawn after
          * them, so it is not filtered. */
         /* BO-110: HDR follows the setting live; the display's headroom is
-         * read every present (macOS changes it with the brightness). */
-        hdr_display(win);
+         * read by the main thread (fbm_main_tick). */
         hdr_layer(nv2a_host_hdr_active());
         if (s_hdr_win && s_slot[k] && [s_slot[k] pixelFormat] != MTLPixelFormatRGBA16Float)
             fw = fh = 0;               /* a slot from before the switch: black once */
@@ -1318,15 +1869,20 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             id<MTLTexture> dst = target_texture(&s_hp_c, MTLPixelFormatRGBA16Float,
                                                 [src width], [src height]);
             nv2a_host_hdr_levels(&pk, &pw, &hw);
-            float sf, bl;
+            float sf, bl, sh, hl;
+            int srgb;
             nv2a_host_hdr_shape(&sf, &bl);
-            float hp[8] = { pw / 100.0f, hw / 100.0f, pk / 100.0f,
-                            s_scene_ok[k] && s_scene[k] ? 1.0f : 0.0f,
-                            sf, bl / 100.0f, 0.0f, 0.0f };
+            nv2a_host_hdr_tone(&sh, &hl, &srgb);
+            /* BO-244: the Vulkan flip pass's push constants (a, b), and the
+             * HUD's white, the peak and whether there is a scene snapshot. */
+            float hp[12];
+            hdr_comp_consts(hp, pk, pw, hw, sh, hl, srgb, sf, bl, s_scene_ok[k] && s_scene[k]);
+            hdr_meta();
             if (dst) {
                 in2[0] = src;
-                in2[1] = hp[3] > 0.5f ? s_scene[k] : src;
-                post_pass(&cb, PT_SCALE, s_hp_comp, dst, 0, in2, 2, hp, sizeof hp);
+                in2[1] = hp[10] > 0.5f ? s_scene[k] : src;
+                post_pass(&cb, PT_SCALE, s_hdr_win == HDRL_PQ ? s_hp_comp : s_hp_edr, dst, 0, in2, 2,
+                          hp, sizeof hp);
                 src = dst;
             }
         }
@@ -1362,11 +1918,19 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         }
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
         /* The settings overlay, over the game's image and under the present
-         * (overlay.h): more of the same encoder. */
-        if (xbox_OverlayWants())
-            xbox_OverlayMetalDraw((void *)s_dev, (void *)cb, (void *)rp, (void *)enc);
+         * (overlay.h): more of the same encoder. BO-244: over a PQ drawable
+         * drawn apart and encoded at the HUD's white, as on Vulkan. */
+        if (xbox_OverlayWants()) {
+            if (s_hdr_win == HDRL_PQ)
+                enc = hdr_overlay(cb, enc, d.texture);
+            else
+                xbox_OverlayMetalDraw((void *)s_dev, (void *)cb, (void *)rp, (void *)enc);
+        }
 #endif
         [enc endEncoding];
+        if (s_slot[k] && fw && fh)
+            hdr_probe(cb, s_slot[k], s_hp_c, d.texture);   /* BO-227, RECOMP_HDR_PROBE=1 */
+        hdr_probe_patch(cb, d.texture);                    /* BO-244 */
         if (shot_path && !s_hdr_win) {
             shot = [s_dev newBufferWithLength:(NSUInteger)dw * dh * 4
                                       options:MTLResourceStorageModeShared];

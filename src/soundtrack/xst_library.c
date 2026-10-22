@@ -583,6 +583,48 @@ const xst_song *xst_song_by_id(const xst_library *lib, uint32_t id)
     return &lib->songs[lib->st[st - 1].first + (int)idx];
 }
 
+/* Soundtrack i's name as UTF-8: the library keeps names as Latin-1 UTF-16
+ * units (xst_name_from_utf8), which are one or two bytes each here. */
+int xst_soundtrack_name(const xst_library *lib, int i, char *out, size_t cap)
+{
+    size_t o = 0;
+    int k;
+
+    if (out && cap)
+        out[0] = 0;
+    if (!lib || !out || cap < 2 || i < 0 || i >= lib->n_st)
+        return 0;
+    for (k = 0; k < XST_NAME_UNITS && lib->st[i].name[k]; k++) {
+        unsigned c = lib->st[i].name[k];
+        if (c < 0x80) {
+            if (o + 1 >= cap)
+                break;
+            out[o++] = (char)c;
+        } else {
+            if (o + 2 >= cap)
+                break;
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    out[o] = 0;
+    return 1;
+}
+
+int xst_soundtrack_find(const xst_library *lib, const char *utf8)
+{
+    uint16_t want[XST_NAME_UNITS];
+    int i;
+
+    if (!lib || !utf8 || !*utf8)
+        return -1;
+    xst_name_from_utf8(want, utf8);
+    for (i = 0; i < lib->n_st; i++)
+        if (!memcmp(want, lib->st[i].name, sizeof want))
+            return i;
+    return -1;
+}
+
 /* ── ST.DB ─────────────────────────────────────────────────────────── */
 
 /*

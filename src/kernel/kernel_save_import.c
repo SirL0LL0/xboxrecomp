@@ -542,9 +542,46 @@ static int unzip_to(const char *zip, const char *dest, char *err, unsigned err_s
 
 /* ── finding the save ──────────────────────────────────────────────── */
 
+/* How much a check may look at (BO-289): every entry counts, the clock
+ * and the caller's stop are asked at each one, and a folder on a slow
+ * volume is looked at but not below. NULL (an import): no bound. */
+#define SI_CHECK_ENTRIES 50000
+#define SI_CHECK_MS      3000
+
+typedef struct {
+    const xbox_save_check_limits *l;
+    long     entries;
+    uint64_t deadline;          /* ms */
+    int      out;               /* ran out or was stopped: the answer is not known */
+    int      skipped;           /* a folder was not looked below */
+} Lim;
+
+static uint64_t si_now_ms(void)
+{
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+/* One more entry looked at; 1 when the looking has to stop. */
+static int lim_spent(Lim *b)
+{
+    if (!b)
+        return 0;
+    if (!b->out && (--b->entries < 0 || si_now_ms() >= b->deadline
+                    || (b->l && b->l->stop && b->l->stop(b->l->ctx))))
+        b->out = 1;
+    return b->out;
+}
+
 typedef struct {
     const char *want;
     int want_dir;
+    Lim *b;
     char found[SI_PATH];
 } Named;
 
@@ -552,6 +589,8 @@ static int named_cb(const char *dir, const char *name, int dir_entry, void *vctx
 {
     Named *n = (Named *)vctx;
     (void)dir;
+    if (lim_spent(n->b))
+        return 0;
     if (!!dir_entry == !!n->want_dir && ci_eq(name, n->want) && strlen(name) < sizeof n->found) {
         snprintf(n->found, sizeof n->found, "%s", name);
         return 0;
@@ -560,11 +599,12 @@ static int named_cb(const char *dir, const char *name, int dir_entry, void *vctx
 }
 
 /* The entry of `dir` called `want` in any case; path in `out`. */
-static int find_named(const char *dir, const char *want, int want_dir, char *out, size_t n)
+static int find_named_in(const char *dir, const char *want, int want_dir, char *out, size_t n, Lim *b)
 {
     Named c;
     c.want = want;
     c.want_dir = want_dir;
+    c.b = b;
     c.found[0] = 0;
     recomp_fs_each(dir, named_cb, &c);
     if (!c.found[0])
@@ -573,37 +613,52 @@ static int find_named(const char *dir, const char *want, int want_dir, char *out
     return 1;
 }
 
+static int find_named(const char *dir, const char *want, int want_dir, char *out, size_t n)
+{
+    return find_named_in(dir, want, want_dir, out, n, NULL);
+}
+
 typedef struct {
     int depth;
+    Lim *b;
     char found[SI_PATH];
 } Search;
 
-static int search_save(const char *dir, int depth, char *out, size_t n);
+static int search_save(const char *dir, int depth, char *out, size_t n, Lim *b);
 
 static int search_cb(const char *dir, const char *name, int dir_entry, void *vctx)
 {
     Search *s = (Search *)vctx;
     char p[SI_PATH];
+    if (lim_spent(s->b))
+        return 0;
     if (!dir_entry || name[0] == '.' || !strcmp(name, "__MACOSX") || strlen(dir) + strlen(name) + 2 >= sizeof p)
         return 1;
     snprintf(p, sizeof p, "%s/%s", dir, name);
-    if (search_save(p, s->depth - 1, s->found, sizeof s->found))
+    if (search_save(p, s->depth - 1, s->found, sizeof s->found, s->b))
         return 0;
     return 1;
 }
 
 /* A folder with SaveMeta.xbx and the profile, `dir` itself or below it. */
-static int search_save(const char *dir, int depth, char *out, size_t n)
+static int search_save(const char *dir, int depth, char *out, size_t n, Lim *b)
 {
     char p[SI_PATH];
     Search s;
-    if (find_named(dir, k_meta, 0, p, sizeof p) && find_named(dir, k_profile, 0, p, sizeof p)) {
+    if (lim_spent(b))
+        return 0;
+    if (find_named_in(dir, k_meta, 0, p, sizeof p, b) && find_named_in(dir, k_profile, 0, p, sizeof p, b)) {
         snprintf(out, n, "%s", dir);
         return 1;
     }
-    if (depth <= 0)
+    if (depth <= 0 || (b && b->out))
         return 0;
+    if (b && b->l && b->l->shallow && b->l->shallow(dir, b->l->ctx)) {
+        b->skipped = 1;                    /* a network share: not walked */
+        return 0;
+    }
     s.depth = depth;
+    s.b = b;
     s.found[0] = 0;
     recomp_fs_each(dir, search_cb, &s);
     if (!s.found[0])
@@ -615,11 +670,11 @@ static int search_save(const char *dir, int depth, char *out, size_t n)
 /* The save folder under `root` (a folder), and what the paths say about its
  * title: 1 when the path names another game (then `err` says so). */
 static int locate(const char *root, const char *title_id, char *save, size_t save_n, int *have_tid,
-                  char *err, unsigned err_size)
+                  char *err, unsigned err_size, Lim *b)
 {
     char parent[SI_PATH], pl[SI_PATH];
     *have_tid = 0;
-    if (!search_save(root, 4, save, save_n)) {
+    if (!search_save(root, 4, save, save_n, b)) {
         si_err(err, err_size, "No Burnout 3 save in %s. Expected a folder with SaveMeta.xbx and \"Profile 1\" in it "
                "(UDATA/%s/<save id>/ on the Xbox), or a folder or zip that holds it.", root, title_id);
         return 0;
@@ -701,13 +756,25 @@ static int prepare_source(const char *input, const char *title_id, const char *w
     return 1;
 }
 
-int xbox_SaveImportCheck(const char *path, const char *title_id)
+int xbox_SaveImportCheckBounded(const char *path, const char *title_id, const xbox_save_check_limits *lim)
 {
     char save[SI_PATH];
     int have;
+    Lim b;
     if (!path || !*path || !recomp_fs_is_dir(path))
         return 0;          /* a zip is only looked into when it is imported */
-    return locate(path, title_id, save, sizeof save, &have, NULL, 0);
+    memset(&b, 0, sizeof b);
+    b.l = lim;
+    b.entries = lim && lim->max_entries > 0 ? lim->max_entries : SI_CHECK_ENTRIES;
+    b.deadline = si_now_ms() + (uint64_t)(lim && lim->max_ms > 0 ? lim->max_ms : SI_CHECK_MS);
+    if (locate(path, title_id, save, sizeof save, &have, NULL, 0, &b))
+        return 1;
+    return b.out || b.skipped ? -1 : 0;
+}
+
+int xbox_SaveImportCheck(const char *path, const char *title_id)
+{
+    return xbox_SaveImportCheckBounded(path, title_id, NULL) > 0;
 }
 
 void xbox_SaveImportCleanup(const char *work_root)
@@ -744,7 +811,7 @@ int xbox_SaveImportPrepare(const char *input, const char *title_id, const char *
     }
     if (!prepare_source(input, title_id, work, root, sizeof root, err, err_size))
         goto fail;
-    if (!locate(root, title_id, save, sizeof save, &have_tid, err, err_size))
+    if (!locate(root, title_id, save, sizeof save, &have_tid, err, err_size, NULL))
         goto fail;
     parent_copy(save, parent, sizeof parent);
     leaf_copy(save, id, sizeof id);

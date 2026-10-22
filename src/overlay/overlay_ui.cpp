@@ -21,6 +21,7 @@
 #include "overlay_keys.h"
 #include "xbox_settings.h"
 #include "nv2a_texscale.h"
+#include "nv2a_texup.h"
 #include "xbox_shader_build.h"
 #include "xbox_report.h"
 #include "nv2a_pcache.h"
@@ -29,6 +30,7 @@
 
 #include "imgui.h"
 #include <atomic>
+#include <mutex>
 #include "imgui_internal.h"
 #include "backends/imgui_impl_sdl2.h"
 
@@ -53,6 +55,7 @@ extern "C" {
 float nv2a_host_hdr_potential(void);
 void  nv2a_host_hdr_levels(float *peak_nits, float *paper_nits, float *hud_nits);
 void *nv2a_host_hdr_patch(float symbol_nits);
+void  nv2a_host_hdr_patch_at(float x0, float y0, float x1, float y1);
 void  nv2a_host_hdr_pattern(int kind, float x0, float y0, float x1, float y1, float a, float b);
 }
 
@@ -91,6 +94,20 @@ static uint32_t s_rows_step_ms;
 #define ROWS_STEP_OPEN_MS 67u   /* 4 frames (the pause menu opening) */
 #define ROWS_IN_SLOTS 6         /* rows further down come in with the sixth */
 static bool s_core_ready;
+
+/* The window presents on a thread of its own (fb_present_sdl.c, BO-210):
+ * the main thread hands the overlay its events, its poll and ImGui's SDL
+ * half (xbox_OverlayPlatformFrame), the present thread builds and draws the
+ * frame. One mutex around each of those, so ImGui and the overlay's state
+ * are used by one thread at a time; neither side holds it across a GPU or
+ * display wait. */
+static std::mutex s_ov_mu;
+/* ImGui_ImplSDL2_NewFrame ran on the main thread and no frame has used it
+ * yet (the next one is built with it); ever: once. */
+static bool s_plat_pending, s_plat_ever;
+
+void overlay_lock() { s_ov_mu.lock(); }
+void overlay_unlock() { s_ov_mu.unlock(); }
 static bool s_vulkan;
 static uint32_t s_last_ms;
 static bool s_last_input_pad;   /* the hints name pad buttons or keys */
@@ -140,6 +157,11 @@ static uint32_t s_cycle_ms, s_cycle_next;
 static int s_cycle_i;
 static char s_trigger[512];
 static uint32_t s_trigger_next;
+/* RECOMP_OVERLAY=pacing_file=<path> (a test hook, BO-210): when that file
+ * appears it is read (auto, low_latency or smooth) and removed, and
+ * display.frame_pacing is set to it through the settings, as the Display
+ * page does: a Frame pacing switch mid-race from a script. */
+static char s_pacing_file[512];
 
 /* The window's present rate for the graph. */
 static volatile uint32_t s_presents;
@@ -149,6 +171,7 @@ static volatile uint32_t s_presents;
 enum { FMT_PLAIN, FMT_PERCENT, FMT_PERCENT_OF_MAX, FMT_TIMES, FMT_GAIN, FMT_NITS };
 
 struct Meta {
+    xs_id id;                         /* its own index: checked below */
     const char *label;
     const char *hint;
     double step;                      /* a left/right step */
@@ -159,7 +182,7 @@ struct Meta {
 
 static const char *const n_aspect[]    = { "4:3", "16:9", NULL };
 static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL };
-static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
+static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", "Fill height", NULL };
 static const char *const n_timing[]    = { "Legacy (when ready)", "Auto (even frames)", NULL };
 static const char *const n_frame_pacing[] = { "Automatic", "Low latency", "Smooth", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
@@ -179,6 +202,8 @@ static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
 static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
 static const char *const n_ui_scale[]  = { "Off", "2x", "4x", NULL };
+static const char *const n_texup[]     = { "Off", "FSRCNNX", "NNEDI3", NULL };
+static const char *const n_texup_sc[]  = { "2x", "4x", NULL };
 static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation (DualShock 3, 4)", "PlayStation 5 (DualSense)", "Nintendo", "Steam (Deck, Steam Controller)", "Positional (any pad)", "Keyboard", NULL };
 static_assert(sizeof n_glyphs / sizeof n_glyphs[0] == XBOX_GLYPHS_MODE_COUNT + 1, "one name per glyph mode, in pad_glyphs.h order");
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
@@ -186,81 +211,102 @@ static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_scenery_detail[] = { "Original", "Far", NULL };
 static const char *const n_score_board[] = { "Original", "Smooth", NULL };
+static const char *const n_rival_marker[] = { "Original", "Farther", NULL };
+static const char *const n_crashnav_map[] = { "Full width", "4:3", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", "Auto (adapts)", NULL };
 /* Off the Steam Deck the watts are somebody else's: the names alone. */
 static const char *const n_power_plain[] = { "Maximum", "Balanced (recommended)", "Battery saver", "Auto (adapts)", NULL };
 static bool on_steam_deck()
 {
-    const char *sd = getenv("SteamDeck");
-    return sd && sd[0] == '1';
+    return recomp_host_is_steam_deck() != 0;
 }
 
-static const Meta k_meta[XS_COUNT] = {
-    /* XS_DISPLAY_FULLSCREEN */ { "Fullscreen", "Borderless fullscreen on the desktop.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_DISPLAY_ASPECT */     { "Aspect ratio", "16:9 draws the game in widescreen.", 1, FMT_PLAIN, n_aspect, 0 },
-    /* XS_DISPLAY_FILTER */     { "Filter", "How the picture is scaled to the window.", 1, FMT_PLAIN, n_filter, 0 },
-    /* XS_DISPLAY_OVERSCAN */   { "Overscan", "Crops the border a TV would have hidden.", 1, FMT_PLAIN, n_overscan, 0 },
-    /* XS_DISPLAY_FIT */        { "Present fit", "Fills the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
+static constexpr Meta k_meta[XS_COUNT] = {
+    /* XS_DISPLAY_FULLSCREEN */ { XS_DISPLAY_FULLSCREEN, "Fullscreen", "Borderless fullscreen on the desktop.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_DISPLAY_ASPECT */     { XS_DISPLAY_ASPECT, "Aspect ratio", "16:9 draws the game in widescreen.", 1, FMT_PLAIN, n_aspect, 0 },
+    /* XS_DISPLAY_FILTER */     { XS_DISPLAY_FILTER, "Filter", "How the picture is scaled to the window.", 1, FMT_PLAIN, n_filter, 0 },
+    /* XS_DISPLAY_OVERSCAN */   { XS_DISPLAY_OVERSCAN, "Overscan", "Crop cuts the TV border all round. Fill height drops the top and bottom border and stretches to the full height (about 7% taller); the sides stay.", 1, FMT_PLAIN, n_overscan, 0 },
+    /* XS_DISPLAY_FIT */        { XS_DISPLAY_FIT, "Present fit", "Fills the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
 #if defined(__ANDROID__)
-    /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution as a multiple of the Xbox's 640x480. 1.5x is 960x720.", 1, FMT_PLAIN, n_scale, 0 },
+    /* XS_GRAPHICS_RENDER_SCALE */ { XS_GRAPHICS_RENDER_SCALE, "Render scale", "Internal resolution as a multiple of the Xbox's 640x480. 1.5x is 960x720.", 1, FMT_PLAIN, n_scale, 0 },
 #else
-    /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution as a multiple of the Xbox's 640x480.", 1, FMT_TIMES, NULL, 0 },
+    /* XS_GRAPHICS_RENDER_SCALE */ { XS_GRAPHICS_RENDER_SCALE, "Render scale", "Internal resolution as a multiple of the Xbox's 640x480.", 1, FMT_TIMES, NULL, 0 },
 #endif
-    /* XS_GRAPHICS_ANISO */    { "Anisotropic filtering", "Sharper textures at a slant, like the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
-    /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges. FXAA is one cheap pass; SMAA takes three and looks cleaner.", 1, FMT_PLAIN, n_aa, 0 },
-    /* XS_GRAPHICS_SHARPEN */  { "Sharpening", "Contrast-adaptive sharpening (AMD CAS). Offsets the softness from anti-aliasing and scaling up.", 0.05, FMT_PERCENT, NULL, 0 },
-    /* XS_AUDIO_VOLUME */       { "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
-    /* XS_AUDIO_MUTE */         { "Mute", "Silences the game.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "Silences the game while its window is not in front.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_SPEAKERS */     { "Speakers", "Auto uses 5.1 when the system's sound output is 5.1 or more, otherwise stereo.", 1, FMT_PLAIN, n_speakers, 0 },
-    /* XS_AUDIO_FX_LEVEL */     { "Surround effects (reverb) level", "5.1 only. The level of the game's reverb sends, which play dry here because no effect DSP runs.", 0.05, FMT_PERCENT, NULL, 0 },
-    /* XS_AUDIO_MIXER */        { "Mixer", "Gains, sends, LFE and a limiter over the game's sound buses; the Mixer page is below. Off keeps the game's own mix.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_INPUT_DEADZONE */     { "Stick deadzone", "How far the stick can move before it counts as centred.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
-    /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "How far a trigger can be pulled and still count as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
-    /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original Xbox rumble. Higher strengthens the weaker rumbles; the strongest stays at full. 0 turns rumble off.", 0.25, FMT_GAIN, NULL, 0 },
-    /* XS_INPUT_FACE_LAYOUT */  { "Face buttons", "Nintendo layout is for pads with A on the right and B below. It swaps A with B and X with Y, in the game and here.", 1, FMT_PLAIN, n_face, 0 },
-    /* XS_INPUT_CONTROL_SCHEME */ { "Driving controls", "PS2 layout uses the PlayStation 2 version's driving controls: accelerate on the bottom face button, brake on the left one, boost on the right shoulder, look back on the left shoulder. Applies only while driving.", 1, FMT_PLAIN, n_scheme, 0 },
-    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits throughout (steadiest, hottest). Balanced sleeps, then spins for the last 8 ms of each frame (steady 60). Battery saver only sleeps (coolest, with an occasional small dip). Auto picks the spin as it goes: less while frames are steady, more when they come late.", 1, FMT_PLAIN, n_power, 0 },
-    /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speed and distance in km/h and metres instead of mph and miles, using the game's own metric display. Applies from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
-    /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On keeps the HUD at its 4:3 proportions, pinned to the screen edges. Applies from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For displays wider than 16:9, with Aspect set to 16:9. Races fill the whole width, showing more at the sides without stretching. Menus, loading screens and videos stay 16:9 in the middle. Window matches the window's or screen's own shape. Applies from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
-    /* XS_GRAPHICS_BLOOM */     { "Bloom", "How strong the game's own bloom is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
-    /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "How strong the game's own motion blur is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
-    /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game drops to 30 fps in its crash and takedown cameras. On keeps them at 60. Needs a fast machine: if 60 can't be held, the game itself slows down, not just the picture. Leave it off on a Steam Deck or other handheld.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "Two-player split screen runs at 30 fps in the original. On runs it at 60 and draws the scene twice per frame. Needs a fast machine: if 60 can't be held, the game itself slows down. Leave it off on a Steam Deck or other handheld. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The original plays no music in split screen. On plays EA GAMES TRAX or your custom music in two-player Race and Road Rage, as in one-player. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto uses -0.5 at 2x and -1.0 at 4x.", 1, FMT_PLAIN, n_lod, 0 },
-    /* XS_GRAPHICS_DITHER */    { "Dither", "Faint noise added when scaling to the window, to hide banding in smooth gradients such as the sky. Metal only for now. Text and HUD at their exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Far doubles the console's distance, Farthest quadruples it. Costs GPU time with many vehicles on screen. Scenery, the track and where traffic appears stay the same.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
-    /* XS_GRAPHICS_SCENERY_DETAIL */ { "Scenery detail", "How far away trees and other roadside objects keep their detailed models before the game swaps in simpler ones. Original is the console's distance; Far moves the swap further out, so trees no longer change shape as you come round a bend. Costs a little GPU time. Changes at once.", 1, FMT_PLAIN, n_scenery_detail, 0 },
-    /* XS_INPUT_GLYPHS */       { "Button prompts", "The button icons in the game's menus and hints. Auto follows the controller you used last. Xbox (original) is the game's own art. Positional works with any pad: a diamond of four dots, with the button to press filled. Keyboard shows key caps. Auto picks it while you play on the keyboard. The game's text and videos still name Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
-    /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz matches the console's Dolby Digital encoder. Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
-    /* XS_DISPLAY_PRESENT_TIMING */ { "Frame presentation", "When a finished frame goes to the display. Legacy: as soon as it is ready. Auto: each frame is aimed at one refresh, so frames stay on screen equally long and appear sooner after they are drawn. On a fixed 60, 120 or 240 Hz display the game's clock follows the display; on variable refresh (VRR, ProMotion) frames go out at even intervals. The performance overlay's on-glass line shows the result.", 1, FMT_PLAIN, n_timing, 0 },
-    /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "Marks frames where the game ran more than one simulation step on the frame-time graph. It does that when its frame rate drops.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_ADVANCED_DIAG_LOG */  { "Diagnostic logging", "Off logs only errors and a few start-up facts. On writes the full log (about 830 KB a run at most, the last three runs kept), and bug reports include it. To capture a problem: switch it on, restart so the log has the start, reproduce it, then create the report.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_UI_SCALE */  { "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2x or 4x with an edge-following scaler (Super-xBR), for render scales above 1x. The 3D world is untouched. Sharper versions are made in the background and kept on disk, so new art can look unscaled at first. Uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
-    /* XS_INTERFACE_MENU_ENTRY */ { "Entry in the game's menu", "Adds TAKEDAWN SETTINGS to the game's Settings menu (Driver Details > Settings). It opens this menu, like the hotkey. Shows the next time that menu opens.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_CUSTOM_LEVEL */ { "Custom music loudness", "Modern songs are mastered louder than the game's music, and the game plays them louder still, so they distort. Match game music brings each song to the level of EA GAMES TRAX with a slow gain that never pumps within a song. Quieter and Louder sit 4 dB below and above that. Off plays songs as the game sends them. Custom music only.", 1, FMT_PLAIN, n_custom_level, 0 },
-    /* XS_DISPLAY_SCORE_BOARD */ { "Score board", "The SCORE board at the top of the screen. Original is the console's look: the dark plate behind the score vanishes a moment after its text fades. Smooth fades the plate with the text, and fades the board back in after a crash camera. Changes at once.", 1, FMT_PLAIN, n_score_board, 0 },
-    /* XS_AUDIO_MENU_SOUNDS */  { "Menu sounds", "This menu clicks with the game's own menu sounds, read from your copy of the game.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_HDR */       { "HDR", "High dynamic range output on a display that can show it (on macOS: a display with HDR or XDR brightness headroom; on Steam Deck and Linux: game mode with HDR switched on in the display settings; on Windows: Use HDR switched on for the display in Windows' display settings). The game's light keeps its strength: lamps, brake lights, sparks, the boost glow and the sun go brighter than white, while the HUD and menus stay at their own brightness. Off is the original picture.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_HDR_PEAK */  { "Peak brightness", "The brightest the display can show. Display uses what the display reports (on a Steam Deck that is right). To set it by eye: raise it until the symbol in the box disappears into the bright background, then stop.", 50.0, FMT_NITS, NULL, 0 },
-    /* XS_GRAPHICS_HDR_PAPER */ { "Paper white", "How bright the game's ordinary white is: the scene's overall brightness. Light above it uses the room up to the peak. Raise it if the whole picture looks dimmer than without HDR. The box shows paper white (left) beside the HUD's white (right).", 10.0, FMT_NITS, NULL, 0 },
-    /* XS_GRAPHICS_HDR_HUD */   { "HUD and menu brightness", "How bright the HUD, the game's menus and its text are. Same as paper white unless set.", 10.0, FMT_NITS, NULL, 0 },
-    /* XS_GRAPHICS_HDR_SHADOWS */ { "Shadows", "Deepens the dark parts of the picture. 1.00 is the game's own, as it looks without HDR; higher makes shadows and night darker without touching the bright parts. 1.10 suits an OLED in a dark room; above 1.20 the darkest steps start to merge.", 0.05, FMT_GAIN, NULL, 0 },
-    /* XS_GRAPHICS_HDR_HIGHLIGHTS */ { "Highlight gain", "Strengthens the light above paper white (lamps, sparks, flames) before it rolls off to the peak. 1.00 is as the game stacks it; more helps a display with little room above paper white.", 0.1, FMT_GAIN, NULL, 0 },
-    /* XS_GRAPHICS_HDR_DECODE */ { "Gamma", "How the game's colours become light: 2.2 as a TV shows it, or the sRGB curve (lighter near black).", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_DISPLAY_FRAME_PACING */ { "Frame pacing", "Low latency shows each frame at the first refresh it can make. Smooth keeps one finished frame in hand, so a late frame does not show as a repeated one; it adds one refresh (16.7 ms at 60 Hz) to the delay from the pad to the screen. Automatic picks Smooth on the Steam Deck and Low latency elsewhere. On a variable-refresh display (G-Sync, FreeSync) or one well above 60 Hz there is no queue to keep, and Smooth works like Low latency.", 1, FMT_PLAIN, n_frame_pacing, 0 },
-    /* XS_GAME_RACE_CLOCK */    { "Potato mode", "Keeps the race at real speed on a slow machine by skipping frames. Without it, a machine under 60 fps runs the race in slow motion until the first crash. Leave it off on a fast PC: at 60 fps it gains nothing, and lap times can come out a few seconds slower. Applies from the next race.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_ANISO */    { XS_GRAPHICS_ANISO, "Anisotropic filtering", "Sharper textures at a slant, like the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
+    /* XS_GRAPHICS_AA */       { XS_GRAPHICS_AA, "Anti-aliasing", "Smooths jagged edges. FXAA is one cheap pass; SMAA takes three and looks cleaner.", 1, FMT_PLAIN, n_aa, 0 },
+    /* XS_GRAPHICS_SHARPEN */  { XS_GRAPHICS_SHARPEN, "Sharpening", "Contrast-adaptive sharpening (AMD CAS). Offsets the softness from anti-aliasing and scaling up.", 0.05, FMT_PERCENT, NULL, 0 },
+    /* XS_AUDIO_VOLUME */       { XS_AUDIO_VOLUME, "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
+    /* XS_AUDIO_MUTE */         { XS_AUDIO_MUTE, "Mute", "Silences the game.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_MUTE_BG */      { XS_AUDIO_MUTE_BG, "Mute in the background", "Silences the game while its window is not in front.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_SPEAKERS */     { XS_AUDIO_SPEAKERS, "Speakers", "Auto uses 5.1 when the system's sound output is 5.1 or more, otherwise stereo.", 1, FMT_PLAIN, n_speakers, 0 },
+    /* XS_AUDIO_FX_LEVEL */     { XS_AUDIO_FX_LEVEL, "Surround effects (reverb) level", "5.1 only. The level of the game's reverb sends, which play dry here because no effect DSP runs.", 0.05, FMT_PERCENT, NULL, 0 },
+    /* XS_AUDIO_MIXER */        { XS_AUDIO_MIXER, "Mixer", "Gains, sends, LFE and a limiter over the game's sound buses; the Mixer page is below. Off keeps the game's own mix.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_INPUT_DEADZONE */     { XS_INPUT_DEADZONE, "Stick deadzone", "How far the stick can move before it counts as centred.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
+    /* XS_INPUT_TRIGGER_DEADZONE */ { XS_INPUT_TRIGGER_DEADZONE, "Trigger deadzone", "How far a trigger can be pulled and still count as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
+    /* XS_INPUT_RUMBLE */       { XS_INPUT_RUMBLE, "Rumble strength", "1.0 is the original Xbox rumble. Higher strengthens the weaker rumbles; the strongest stays at full. 0 turns rumble off.", 0.25, FMT_GAIN, NULL, 0 },
+    /* XS_INPUT_FACE_LAYOUT */  { XS_INPUT_FACE_LAYOUT, "Face buttons", "Nintendo layout is for pads with A on the right and B below. It swaps A with B and X with Y, in the game and here.", 1, FMT_PLAIN, n_face, 0 },
+    /* XS_INPUT_CONTROL_SCHEME */ { XS_INPUT_CONTROL_SCHEME, "Driving controls", "PS2 layout uses the PlayStation 2 version's driving controls: accelerate on the bottom face button, brake on the left one, boost on the right shoulder, look back on the left shoulder. Applies only while driving.", 1, FMT_PLAIN, n_scheme, 0 },
+    /* XS_POWER_MODE */         { XS_POWER_MODE, "Power mode", "Maximum busy-waits throughout (steadiest, hottest). Balanced sleeps, then spins for the last 8 ms of each frame (steady 60). Battery saver only sleeps (coolest, with an occasional small dip). Auto picks the spin as it goes: less while frames are steady, more when they come late.", 1, FMT_PLAIN, n_power, 0 },
+    /* XS_ADVANCED_PERF */      { XS_ADVANCED_PERF, "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GAME_SPEED_UNITS */   { XS_GAME_SPEED_UNITS, "Speed units", "Speed and distance in km/h and metres instead of mph and miles, using the game's own metric display. Applies from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
+    /* XS_DISPLAY_HUD_FIX */    { XS_DISPLAY_HUD_FIX, "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On keeps the HUD at its 4:3 proportions, pinned to the screen edges. Applies from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_DISPLAY_ULTRAWIDE */  { XS_DISPLAY_ULTRAWIDE, "Ultrawide", "For displays wider than 16:9, with Aspect set to 16:9. Races fill the whole width, showing more at the sides without stretching. Menus, loading screens and videos stay 16:9 in the middle. Window matches the window's or screen's own shape. Applies from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
+    /* XS_GRAPHICS_BLOOM */     { XS_GRAPHICS_BLOOM, "Bloom", "How strong the game's own bloom is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_GRAPHICS_MOTION_BLUR */ { XS_GRAPHICS_MOTION_BLUR, "Motion blur", "How strong the game's own motion blur is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_GRAPHICS_CRASH_60FPS */ { XS_GRAPHICS_CRASH_60FPS, "60 fps crash cameras", "The game drops to 30 fps in its crash and takedown cameras. On keeps them at 60. Needs a fast machine: if 60 can't be held, the game itself slows down, not just the picture. Leave it off on a Steam Deck or other handheld.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SPLIT_60FPS */ { XS_GRAPHICS_SPLIT_60FPS, "60 fps split screen", "Two-player split screen runs at 30 fps in the original. On runs it at 60 and draws the scene twice per frame. Needs a fast machine: if 60 can't be held, the game itself slows down. Leave it off on a Steam Deck or other handheld. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_HIGH_REFRESH */ { XS_GRAPHICS_HIGH_REFRESH, "High refresh rate", "Draws the game at your display's refresh rate instead of 60 fps, for 120, 144 Hz and faster displays. The game itself still runs at its own 60 steps a second; cars and the camera move smoothly between them. Menus, split screen, and crash cameras unless 60 fps crash cameras is on, stay at the game's own rate. Adds up to one 60 Hz step of delay. Needs a fast machine: every frame is drawn at the full render scale.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_SPLIT_MUSIC */  { XS_AUDIO_SPLIT_MUSIC, "Music in split screen", "The original plays no music in split screen. On plays EA GAMES TRAX or your custom music in two-player Race and Road Rage, as in one-player. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_LOD_BIAS */  { XS_GRAPHICS_LOD_BIAS, "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto uses -0.5 at 2x and -1.0 at 4x.", 1, FMT_PLAIN, n_lod, 0 },
+    /* XS_GRAPHICS_DITHER */    { XS_GRAPHICS_DITHER, "Dither", "Faint noise added when scaling to the window, to hide banding in smooth gradients such as the sky. Metal only for now. Text and HUD at their exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_VEHICLE_DETAIL */ { XS_GRAPHICS_VEHICLE_DETAIL, "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Far doubles the console's distance, Farthest quadruples it. Costs GPU time with many vehicles on screen. Scenery, the track and where traffic appears stay the same.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
+    /* XS_GRAPHICS_SCENERY_DETAIL */ { XS_GRAPHICS_SCENERY_DETAIL, "Scenery detail", "How far away trees and other roadside objects keep their detailed models before the game swaps in simpler ones. Original is the console's distance; Far moves the swap further out, so trees no longer change shape as you come round a bend. Costs a little GPU time. Changes at once.", 1, FMT_PLAIN, n_scenery_detail, 0 },
+    /* XS_INPUT_GLYPHS */       { XS_INPUT_GLYPHS, "Button prompts", "The button icons in the game's menus and hints. Auto follows the controller you used last. Xbox (original) is the game's own art. Positional works with any pad: a diamond of four dots, with the button to press filled. Keyboard shows key caps. Auto picks it while you play on the keyboard. The game's text and videos still name Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
+    /* XS_AUDIO_LFE_LOWPASS */  { XS_AUDIO_LFE_LOWPASS, "Subwoofer low-pass (LFE)", "120 Hz matches the console's Dolby Digital encoder. Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
+    /* XS_DISPLAY_PRESENT_TIMING */ { XS_DISPLAY_PRESENT_TIMING, "Frame presentation", "When a finished frame goes to the display. Legacy: as soon as it is ready. Auto: each frame is aimed at one refresh, so frames stay on screen equally long and appear sooner after they are drawn. On a fixed 60, 120 or 240 Hz display the game's clock follows the display; on variable refresh (VRR, ProMotion) frames go out at even intervals. The performance overlay's on-glass line shows the result.", 1, FMT_PLAIN, n_timing, 0 },
+    /* XS_ADVANCED_PERF_STEPS */ { XS_ADVANCED_PERF_STEPS, "Graph: simulation steps", "Marks frames where the game ran more than one simulation step on the frame-time graph. It does that when its frame rate drops.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_ADVANCED_DIAG_LOG */  { XS_ADVANCED_DIAG_LOG, "Diagnostic logging", "Off logs only errors and a few start-up facts. On writes the full log (about 830 KB a run at most, the last three runs kept), and bug reports include it. To capture a problem: switch it on, restart so the log has the start, reproduce it, then create the report.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_UI_SCALE */  { XS_GRAPHICS_UI_SCALE, "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2x or 4x with an edge-following scaler (Super-xBR), for render scales above 1x. The 3D world is untouched. Sharper versions are made in the background and kept on disk, so new art can look unscaled at first. Uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
+    /* XS_INTERFACE_MENU_ENTRY */ { XS_INTERFACE_MENU_ENTRY, "Entry in the game's menu", "Adds TAKEDAWN SETTINGS to the game's Settings menu (Driver Details > Settings). It opens this menu, like the hotkey. Shows the next time that menu opens.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_CUSTOM_LEVEL */ { XS_AUDIO_CUSTOM_LEVEL, "Custom music loudness", "Modern songs are mastered louder than the game's music, and the game plays them louder still, so they distort. Match game music brings each song to the level of EA GAMES TRAX with a slow gain that never pumps within a song. Quieter and Louder sit 4 dB below and above that. Off plays songs as the game sends them. Custom music only.", 1, FMT_PLAIN, n_custom_level, 0 },
+    /* XS_DISPLAY_SCORE_BOARD */ { XS_DISPLAY_SCORE_BOARD, "Score board", "The SCORE board at the top of the screen. Original is the console's look: the dark plate behind the score vanishes a moment after its text fades. Smooth fades the plate with the text, and fades the board back in after a crash camera. Changes at once.", 1, FMT_PLAIN, n_score_board, 0 },
+    /* XS_DISPLAY_RIVAL_MARKER */ { XS_DISPLAY_RIVAL_MARKER, "Rival marker switch", "The marker over a rival car is a small arrow far away and its race position (4th) near. Original is the console's: it changes at 35 metres, checked twice a second, so a rival you close on can be nearer when it changes. Farther shows the position from 60 metres and the arrow again past 75, checked every frame, so the change is earlier and does not flip back and forth. Changes at once.", 1, FMT_PLAIN, n_rival_marker, 0 },
+    /* XS_AUDIO_MENU_SOUNDS */  { XS_AUDIO_MENU_SOUNDS, "Menu sounds", "This menu clicks with the game's own menu sounds, read from your copy of the game.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR */       { XS_GRAPHICS_HDR, "HDR", "High dynamic range output on a display that can show it (on macOS: a display with HDR or XDR brightness headroom; on Steam Deck and Linux: game mode with HDR switched on in the display settings; on Windows: Use HDR switched on for the display in Windows' display settings). The game's light keeps its strength: lamps, brake lights, sparks, the boost glow and the sun go brighter than white, while the HUD and menus stay at their own brightness. Off is the original picture.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR_PEAK */  { XS_GRAPHICS_HDR_PEAK, "Peak brightness", "The brightest the display can show. Display uses what the display reports (on a Steam Deck that is right). To set it by eye: raise it until the symbol in the box disappears into the bright background, then stop.", 50.0, FMT_NITS, NULL, 0 },
+    /* XS_GRAPHICS_HDR_PAPER */ { XS_GRAPHICS_HDR_PAPER, "Paper white", "How bright the game's ordinary white is: the scene's overall brightness. Light above it uses the room up to the peak. Raise it if the whole picture looks dimmer than without HDR. The box shows paper white (left) beside the HUD's white (right).", 10.0, FMT_NITS, NULL, 0 },
+    /* XS_GRAPHICS_HDR_HUD */   { XS_GRAPHICS_HDR_HUD, "HUD and menu brightness", "How bright the HUD, the game's menus and its text are. Same as paper white unless set.", 10.0, FMT_NITS, NULL, 0 },
+    /* XS_GRAPHICS_HDR_SHADOWS */ { XS_GRAPHICS_HDR_SHADOWS, "Shadows", "Deepens the dark parts of the picture. 1.00 is the game's own, as it looks without HDR; higher makes shadows and night darker without touching the bright parts. 1.10 suits an OLED in a dark room; above 1.20 the darkest steps start to merge.", 0.05, FMT_GAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR_HIGHLIGHTS */ { XS_GRAPHICS_HDR_HIGHLIGHTS, "Highlight gain", "Strengthens the light above paper white (lamps, sparks, flames) before it rolls off to the peak. 1.00 is as the game stacks it; more helps a display with little room above paper white.", 0.1, FMT_GAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR_DECODE */ { XS_GRAPHICS_HDR_DECODE, "Gamma", "How the game's colours become light: 2.2 as a TV shows it, or the sRGB curve (lighter near black).", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_DISPLAY_FRAME_PACING */ { XS_DISPLAY_FRAME_PACING, "Frame pacing", "Low latency shows each frame at the first refresh it can make. Smooth keeps one finished frame in hand, so a late frame does not show as a repeated one; it adds one refresh (16.7 ms at 60 Hz) to the delay from the pad to the screen. Automatic picks Smooth on the Steam Deck and Low latency elsewhere. On a variable-refresh display (G-Sync, FreeSync) or one well above 60 Hz there is no queue to keep, and Smooth works like Low latency.", 1, FMT_PLAIN, n_frame_pacing, 0 },
+    /* XS_GAME_RACE_CLOCK */    { XS_GAME_RACE_CLOCK, "Potato mode", "Keeps the race at real speed on a slow machine by skipping frames. Without it, a machine under 60 fps runs the race in slow motion until the first crash. Leave it off on a fast PC: at 60 fps it gains nothing, and lap times can come out a few seconds slower. Applies from the next race.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_CUSTOM_AT_START */ { XS_AUDIO_CUSTOM_AT_START, "Custom music at start", "With a music folder chosen, the game starts on the custom soundtrack you last picked in Driver Details > Settings > EA GAMES TRAX (the first one until you pick), so you do not have to pick it every time. Picking EA GAMES TRAX there starts it on EA GAMES TRAX from then on. Off starts on EA GAMES TRAX every time, as the original does. Applies from the next start.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_TEXUP */     { XS_GRAPHICS_TEXUP, "Texture upscale", "Sharpens the textures of the world (signs, buildings, cars) on the graphics card while you play. FSRCNNX is sharper, NNEDI3 softer. A texture first shows as the game has it and turns sharp a moment later. Sharpened textures are kept on disk, so the next race has them at once. See-through parts (fences, trees) keep the game's own edges. Uses more video memory. Off shows the game's own textures.", 1, FMT_PLAIN, n_texup, 0 },
+    /* XS_GRAPHICS_TEXUP_SCALE */ { XS_GRAPHICS_TEXUP_SCALE, "Upscale scale", "How much larger the sharpened textures are. 4x looks finer up close, but it needs four times the video memory of 2x and takes longer to fill in. Textures over 256 pixels a side get 2x.", 1, FMT_PLAIN, n_texup_sc, 0 },
+    /* XS_GRAPHICS_TEXUP_ROADS */ { XS_GRAPHICS_TEXUP_ROADS, "Upscale road surfaces", "Off leaves the road surfaces as the game has them: the upscalers can make their fine grain look noisy. On upscales them too.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_DISPLAY_CRASHNAV_MAP */ { XS_DISPLAY_CRASHNAV_MAP, "Crash Nav map", "The map in Crash Nav (Select Location) with Widescreen HUD on in 16:9. Full width spreads the map, its route and its markers across the screen like the frame around it. 4:3 keeps the map the shape of the rest of the menu, with the frame beside it. Changes at once.", 1, FMT_PLAIN, n_crashnav_map, 0 },
+    /* XS_GRAPHICS_TEXUP_PRELOAD */ { XS_GRAPHICS_TEXUP_PRELOAD, "Upscale while loading", "Does most of the sharpening during the loading screen and the countdown, so the first race on a new track has less of it to do; a fast PC can leave it off.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
-    /* XS_INPUT_VIBRATION */    { "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
-    /* XS_INPUT_TOUCH */        { "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
-    /* XS_INPUT_TOUCH_OPACITY */ { "Touch controls opacity", "How solid the on-screen controls look.", 0.1, FMT_PERCENT, NULL, 0 },
-    /* XS_INPUT_TOUCH_SCALE */  { "Touch controls size", "100% suits a phone or a 6-7 inch handheld held in both hands.", 0.1, FMT_PERCENT, NULL, 0 },
-    /* XS_INPUT_TOUCH_AUTO_GAS */ { "Touch: accelerate automatically", "In a race the car accelerates by itself; hold BRAKE to slow down or reverse. Touch controls only.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
+    /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
+    /* XS_INPUT_TOUCH_OPACITY */ { XS_INPUT_TOUCH_OPACITY, "Touch controls opacity", "How solid the on-screen controls look.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_INPUT_TOUCH_SCALE */  { XS_INPUT_TOUCH_SCALE, "Touch controls size", "100% suits a phone or a 6-7 inch handheld held in both hands.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_INPUT_TOUCH_AUTO_GAS */ { XS_INPUT_TOUCH_AUTO_GAS, "Touch: accelerate automatically", "In a race the car accelerates by itself; hold BRAKE to slow down or reverse. Touch controls only.", 1, FMT_PLAIN, NULL, 0 },
 #endif
 };
+/* One entry per setting, in xbox_settings.h's order: a row shows its own
+ * label, help and choices only while k_meta[id] is id's (BO-245: a merge
+ * put Custom music at start after the texture rows, and the Graphics and
+ * Audio pages showed each other's rows). A missing entry is zeros, id 0. */
+static constexpr bool meta_in_order()
+{
+    for (int i = 0; i < XS_COUNT; i++)
+        if (k_meta[i].id != i)
+            return false;
+    return true;
+}
+static_assert(meta_in_order(), "k_meta: one entry per xs_id, in xbox_settings.h order");
 
 /* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
  * the game's mixbins and speaker map, 1 straight to the output). */
@@ -612,9 +658,17 @@ static int sio_mark(const char *dir)
     return recomp_save_export_check(dir, s_sio_id, NULL, 0);
 }
 
+static int sio_stopping(void *) { return xsb_stopping(); }
+static int sio_slow(const char *dir, void *) { return xsb_slow_volume(dir); }
+
+/* On the browser's thread, bounded (BO-289): the look gives up when the
+ * browser closes or moves on, and a network share is not walked. */
 static int sio_mark_xbox(const char *dir)
 {
-    return xbox_SaveImportCheck(dir, s_sio_id);
+    xbox_save_check_limits lim = {};
+    lim.stop = sio_stopping;
+    lim.shallow = sio_slow;
+    return xbox_SaveImportCheckBounded(dir, s_sio_id, &lim);
 }
 
 static bool sio_staged(char *folder, unsigned n)
@@ -770,7 +824,8 @@ static void browser_count(const xsb_row &r, char *out, size_t n)
     if (r.kind == XSB_OFF || r.kind == XSB_UP)
         return;
     if (s_fb_purpose == FB_SAVE || s_fb_purpose == FB_XBOX) {
-        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? (s_fb_purpose == FB_XBOX ? "an Xbox save" : "a save of this game") : "");
+        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? (s_fb_purpose == FB_XBOX ? "an Xbox save" : "a save of this game")
+                               : r.more ? "not checked" : "");
         return;
     }
     if (r.songs < 0)
@@ -1021,10 +1076,16 @@ static int page_rows(int page, Row *r)
             SET(XS_GAME_SPEED_UNITS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->key))
             SET(XS_DISPLAY_HUD_FIX);
+        /* The map screen's shape: only with the widescreen HUD on. */
+        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_CRASHNAV_MAP)->key) &&
+            xbox_SettingValue(XS_DISPLAY_HUD_FIX) != 0)
+            SET(XS_DISPLAY_CRASHNAV_MAP);
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_ULTRAWIDE)->key))
             SET(XS_DISPLAY_ULTRAWIDE);
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_SCORE_BOARD)->key))
             SET(XS_DISPLAY_SCORE_BOARD);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_RIVAL_MARKER)->key))
+            SET(XS_DISPLAY_RIVAL_MARKER);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:
@@ -1033,6 +1094,16 @@ static int page_rows(int page, Row *r)
         SET(XS_GRAPHICS_LOD_BIAS);
         if (!nv2a_texscale_held())      /* RECOMP_DEBUG=ui_scale_hold=1 (nv2a_texscale.h) */
             SET(XS_GRAPHICS_UI_SCALE);
+        if (nv2a_texup_supported()) {   /* BO-245: a backend that can (Metal for now) */
+            SET(XS_GRAPHICS_TEXUP);
+            if (xbox_SettingValue(XS_GRAPHICS_TEXUP) != 0) {
+                /* A Steam Deck is offered 2x only: no scale row there. */
+                if (nv2a_texup_max_scale() > 2)
+                    SET(XS_GRAPHICS_TEXUP_SCALE);
+                SET(XS_GRAPHICS_TEXUP_ROADS);
+                SET(XS_GRAPHICS_TEXUP_PRELOAD);
+            }
+        }
         /* Dither (graphics.dither) has no row: settings.toml or
          * RECOMP_GFX_DITHER only (docs/runtime/overlay.md). */
         /* BO-110: HDR, where the display can show more than SDR white. */
@@ -1040,9 +1111,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_HDR);
             if (xbox_SettingValue(XS_GRAPHICS_HDR) != 0.0) {
                 SET(XS_GRAPHICS_HDR_PEAK); SET(XS_GRAPHICS_HDR_PAPER); SET(XS_GRAPHICS_HDR_HUD);
-#if !defined(__APPLE__)
+                /* BO-227: Metal's HDR pass takes these too now. */
                 SET(XS_GRAPHICS_HDR_SHADOWS); SET(XS_GRAPHICS_HDR_HIGHLIGHTS);
-#endif
                 ACT(A_HDR_RESET, "Reset HDR to the display's defaults");
             }
         }
@@ -1054,6 +1124,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_CRASH_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
             SET(XS_GRAPHICS_SPLIT_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_HIGH_REFRESH)->key))
+            SET(XS_GRAPHICS_HIGH_REFRESH);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_RACE_CLOCK)->key))
             SET(XS_GAME_RACE_CLOCK);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
@@ -1103,6 +1175,8 @@ static int page_rows(int page, Row *r)
                 INFO(s_mf_note[k]);
             }
         }
+        if (s_mf)
+            SET(XS_AUDIO_CUSTOM_AT_START);
         if (s_mf)
             SET(XS_AUDIO_CUSTOM_LEVEL);
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
@@ -1456,7 +1530,27 @@ static void value_text(xs_id id, char *out, size_t n)
     case XS_CHOICE:
         {
             const char *const *names = m.names == n_power && !on_steam_deck() ? n_power_plain : m.names;
-            snprintf(out, n, "%s", names ? names[(int)v] : s->choices[(int)v]);
+            int i = (int)v, nn = 0, nc = 0;
+            while (names && names[nn])
+                nn++;
+            while (s->choices && s->choices[nc])
+                nc++;
+            /* The shown names are the table's choices, one for one; a list
+             * that is not (BO-245: the Graphics page's texture row showed
+             * "(null)" with another row's names) is said once and the
+             * setting's own key is shown. */
+            if (names && nn != nc) {
+                static bool said[XS_COUNT];
+                if (!said[id]) {
+                    said[id] = true;
+                    fprintf(stderr, "[OVERLAY] %s: %d names shown for %d choices\n", s->key, nn, nc);
+                }
+                names = NULL;
+            }
+            if (i < 0 || i >= nc)
+                snprintf(out, n, "%g", v);
+            else
+                snprintf(out, n, "%s", names ? names[i] : s->choices[i]);
         }
         break;
     default:
@@ -1465,14 +1559,18 @@ static void value_text(xs_id id, char *out, size_t n)
         case FMT_PERCENT_OF_MAX: snprintf(out, n, "%d%%", (int)floor(v / s->max * 100.0 + 0.5)); break;
         case FMT_TIMES:          snprintf(out, n, "%dx", (int)v); break;
         case FMT_NITS:
-            if (v <= 0.0 && id == XS_GRAPHICS_HDR_PEAK) {
-                float pk, pw, hw;
-                nv2a_host_hdr_levels(&pk, &pw, &hw);
-                snprintf(out, n, "Display (%d nits)", (int)(pk + 0.5f));
-            } else if (v <= 0.0) {
-                snprintf(out, n, "Same as paper white");
-            } else {
-                snprintf(out, n, "%d nits", (int)(v + 0.5));
+            {
+                /* BO-244: nits on every platform (macOS outputs HDR10 too). */
+                double q = v;
+                if (v <= 0.0 && id == XS_GRAPHICS_HDR_PEAK) {
+                    float pk, pw, hw;
+                    nv2a_host_hdr_levels(&pk, &pw, &hw);
+                    q = pk;
+                }
+                if (v <= 0.0 && id != XS_GRAPHICS_HDR_PEAK)
+                    snprintf(out, n, "Same as paper white");
+                else
+                    snprintf(out, n, v <= 0.0 ? "Display (%d nits)" : "%d nits", (int)(q + 0.5));
             }
             break;
         case FMT_GAIN:
@@ -1496,6 +1594,16 @@ static void changed()
     s_save_at = now_ms() + 600;
 }
 
+/* A row that cannot be changed now: the environment sets it, or (Custom
+ * music at start) there is no music folder for it to act on. */
+static bool setting_inactive(xs_id id)
+{
+    const xs_setting *s = xbox_SettingGet(id);
+    if (s->locked)
+        return true;
+    return id == XS_AUDIO_CUSTOM_AT_START && !xbox_SettingsText("audio.custom_music_dir", NULL)[0];
+}
+
 /* Left/right on a setting (dir -1/+1). */
 static void adjust(xs_id id, int dir)
 {
@@ -1503,7 +1611,7 @@ static void adjust(xs_id id, int dir)
     const Meta &m = k_meta[id];
     double v = s->value;
 
-    if (s->locked)
+    if (setting_inactive(id))
         return;
     switch (s->type) {
     case XS_BOOL:
@@ -1620,7 +1728,7 @@ static void activate_row(const Row &r);
 static void activate(const Row &r)
 {
     activate_row(r);
-    if (r.kind != R_SPEAKERS && !(r.kind == R_SETTING && xbox_SettingGet(r.id)->locked))
+    if (r.kind != R_SPEAKERS && !(r.kind == R_SETTING && setting_inactive(r.id)))
         menusnd_play(XBOX_OVERLAY_SND_SELECT);
 }
 
@@ -1751,6 +1859,8 @@ static void activate_row(const Row &r)
     if (r.kind != R_SETTING)
         return;
     const xs_setting *s = xbox_SettingGet(r.id);
+    if (setting_inactive(r.id))
+        return;
     if (s->type == XS_BOOL)
         xbox_SettingSet(r.id, s->value != 0.0 ? 0 : 1), changed();
     else if (s->type == XS_CHOICE)
@@ -1940,6 +2050,7 @@ int xbox_OverlayEvent(const SDL_Event *ev)
 {
     if (!s_enabled)
         return 0;
+    std::lock_guard<std::mutex> g(s_ov_mu);
 
     switch (ev->type) {
     case SDL_WINDOWEVENT:
@@ -2204,6 +2315,7 @@ void xbox_OverlayPoll(void)
 {
     if (!s_enabled)
         return;
+    std::lock_guard<std::mutex> g(s_ov_mu);
     test_poll();
 
     if (s_open_request.exchange(0) && !s_open)
@@ -2226,6 +2338,22 @@ void xbox_OverlayPoll(void)
         s_trigger_next = now_ms() + 200;
         if (unlink(s_trigger) == 0)
             hot_toggle();
+    }
+    if (s_pacing_file[0] && (int32_t)(now_ms() - s_trigger_next) >= 0) {
+        FILE *f = fopen(s_pacing_file, "r");
+        s_trigger_next = now_ms() + 200;
+        if (f) {
+            char w[32] = { 0 };
+            int v;
+            if (!fgets(w, sizeof w, f))
+                w[0] = 0;
+            fclose(f);
+            unlink(s_pacing_file);
+            v = !strncmp(w, "low_latency", 11) ? 1 : !strncmp(w, "smooth", 6) ? 2 : 0;
+            fprintf(stderr, "[OVERLAY] pacing_file: frame pacing -> %s\n",
+                    v == 1 ? "low_latency" : v == 2 ? "smooth" : "auto");
+            xbox_SettingSet(XS_DISPLAY_FRAME_PACING, v);
+        }
     }
 
     /* B or Esc: here and not in the frame, so a window that cannot present
@@ -2312,6 +2440,8 @@ int xbox_OverlaySetWindow(SDL_Window *win)
     }
     if (e && !strncmp(e, "file=", 5))
         snprintf(s_trigger, sizeof s_trigger, "%s", e + 5);
+    if (e && !strncmp(e, "pacing_file=", 12))
+        snprintf(s_pacing_file, sizeof s_pacing_file, "%s", e + 12);
     if (e && !strcmp(e, "open"))
         set_open(true);
     return 1;
@@ -2393,10 +2523,32 @@ void xbox_OverlayFramePresented(void)
     s_presents++;
 }
 
+void xbox_OverlayPlatformFrame(int vulkan)
+{
+    if (!s_enabled)
+        return;
+    std::lock_guard<std::mutex> g(s_ov_mu);
+    if (!s_core_ready) {
+        /* The context and ImGui's SDL half (cursors, the window's id) are
+         * made here, on the window's thread, before the first draw. */
+        if (!overlay_core_init(vulkan != 0)) {
+            overlay_fail();
+            return;
+        }
+    }
+    if (s_plat_pending || !xbox_OverlayWants())
+        return;
+    /* The window's size, the mouse and its cursor: SDL window calls, which
+     * stay on this thread (AppKit's on macOS). */
+    ImGui_ImplSDL2_NewFrame();
+    s_plat_pending = s_plat_ever = true;
+}
+
 void xbox_OverlayShutdown(void)
 {
     if (!s_enabled)
         return;
+    std::lock_guard<std::mutex> g(s_ov_mu);
     if (s_open)
         set_open(false);
     xbox_SettingsFlush();
@@ -2643,6 +2795,11 @@ static void gamefont_attach()
     s_caps_title = gt->caps;
 }
 
+bool overlay_core_is_ready()
+{
+    return s_core_ready;
+}
+
 bool overlay_core_init(bool vulkan)
 {
     if (s_core_ready)
@@ -2655,6 +2812,10 @@ bool overlay_core_init(bool vulkan)
     /* Navigation is the overlay's own (see the top); ImGui is the renderer
      * and the mouse. */
     io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+    /* The mouse cursor is the window loop's (fb_present_sdl.c): hidden in
+     * play, shown while the overlay is open. ImGui's SDL backend would show
+     * it on every frame it runs, a notice or the perf panel included. */
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     overlay_fonts();
     theme_pick();
     accent_style();
@@ -2664,6 +2825,12 @@ bool overlay_core_init(bool vulkan)
         return false;
     }
     ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_Manual, nullptr, 0);
+    /* No text field and no clipboard in the overlay. ImGui would call these
+     * from the frame's end, on the present thread, and the IME one starts
+     * and stops SDL's text input, an AppKit call on macOS (BO-210). */
+    ImGui::GetPlatformIO().Platform_SetImeDataFn = nullptr;
+    ImGui::GetPlatformIO().Platform_SetClipboardTextFn = nullptr;
+    ImGui::GetPlatformIO().Platform_GetClipboardTextFn = nullptr;
     s_vulkan = vulkan;
     s_core_ready = true;
     s_last_ms = now_ms();
@@ -3508,18 +3675,27 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
          * peak set here on a background as bright as the display goes. */
         float pk, pw, hw;
         nv2a_host_hdr_levels(&pk, &pw, &hw);
-        void *tex = nv2a_host_hdr_patch(pk);
+        /* BO-227: the symbol at the value set here, not the level in use
+         * (that one stops at what the display grants now), so it does
+         * disappear where the display clips. */
+        const double set = xbox_SettingValue(XS_GRAPHICS_HDR_PEAK);
+        void *tex = nv2a_host_hdr_patch(set >= 10.0 ? (float)set : pk);
         const float ph = rh * 2.2f, pwid = ph * 2.0f;
         float px = arr + ah * 1.5f;
         if (px + pwid > p.x + width)
             px = arl - ah * 1.5f - pwid;   /* no room right of the value: left of its arrow */
-        if (tex && px + pwid <= p.x + width)
+        if (tex && px + pwid <= p.x + width) {
             dl->AddImage((ImTextureID)tex, ImVec2(px, cy - ph * 0.5f), ImVec2(px + pwid, cy + ph * 0.5f));
+            const ImVec2 fs2 = ImGui::GetIO().DisplayFramebufferScale;
+            nv2a_host_hdr_patch_at(px * fs2.x, (cy - ph * 0.5f) * fs2.y, (px + pwid) * fs2.x,
+                                   (cy + ph * 0.5f) * fs2.y);
+        }
         else if (!tex && px + pwid <= p.x + width) {
-            /* Vulkan: drawn by the presenter over the overlay (past its white). */
+            /* Vulkan, and Metal's PQ layer (BO-244): drawn by the presenter
+             * over the overlay (past its white). */
             const ImVec2 sc = ImGui::GetIO().DisplayFramebufferScale;
             nv2a_host_hdr_pattern(0, px * sc.x, (cy - ph * 0.5f) * sc.y, (px + pwid) * sc.x,
-                                  (cy + ph * 0.5f) * sc.y, pk, 10000.0f);
+                                  (cy + ph * 0.5f) * sc.y, set >= 10.0 ? (float)set : pk, 10000.0f);
         }
     }
     if (sel && r.kind == R_SETTING && r.id == XS_GRAPHICS_HDR_PAPER) {
@@ -3631,7 +3807,7 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     const xs_setting *s = xbox_SettingGet(r.id);
     const Meta &m = k_meta[r.id];
     char v[96];
-    const bool dim = s->locked;
+    const bool dim = setting_inactive(r.id);
     const ImU32 vc = dim ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text);
     value_text(r.id, v, sizeof v);
     {
@@ -4112,7 +4288,10 @@ static bool row_hint(const Row &r, char *hint, size_t n)
     if (r.kind == R_SETTING) {
         const xs_setting *s = xbox_SettingGet(r.id);
         locked_out = s->locked;
-        if (s->locked) {
+        if (!s->locked && setting_inactive(r.id)) {
+            locked_out = true;
+            snprintf(hint, n, "Choose a music folder first (Custom music folder, above). This starts the game on the custom soundtrack you last picked.");
+        } else if (s->locked) {
             if (s->env == RENV_COUNT)
                 snprintf(hint, n, "Set by the environment (RECOMP_PRESENT_PACING / RECOMP_PRESENT_SPIN_LEAD); unset it to change it here.");
             else
@@ -4137,6 +4316,22 @@ static bool row_hint(const Row &r, char *hint, size_t n)
                              done, total, hint);
                     snprintf(hint, n, "%s", whole);
                 }
+            }
+            if (r.id == XS_GRAPHICS_TEXUP && xbox_SettingValue(XS_GRAPHICS_TEXUP) != 0) {
+                /* BO-245: what it has done so far, after the help; the
+                 * Deck's one factor said here, as it has no scale row. */
+                struct nv2a_texup_stats st;
+                size_t at = strlen(hint);
+                nv2a_texup_stats(&st);
+                if (nv2a_texup_max_scale() <= 2 && at < n)
+                    at += (size_t)snprintf(hint + at, n - at, " On a Steam Deck it sharpens to 2x.");
+                if (at < n && !st.upscaled && !st.queued)
+                    snprintf(hint + at, n - at, " None sharpened yet.");
+                else if (at < n)
+                    snprintf(hint + at, n - at, " So far: %u sharpened (%.0f MB), %u waiting;"
+                             " %llu read from disk, %llu made.", st.upscaled,
+                             (double)st.resident_bytes / 1048576.0, st.queued,
+                             (unsigned long long)st.from_disk, (unsigned long long)st.computed);
             }
             /* The table's flag: this one is read when the game starts. */
             if (s->flags & XS_RESTART) {
@@ -4438,7 +4633,7 @@ static void build_pages_inner()
         }
         if (rows[i].kind == R_SETTING) {
             const xs_setting *s = xbox_SettingGet(rows[i].id);
-            if (drag >= 0 && !s->locked) {
+            if (drag >= 0 && !setting_inactive(rows[i].id)) {
                 double v = s->min + drag * (s->max - s->min);
                 if (s->type == XS_INT)
                     v = floor(v + 0.5);
@@ -4670,7 +4865,12 @@ bool overlay_begin_frame()
     scale = scale < 1.0f ? 1.0f : scale > 2.2f ? 2.2f : scale;
     ImGui::GetStyle().FontSizeBase = 17.0f * scale;
 
-    ImGui_ImplSDL2_NewFrame();
+    /* ImGui's SDL half ran on the main thread (xbox_OverlayPlatformFrame);
+     * not yet once: nothing to draw with. */
+    if (!s_plat_ever)
+        return false;
+    s_plat_pending = false;
+    io.DeltaTime = dt > 0.0f ? dt : 0.001f;
     /* The image drawn into, in pixels, for the window's points: a swapchain
      * smaller or larger than the window (Android's scaled swapchain) still
      * gets the whole picture, every control where the fingers are. */

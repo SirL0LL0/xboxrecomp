@@ -144,6 +144,27 @@ void nv2a_texrep_register_zbias(const struct nv2a_texrep_zbias *tex, unsigned n)
     s_zb_n = tex ? n : 0;
 }
 
+/* zbias_ab=n with zbias_all=ab: three pictures, n flips each in turn: no
+ * offsets, the offsets on the front faces (BO-253), the offsets on both
+ * faces (BO-176 as released). */
+static int zb_read_all(void)    /* 0 front faces, 1 both faces, 2 the three-way ab */
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = recomp_env(RENV_ZBIAS_ALL);
+        v = !e || !strcmp(e, "0") || !strcmp(e, "off") ? 0
+          : !strcmp(e, "ab") ? 2 : 1;
+    }
+    return v;
+}
+
+static int zb_arm(uint32_t flip)    /* 0 none, 1 front faces, 2 both */
+{
+    const char *a = recomp_env(RENV_ZBIAS_AB);
+    uint32_t ab = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
+    return ab ? (int)((flip / ab) % 3u) : 1;
+}
+
 int nv2a_texrep_zbias_on(uint32_t flip)
 {
     static int mode = -1;               /* -1 not read, 0 off, 1 on */
@@ -153,6 +174,8 @@ int nv2a_texrep_zbias_on(uint32_t flip)
         ab = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
         mode = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
     }
+    if (mode && ab && zb_read_all() == 2)
+        return zb_arm(flip) != 0;
     if (mode && ab) {
         static uint32_t said = 0xFFFFFFFFu;
         uint32_t f = flip, half = (f / ab) & 1u;
@@ -163,6 +186,14 @@ int nv2a_texrep_zbias_on(uint32_t flip)
         return !half;
     }
     return mode;
+}
+
+int nv2a_texrep_zbias_facing(uint32_t flip)
+{
+    int a = zb_read_all();
+    if (a == 2)
+        return zb_arm(flip) != 2;
+    return a == 0;
 }
 
 /* RECOMP_DEBUG=zbias_add=<hash>[+<hash>...] (BO-204): textures that take

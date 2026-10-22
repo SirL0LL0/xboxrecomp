@@ -52,7 +52,8 @@
 #define COBJMACROS
 #include <dxgi1_6.h>
 #include "dxgi_vblank_model.h"
-#else
+#endif
+#if defined(__ANDROID__)
 #include <dlfcn.h>
 #endif
 #include <sched.h>
@@ -69,6 +70,7 @@
 #include "latency_trace.h"
 #include "d3d/nv2a_vk_glsl.h"
 #include "post_shaders.h"
+#include "hdr_shaders.h"      /* BO-244: the HDR maths shared by both presenters */
 #include "smaa.h"
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"
@@ -80,6 +82,9 @@ void xbox_HostWakeListener(const char *what, void (*fn)(uint64_t gap_ns));
 void xbox_PacingResetHook(void (*fn)(void));
 void xbox_PacingPresent(uint64_t when_ns);
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
+void xbox_FlipHostShown(uint32_t flip, uint64_t shown_ns);
+void xbox_VblankDisplayCycle(uint64_t period_ns);
+int xbox_VblankDisplayCycleOk(void);
 int xbox_VblankDisplayLockOn(void);
 uint32_t xbox_HostFlipIntervalAsked(void);
 #include "kernel/nv2a_backend_common.h"
@@ -235,7 +240,7 @@ static volatile int    s_keep_want;         /* waiter -> presenter: +1 refill, -
 static volatile int    s_keep_depth = -1;   /* the last frame's queue depth */
 static volatile unsigned s_keep_gen;        /* bumped at each correction or switch */
 static uint64_t        s_keep_from_id;      /* measured from the id after this one */
-static unsigned        s_keep_refills, s_keep_skips;
+static unsigned        s_keep_refills;
 static int             s_keep_repeat;       /* the present being made is a repeat */
 static uint32_t        s_keep_last_flip = 0xFFFFFFFFu;
 static uint64_t        s_keep_poll_ns;
@@ -243,6 +248,17 @@ static uint64_t        s_keep_poll_ns;
  * thread's keep_poll and the waiter each take their part. */
 static volatile int    s_keep_reset_main, s_keep_reset_waiter;
 static unsigned        s_keep_resets;
+/* BO-210: a correction clears the waiter's period (learned again). */
+static volatile int    s_keep_per_clear;
+static volatile unsigned s_keep_deep, s_keep_held;   /* rows too deep / refills held back */
+/* The window system's refresh cycle (VK_GOOGLE_display_timing; gamescope's
+ * WSI layer has it), ns, 0 not known; the waiter asks it four times a second. */
+static PFN_vkGetRefreshCycleDurationGOOGLE s_get_cycle;
+static volatile uint64_t s_wsi_cycle_ns;
+/* The counters line (fbv_counts, BO-210). */
+static volatile uint64_t s_cnt_new, s_cnt_redraw, s_cnt_refill, s_cnt_shown, s_cnt_shown_rep;
+static volatile uint64_t s_cnt_present_max_ns;
+static uint32_t        s_cnt_last_flip = 0xFFFFFFFFu;
 #if defined(_WIN32)
 static int             s_keep_images;       /* Smooth asked: three swapchain images (BO-207) */
 /* BO-207, Smooth on Windows (Fable's plan): the depth is known at one moment
@@ -348,9 +364,30 @@ void fbv_timing_report(const char *when)
     fprintf(stderr, LOGP "Vulkan %s: %s; %s%s\n", when, a, b,
             C && C->present_wait ? "" : " (no VK_KHR_present_wait)");
     if (s_keep_on > 0)
-        fprintf(stderr, LOGP "frame pacing smooth: %u refills, %u skips, queue depth %d,"
-                " %u watchdog resets\n", s_keep_refills, s_keep_skips, s_keep_depth,
-                s_keep_resets);
+        fprintf(stderr, LOGP "frame pacing smooth: %u refills (%u held back), %u rows too deep"
+                " (left so), queue depth %d, %u watchdog resets\n", s_keep_refills,
+                s_keep_held, s_keep_deep, s_keep_depth, s_keep_resets);
+}
+
+/* The counters line's Vulkan half (BO-210): running totals, and the
+ * longest present call since the last call (then cleared). Main thread. */
+void fbv_counts(FbvCounts *c)
+{
+    memset(c, 0, sizeof *c);
+    c->presents_new = s_cnt_new;
+    c->presents_redraw = s_cnt_redraw;
+    c->refills = s_cnt_refill;
+    c->shown = s_cnt_shown;
+    c->shown_rep = s_cnt_shown_rep;
+    c->present_max_ns = s_cnt_present_max_ns;
+    s_cnt_present_max_ns = 0;
+    c->wsi_cycle_ns = __atomic_load_n(&s_wsi_cycle_ns, __ATOMIC_RELAXED);
+    c->period_ns = __atomic_load_n(&s_vbl_period_ns, __ATOMIC_RELAXED);
+    c->deep = s_keep_deep;
+    c->held = s_keep_held;
+    c->smooth = s_keep_on > 0;
+    c->depth = s_keep_depth;
+    c->have_wait = s_waiter_run;
 }
 
 /* The last vblank a frame was shown at (CLOCK_MONOTONIC ns) and the
@@ -395,6 +432,19 @@ static int under_gamescope(void)
 #else
     return 0;
 #endif
+}
+
+/* The refresh period Smooth works with: the window system's where it says
+ * it and the reports agree, else the one present_wait's steps show (BO-210). */
+static uint64_t keep_period(void)
+{
+    uint64_t w = __atomic_load_n(&s_wsi_cycle_ns, __ATOMIC_RELAXED);
+    /* Not while the vblank lock finds the reports off its grid (a limiter's
+     * target stated, not the panel's refresh). */
+    if (w >= 2000000u && w <= 50000000u
+            && (xbox_VblankDisplayCycleOk() || !xbox_VblankDisplayLockOn()))
+        return w;
+    return __atomic_load_n(&s_vbl_period_ns, __ATOMIC_RELAXED);
 }
 
 /* display.frame_pacing asks for Smooth (auto: under gamescope). */
@@ -489,13 +539,28 @@ static void keep_poll(void)
             on = 0;
             off = "smooth under variable refresh: each frame shows when it is presented,"
                   " no queue to keep (FIFO, three images)";
-        } else if (on && per && (per < 14000000u || per > 19000000u)) {
-            on = 0;
-            off = "smooth at a refresh well away from 60 Hz: a queued frame shows at the next"
-                  " refresh, a late one slips one short refresh (FIFO, three images)";
         }
+        (void)per;
     }
 #endif
+    {
+        /* Smooth only near 60 Hz, on every platform (BO-210; it was
+         * Windows' only). At 90 Hz under gamescope a 60 Hz title's frames are
+         * 1.5 refreshes apart: there is no queue of one to keep, and the
+         * keeper's readings were wrong. At 120 Hz and up a queued frame shows
+         * at the next refresh, a few ms on. Low latency until the refresh is
+         * back. */
+        uint64_t per = keep_period();
+#if defined(_WIN32)
+        if (s_dxgi_period)
+            per = s_dxgi_period;
+#endif
+        if (on && !sk_refresh_ok(per)) {
+            on = 0;
+            off = "smooth at a refresh well away from 60 Hz: low latency until it is back"
+                  " (a queued frame shows at the next refresh)";
+        }
+    }
     {
         /* A new reason Smooth stands down is said too (BO-207). */
         static const char *said_off;
@@ -552,7 +617,7 @@ static void keep_measure(uint64_t id, uint64_t t, uint64_t prev_t)
 {
     static unsigned gen;
     static SkRun run = { -1, 0 };
-    uint64_t p = __atomic_load_n(&s_vbl_period_ns, __ATOMIC_RELAXED), pns, from;
+    uint64_t p = keep_period(), pns, from;
     int meas, d;
     unsigned g = __atomic_load_n(&s_keep_gen, __ATOMIC_ACQUIRE);
 
@@ -634,9 +699,14 @@ static void keep_measure(uint64_t id, uint64_t t, uint64_t prev_t)
                 return;
             }
             if (k > 1) {
+                /* Too deep: left so (a refresh of latency, not a frame;
+                 * BO-210). The anchor is the one-deep one, from B. */
                 fprintf(stderr, "[PACING] smooth: anchor %.1f ms is %d refreshes past the empty"
-                        " queue's (%.1f): one present skipped\n", m / 1e6, k, s_kw_B / 1e6);
-                __atomic_store_n(&s_keep_want, -1, __ATOMIC_RELEASE);
+                        " queue's (%.1f): %d frames queued, left so\n", m / 1e6, k,
+                        s_kw_B / 1e6, k);
+                s_kw_A = s_kw_B + per;
+                s_kw_tries = 0;
+                s_keep_depth = k;
                 return;
             }
             s_kw_A = m;
@@ -664,9 +734,11 @@ static void keep_measure(uint64_t id, uint64_t t, uint64_t prev_t)
         d = 0;
     s_keep_depth = d;
     {
-        int want = sk_run(&run, d, __atomic_load_n(&s_keep_want, __ATOMIC_RELAXED) != 0);
+        int want = sk_run(&run, d, __atomic_load_n(&s_keep_want, __ATOMIC_RELAXED) != 0, t);
         if (want)
             __atomic_store_n(&s_keep_want, want, __ATOMIC_RELEASE);
+        s_keep_deep = run.deep;
+        s_keep_held = run.held;
     }
 }
 
@@ -680,10 +752,15 @@ static void keep_corrected(const char *what, uint32_t flip)
     pthread_mutex_unlock(&s_id_mu);
     __atomic_store_n(&s_keep_want, 0, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_keep_gen, 1, __ATOMIC_RELEASE);
+    /* The period is learned again from the next steps (BO-210: a wrong one
+     * used to stay for the session). */
+    __atomic_store_n(&s_keep_per_clear, 1, __ATOMIC_RELEASE);
+    /* Printed for the first 400; all are counted in the counters line. */
     if (said++ < 400)
-        fprintf(stderr, "[PACING] smooth: %s at flip %u, t_us %llu (refills %u, skips %u)\n",
+        fprintf(stderr, "[PACING] smooth: %s at flip %u, t_us %llu (refills %u, rows too deep"
+                " %u)\n",
                 what, flip, (unsigned long long)(mono_ns() / 1000u), s_keep_refills,
-                s_keep_skips);
+                s_keep_deep);
 }
 
 /* vkWaitForPresentKHR, or its second form (BO-207). s_sc_mu held. */
@@ -709,9 +786,9 @@ static VkResult wait_present(uint64_t id, uint64_t timeout_ns)
  * at most), so the swapchain is not destroyed under it. */
 static void *waiter_main(void *arg)
 {
-    uint64_t next = 1, prev_t = 0;
+    uint64_t next = 1, prev_t = 0, cyc_t = 0;
     int prev_meas = 0;
-    SkPeriod per = { 0, 0, 0, 0 };
+    SkPeriod per = { 0, 0, 0, 0, 0 };
     (void)arg;
     for (;;) {
         VkResult r;
@@ -725,6 +802,30 @@ static void *waiter_main(void *arg)
         if (next < s_sc_first_id)
             next = s_sc_first_id;
         r = s_sc && next <= s_present_id ? wait_present(next, 20000000ull) : VK_NOT_READY;
+        if (s_get_cycle && s_sc && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+            /* The window system's refresh, four times a second (gamescope's
+             * layer answers from what the compositor last said). */
+            uint64_t now = mono_ns();
+            if (now - cyc_t >= 250000000ull) {
+                VkRefreshCycleDurationGOOGLE rc;
+                cyc_t = now;
+                memset(&rc, 0, sizeof rc);
+                if (s_get_cycle(C->dev, s_sc, &rc) == VK_SUCCESS) {
+                    uint64_t c = rc.refreshDuration, o = s_wsi_cycle_ns;
+                    if (c < 2000000u || c > 50000000u)
+                        c = 0;
+                    if (c != o && (!c || !o || (c > o ? c - o : o - c) > o / 200)) {
+                        static int said;
+                        if (said++ < 50)
+                            XR_NOTICE("[PACING] window system refresh: %.3f ms (%.2f Hz)%s\n",
+                                      c / 1e6, c ? 1e9 / (double)c : 0.0,
+                                      o ? "" : ", for Smooth and the vblank lock");
+                        __atomic_store_n(&s_wsi_cycle_ns, c, __ATOMIC_RELAXED);
+                        xbox_VblankDisplayCycle(c);
+                    }
+                }
+            }
+        }
         pthread_mutex_unlock(&s_sc_mu);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
             uint64_t t = mono_ns();
@@ -736,15 +837,24 @@ static void *waiter_main(void *arg)
                 s_keep_reset_waiter = 0;
                 memset(&per, 0, sizeof per);
             }
+            if (__atomic_exchange_n(&s_keep_per_clear, 0, __ATOMIC_ACQ_REL))
+                sk_period_clear(&per);
             pthread_mutex_lock(&s_id_mu);
             meas_now = s_id_meas[next % ID_RING] && !s_id_rep[next % ID_RING];
+            if (s_id_rep[next % ID_RING])
+                s_cnt_shown_rep++;
+            else
+                s_cnt_shown++;
             pthread_mutex_unlock(&s_id_mu);
             if (prev_t && prev_meas && meas_now) {
                 /* The refresh period from the steps between two new frames
                  * at the title's 60: a crash camera's 30 fps steps and a
-                 * refill's repeat are not fed (smooth_keeper.h, BO-211). */
-                __atomic_store_n(&s_vbl_period_ns, sk_period_feed(&per, t - prev_t),
-                                 __ATOMIC_RELAXED);
+                 * refill's repeat are not fed (smooth_keeper.h, BO-211).
+                 * Told once confirmed: after a clear the last one stands
+                 * until ~5 steps agree on the new one (BO-210). */
+                sk_period_feed(&per, t - prev_t);
+                if (sk_period_sure(&per))
+                    __atomic_store_n(&s_vbl_period_ns, per.p, __ATOMIC_RELAXED);
             }
             prev_meas = meas_now;
             __atomic_store_n(&s_vbl_ns, t, __ATOMIC_RELEASE);
@@ -760,6 +870,9 @@ static void *waiter_main(void *arg)
 #endif
             xbox_VblankDisplayRefresh(t, 0);
             xbox_PacingPresent(t);
+            /* A new frame on the glass: when, for a title on the host grid. */
+            if (!s_id_rep[next % ID_RING])
+                xbox_FlipHostShown(s_id_flip[next % ID_RING], t);
             if (s_keep_on > 0)
                 keep_measure(next, t, prev_t);
             if (xbox_LatOn() && !s_id_rep[next % ID_RING]) {
@@ -1216,10 +1329,22 @@ int fbv_load_library(char *err, size_t errn)
 {
     const char *path = NULL;
 
-    /* The loader linked into this binary: SDL_Vulkan_CreateSurface must use
-     * the same instance functions as the instance made here. On Windows that
-     * is vulkan-1.dll, which SDL's default load finds already mapped. */
-#if !defined(_WIN32)
+    /* Our own loader first (vk_dyn.c): without one there is nothing for SDL
+     * to load either, and the reason is the useful part. */
+#if defined(XR_VK_DYNAMIC)
+    if (!xr_vk_loader_ok()) {
+        snprintf(err, errn, "%s", xr_vk_loader_error());
+        return 0;
+    }
+#endif
+    /* The loader the runtime calls: SDL_Vulkan_CreateSurface must use the
+     * same instance functions as the instance made here. On Android that is
+     * the one vk_dyn.c opened (a replacement driver's loader is not the
+     * system's), which SDL finds through the vkGetInstanceProcAddr this
+     * library exports. On Windows and Linux it is vulkan-1.dll or
+     * libvulkan.so.1, which SDL's default load opens by the same name and
+     * the system hands out as the copy already mapped. */
+#if defined(__ANDROID__)
     Dl_info di;
     if (dladdr((void *)&vkGetInstanceProcAddr, &di) && di.dli_fname)
         path = di.dli_fname;
@@ -1594,6 +1719,29 @@ static int surface_takes_wait2(void)
 }
 #endif
 
+/* The window's drawable size. The presents run on the present thread
+ * (fb_present_sdl.c, BO-210); on macOS (MoltenVK) SDL reads it from the
+ * NSView, which belongs to the main thread, so there the main thread notes
+ * it each turn (fbv_note_drawable) and that is used once noted. */
+#if defined(__APPLE__)
+static int s_note_w, s_note_h;
+void fbv_note_drawable(int w, int h)
+{
+    __atomic_store_n(&s_note_w, w, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_note_h, h, __ATOMIC_RELAXED);
+}
+#endif
+static void drawable_size(SDL_Window *win, int *w, int *h)
+{
+#if defined(__APPLE__)
+    *w = __atomic_load_n(&s_note_w, __ATOMIC_RELAXED);
+    *h = __atomic_load_n(&s_note_h, __ATOMIC_RELAXED);
+    if (*w > 0 && *h > 0)
+        return;
+#endif
+    SDL_Vulkan_GetDrawableSize(win, w, h);
+}
+
 static int make_swapchain(SDL_Window *win)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -1695,7 +1843,7 @@ static int make_swapchain(SDL_Window *win)
             if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR)
                 s_sc_mode = modes[i];
         }
-    SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+    drawable_size(win, &dw, &dh);
     if (caps.currentExtent.width != 0xFFFFFFFFu) {
         s_sc_ext = caps.currentExtent;
     } else {
@@ -1911,6 +2059,9 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             )
         s_wait_present = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(C->dev,
                                                                       "vkWaitForPresentKHR");
+    if (C->display_timing)
+        s_get_cycle = (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(C->dev,
+                                                       "vkGetRefreshCycleDurationGOOGLE");
     {
         int can_wait = C->present_wait && s_wait_present;
 #if defined(_WIN32) && defined(VK_KHR_present_wait2)
@@ -2280,20 +2431,7 @@ static const char *const s_pp_name[PP_COUNT] = { "fxaa", "cas", "smaa edges", "s
  * premultiplied over transparent black; its colour is decoded (gamma 2.2),
  * x the HUD's white in units of 10,000 nits, BT.709 to BT.2020, PQ, and
  * blended over the swapchain image by its alpha. */
-static const char s_post_pq[] =
-    "#version 450\n"
-    "layout(set = 0, binding = 0) uniform sampler2D tex0;\n"
-    "layout(push_constant) uniform PC { vec4 p; } pc;\n"
-    "layout(location = 0) in vec2 vUv;\n"
-    "layout(location = 0) out vec4 outColor;\n"
-    "void main() {\n"
-    "    vec4 s = texelFetch(tex0, ivec2(gl_FragCoord.xy), 0);\n"
-    "    if (s.a <= 0.0) discard;\n"
-    "    vec3 l = pow(clamp(s.rgb / s.a, 0.0, 1.0), vec3(2.2));\n"
-    "    l = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956) * (l * pc.p.x);\n"
-    "    vec3 m = pow(clamp(l, 0.0, 1.0), vec3(0.1593017578125));\n"
-    "    outColor = vec4(pow((0.8359375 + 18.8515625 * m) / (1.0 + 18.6875 * m), vec3(78.84375)), s.a);\n"
-    "}\n";
+static const char s_post_pq[] = HDR_OVL_GLSL;     /* video/hdr_shaders.h (BO-244) */
 /* BO-110: the overlay's calibration patterns over an HDR10 frame, past the
  * overlay's white (nv2a_host_hdr_pattern): p.xy the centre in pixels; p.z
  * the disc's radius (kind 0) or -1 (kind 1: the left half one level, the
@@ -3047,6 +3185,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     int hdr;
     VkImage dimg;            /* where the frame is scaled to: the swapchain image, or s_hcomp */
     int new_frame;           /* a new game frame, not a redraw (frame pacing) */
+    uint64_t t_call0;        /* the call's start, for the counters line */
     int fmt_odd;             /* the slot is not in the swapchain's format (an HDR switch) */
 
     if (!C || gpu_gone())
@@ -3058,15 +3197,9 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     if (xbox_OverlayOpen())
         new_frame = 0;           /* presents on every turn: not paced */
 #endif
-    if (s_keep_on > 0 && new_frame && s_sc
-            && __atomic_load_n(&s_keep_want, __ATOMIC_ACQUIRE) < 0) {
-        /* Smooth: two frames queued, so this one is not presented. */
-        s_keep_last_flip = flip;
-        s_keep_skips++;
-        keep_corrected("two frames queued, one present skipped", flip);
-        return 1;
-    }
-    SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+    /* No skip: a queue found too deep is left so (BO-210). */
+    t_call0 = mono_ns();
+    drawable_size(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
         return 0;
     {
@@ -3471,6 +3604,18 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         pthread_mutex_lock(&s_tm_mu);
         iv_add(&s_host_iv, t);
         pthread_mutex_unlock(&s_tm_mu);
+        /* A new flip is counted new with the overlay open too (new_frame
+         * is 0 then: not paced), so the counters line compares like with
+         * like. */
+        if (s_keep_repeat)
+            s_cnt_refill++;
+        else if (flip != s_cnt_last_flip) {
+            s_cnt_new++;
+            s_cnt_last_flip = flip;
+        } else
+            s_cnt_redraw++;
+        if (t - t_call0 > s_cnt_present_max_ns)
+            s_cnt_present_max_ns = t - t_call0;
         if (xbox_LatOn() && !s_keep_repeat)
             xbox_LatRow('P', flip, 0, NULL);
         if (!s_waiter_run)       /* else the waiter, at the display time */

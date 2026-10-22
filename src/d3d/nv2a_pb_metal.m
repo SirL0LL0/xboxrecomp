@@ -88,7 +88,16 @@
 #include "nv2a_texscale.h"
 #include "nv2a_texmip.h"
 #include "kernel_pause.h"
+#include "kernel_pacing.h"
+#include "nv2a_texup.h"
+#import "nv2a_texup_metal.h"
+#include "recomp_exe_dir.h"
+#include <pthread.h>
+#include <stdatomic.h>
 static void scale_prepare_loaded(void);
+static void texup_time_cmd(id<MTLCommandBuffer> c);   /* BO-245 */
+void xbox_FrametimeGpu(double gpu_ms, double tu_ms, double tu_pred);   /* kernel.h */
+int  xbox_FrametimeOn(void);
 static int ui_scale_log(void);
 #include "nv2a_pcache.h"
 #include "latency_trace.h"
@@ -548,6 +557,7 @@ static void flush(int wait)
         }
         return;
     }
+    texup_time_cmd(s_cmd);   /* BO-245: the frame's GPU time (texture upscale, frame-time log) */
     [s_cmd commit];
     [s_last_cmd release];
     s_last_cmd = [s_cmd retain];
@@ -815,6 +825,9 @@ static int init(void)
                 wb_always() ? "every flip" : "on demand");
     }
     s_failed = 0;
+    /* BO-245: graphics.texture_upscale on Apple silicon (its results are
+     * shared-storage textures the CPU reads back for the disk cache). */
+    nv2a_texup_set_supported(s_unified);
     /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
      * are prepared while the title is held (scale_prepare_loaded). */
     xbox_HostPauseIdleFn(scale_prepare_loaded);
@@ -1800,6 +1813,14 @@ typedef struct {
     uint8_t        solo;          /* BO-203: nv2a_texrep_hdr_stage0_only of its bytes */
     uint32_t       pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t       skey;          /* nv2a_texscale_key of the texels uploaded */
+    /* graphics.texture_upscale (BO-245): the step it is at (TU_*), its slot
+     * + 1, the levels its texture has above the title's (0: the title's),
+     * to go back to the title's (the memory cap), the setting generation it
+     * was looked at with, the flip and hash it was first seen with, and its
+     * upscaled texture's bytes. */
+    uint8_t        tu, tu_slot, tu_add, tu_demote;
+    uint32_t       tgen, tu_flip;
+    uint64_t       tu_hash, tu_bytes;
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
@@ -2135,6 +2156,684 @@ static int ui_scale_log(void)
     return on;
 }
 
+/* ---- graphics.texture_upscale (BO-245, nv2a_texup.h) -----------------------
+ *
+ * A texture a 3D draw binds that stays the same for two flips gets a slot:
+ * the disk cache is asked first (a worker thread reads the file); a file's
+ * texels are uploaded into a new texture under a byte budget a flip, the
+ * title's levels blitted below them on the GPU. On a miss the entry waits
+ * for the one compute job: at each flip, after the frame's commit, the
+ * governor (nv2a_texup_gov) says how many GPU milliseconds of chunks may
+ * follow it, and they go in a command buffer of their own. When a slot's
+ * buffer has completed, the entry's next bind swaps the texture: a pointer
+ * change, the old texture released (draws encoded with it retain it). The
+ * finished compute result is read back on Metal's completion thread and
+ * saved to the disk cache.
+ *
+ * Off: texup_bind returns at once for every entry that was never upscaled,
+ * nothing is hashed, queued or timed; the upload path is unchanged. */
+
+enum { TU_NONE, TU_SEEN, TU_DISK, TU_WAIT, TU_BUSY, TU_UP, TU_NO };
+#define TU_SLOTS 8
+typedef struct {
+    int            used;
+    TexEntry      *e;              /* NULL: the entry went (evicted, changed) */
+    struct nv2a_texup_key k;
+    unsigned       scale;
+    TumJob        *job;            /* compute */
+    id<MTLTexture> tex;            /* from the disk */
+    uint32_t      *px;             /* the file's texels, waiting for the byte budget */
+    size_t         bytes;
+    int            in_cb;          /* its work is in a committed buffer */
+    atomic_int     done;           /* that buffer completed */
+    atomic_int     refused;        /* the result check turned its result down */
+    uint64_t       done_flip;
+    uint64_t       start_flip;     /* taken */
+} TuSlot;
+static TuSlot   s_tu[TU_SLOTS];
+static int      s_tu_job = -1;     /* the slot whose job is being computed */
+static int      s_tu_fifo[TEX_CACHE];
+static unsigned s_tu_fh, s_tu_fn;
+static struct nv2a_texup_gov s_gov;
+static id<MTLCommandBuffer> s_tu_cb;    /* this flip's compute chunks */
+static id<MTLCommandBuffer> s_tu_bcb;   /* this flip's disk results' level blits */
+static double   s_tu_cb_pred;
+static int      s_tu_cb_samples[TU_SLOTS], s_tu_cb_ns;   /* the counter-sample pairs timing this flip's chunks */
+static unsigned s_tu_sample_next;
+static int      s_tu_cb_slot[TU_SLOTS], s_tu_cb_n;
+static int      s_tu_cb_last[TU_SLOTS], s_tu_cb_nlast;   /* the slots whose job's last chunk is in s_tu_cb */
+static int      s_tu_cb_algo;      /* the algorithm of its first chunk (the governor's factor) */
+static size_t   s_tu_bytes_left = 32u << 20;
+static unsigned s_tu_3d;           /* this frame's 3D draws (texup on) */
+static int      s_tu_draw_3d;      /* the draw being recorded binds for the 3D world */
+static int      s_bind_tu;         /* levels the texture tex_bind returned has above the title's */
+static int      s_tu_inited, s_tu_timing;
+static uint64_t s_tu_resident;
+static _Atomic uint64_t s_gpu_ns[8];   /* the frames' GPU time, by flip & 7 */
+static _Atomic uint64_t s_tu_meas_ns, s_tu_meas_n;
+static pthread_mutex_t  s_tu_mx = PTHREAD_MUTEX_INITIALIZER;
+static double   s_tu_fb_pred[16], s_tu_fb_meas[16];
+static int      s_tu_fb_algo[16], s_tu_fb_n;
+static double   s_tu_last_pred;        /* predicted ms encoded at the last flip */
+
+static int tu_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_TEXUP_LOG) != NULL;
+    return on;
+}
+
+static unsigned tu_add_of(unsigned scale)
+{
+    return scale == 4 ? 2u : scale == 2 ? 1u : 0u;
+}
+
+static uint64_t tu_tex_bytes(uint32_t w, uint32_t h, uint32_t levels)
+{
+    return (uint64_t)nv2a_tex_texels(w, h, levels) * 4u;
+}
+
+static void texup_init_once(void);
+
+/* Called at every texture bind while the setting is on, so only the flag
+ * is read here. The work in texup_init_once (getenv, recomp_exe_dir, the
+ * path buffers) used to run before that test at every bind; on Windows
+ * ucrt's getenv takes a lock and walks the environment, which cost about
+ * 2-3 ms a frame on the render thread (BO-273). */
+static void texup_init(void)
+{
+    if (!s_tu_inited)
+        texup_init_once();
+}
+
+/* Once, when the setting is first on: the shader files (compiled on a
+ * thread of their own), the disk cache's directory. */
+static void texup_init_once(void)
+{
+    char sh[1024], dir[900], sub[1000], ver[64] = "";
+    const char *cand[5];
+    char c0[1024] = "", c1[1024] = "", c2[1024] = "";
+    const char *home = getenv("HOME");
+    const char *exe = recomp_exe_dir();
+    FILE *f;
+    s_tu_inited = 1;
+    nv2a_texup_gov_init(&s_gov);
+    if (home)
+        snprintf(c0, sizeof c0, "%s/Library/Application Support/%s/shaders/upscale", home,
+                 nv2a_pcache_app());
+    @autoreleasepool {
+        NSString *res = [[NSBundle mainBundle] resourcePath];
+        if (res)
+            snprintf(c1, sizeof c1, "%s/shaders/upscale", [res UTF8String]);
+    }
+    if (exe && *exe)
+        snprintf(c2, sizeof c2, "%s/shaders/upscale", exe);
+    cand[0] = c0; cand[1] = c1; cand[2] = c2; cand[3] = NULL;
+    if (!nv2a_texup_shader_dir(cand, sh, sizeof sh)) {
+        fprintf(stderr, "[TEXUP] no shader files found: texture upscale stays off\n");
+        return;
+    }
+    snprintf(sub, sizeof sub, "%s/VERSION", sh);
+    if ((f = fopen(sub, "rb")) != NULL) {
+        if (!fgets(ver, sizeof ver, f))
+            ver[0] = 0;
+        fclose(f);
+    }
+    nv2a_texup_set_shaders(sh, strtoull(ver, NULL, 16));
+    tum_load_async(s_dev, sh, recomp_env(RENV_TEXUP_FP32) != NULL);
+    if (nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/texup", dir);
+        nv2a_texup_store_dir(sub);
+    }
+}
+
+static void tu_slot_free(int i)
+{
+    TuSlot *s = &s_tu[i];
+    if (s->e && s->e->tu_slot == i + 1)
+        s->e->tu_slot = 0;
+    tum_job_free(s->job);
+    [s->tex release];
+    free(s->px);
+    if (s_tu_job == i)
+        s_tu_job = -1;
+    memset(s, 0, sizeof *s);
+}
+
+static TuSlot *tu_slot_of(const TexEntry *e)
+{
+    return e->tu_slot ? &s_tu[e->tu_slot - 1] : NULL;
+}
+
+/* The entry's content went, or the entry: whatever was being made for it
+ * lands nowhere (a computed result is still saved). */
+static void tu_detach(TexEntry *e, int dynamic)
+{
+    TuSlot *s = tu_slot_of(e);
+    if (s) {
+        s->e = NULL;
+        e->tu_slot = 0;
+    }
+    if (e->tu_add) {
+        s_tu_resident -= e->tu_bytes;
+        nv2a_texup_stats_rw()->upscaled--;
+    }
+    e->tu = (uint8_t)(dynamic ? TU_NO : TU_NONE);
+    e->tu_add = 0;
+    e->tu_demote = 0;
+    e->tu_bytes = 0;
+}
+
+static void tu_fifo_push(TexEntry *e)
+{
+    if (s_tu_fn < TEX_CACHE) {
+        s_tu_fifo[(s_tu_fh + s_tu_fn) % TEX_CACHE] = (int)(e - s_tc);
+        s_tu_fn++;
+    }
+    nv2a_texup_stats_rw()->queued = s_tu_fn;
+}
+
+/* Room for bytes more under the cap: the least recently bound upscaled
+ * textures go back to the title's at their next bind. 0: no room. */
+static int tu_room(uint64_t bytes, const TexEntry *keep)
+{
+    uint64_t cap = nv2a_texup_cap_bytes();
+    while (s_tu_resident + bytes > cap) {
+        TexEntry *lru = NULL;
+        int i;
+        for (i = 0; i < TEX_CACHE; i++) {
+            TexEntry *c = &s_tc[i];
+            if (c->live && c->tu_add && !c->tu_demote && c != keep
+                    && (!lru || c->used < lru->used))
+                lru = c;
+        }
+        if (!lru)
+            return 0;
+        lru->tu_demote = 1;
+        s_tu_resident -= lru->tu_bytes;
+        lru->tu_bytes = 0;
+        nv2a_texup_stats_rw()->demoted++;
+    }
+    return 1;
+}
+
+static void tu_swap(TexEntry *e, TuSlot *s, id<MTLTexture> nt)
+{
+    uint64_t bytes = tu_tex_bytes(e->width * s->scale, e->height * s->scale,
+                                  e->levels + tu_add_of(s->scale));
+    struct nv2a_texup_stats *st = nv2a_texup_stats_rw();
+    if (!nt || !tu_room(bytes, e)) {
+        st->dropped++;
+        e->tu = TU_NO;
+        tu_slot_free((int)(s - s_tu));
+        return;
+    }
+    [nt retain];
+    [e->tex release];
+    e->tex = nt;
+    e->tu_add = (uint8_t)tu_add_of(s->scale);
+    e->tu_bytes = bytes;
+    e->tu = TU_UP;
+    s_tu_resident += bytes;
+    st->resident_bytes = s_tu_resident;
+    st->upscaled++;
+    st->swaps++;
+    if (tu_log())
+        fprintf(stderr, "[TEXUP] swap %016llx %ux%u x%u (%s), flip %llu\n",
+                (unsigned long long)e->hash, e->width, e->height, s->scale,
+                s->job ? "computed" : "from disk", (unsigned long long)s_presents);
+    tu_slot_free((int)(s - s_tu));
+}
+
+static void tu_cb_ensure(void)
+{
+    if (!s_tu_cb)
+        s_tu_cb = [[s_queue commandBuffer] retain];
+}
+
+static void tu_bcb_ensure(void)
+{
+    if (!s_tu_bcb)
+        s_tu_bcb = [[s_queue commandBuffer] retain];
+}
+
+static void tu_step(TexEntry *e, TuSlot *s);
+
+/* At a bind of entry e (texture up to date): the entry's steps. */
+static void texup_bind(TexEntry *e, const Stage *t, const uint8_t *mem)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    uint32_t gen = nv2a_texup_generation();
+    int algo = nv2a_texup_algo();
+    TuSlot *s;
+
+    if (e->tgen != gen) {
+        tu_detach(e, 0);
+        e->tgen = gen;
+    }
+    if (!algo)
+        return;
+    texup_init();
+    if (tum_state() != 1)
+        return;
+    switch (e->tu) {
+    case TU_NONE: {
+        struct nv2a_texup_tex q;
+        int why;
+        memset(&q, 0, sizeof q);
+        q.size_from_format = nv2a_tex_size_from_format(t->color);
+        q.sign = e->sign != 0;
+        q.cube = t->cube;
+        q.replaced = e->rep != 0 || e->up_scale || e->scale;
+        q.w = t->width;
+        q.h = t->height;
+        q.levels = t->levels;
+        q.draw_3d = s_tu_draw_3d;
+        q.ever_2d = e->ui;
+        why = nv2a_texup_rule(&q);
+        if (why == NV2A_TEXUP_OK) {
+            e->tu = TU_SEEN;
+            e->tu_flip = g->flips;
+            e->tu_hash = e->hash;
+            if (tu_log())    /* first sight: with the swap line, the wait for it */
+                fprintf(stderr, "[TEXUP] seen %016llx %ux%u, flip %llu\n",
+                        (unsigned long long)e->hash, t->width, t->height,
+                        (unsigned long long)s_presents);
+        } else if (why != NV2A_TEXUP_2D || e->ui) {
+            e->tu = TU_NO;
+        }
+        break;
+    }
+    case TU_SEEN: {
+        int i, r;
+        uint32_t *px = NULL;
+        size_t bytes = 0;
+        if (e->hash != e->tu_hash || e->ui) {
+            e->tu = TU_NO;           /* its bytes move: a dynamic texture */
+            break;
+        }
+        if (g->flips < e->tu_flip + 2)
+            break;
+        if (nv2a_texup_skip(nv2a_texrep_hash(mem + t->offset, t->color, t->width, t->height,
+                                             t->pitch))) {
+            e->tu = TU_NO;           /* a road surface, graphics.texup_roads off */
+            break;
+        }
+        for (i = 0; i < (int)nv2a_texup_slots() && s_tu[i].used; i++)
+            ;
+        if (i == (int)nv2a_texup_slots())
+            break;                   /* every slot busy: next bind */
+        s = &s_tu[i];
+        memset(s, 0, sizeof *s);
+        s->used = 1;
+        s->e = e;
+        s->start_flip = s_presents;
+        s->scale = nv2a_texup_factor_for(t->width, t->height);
+        s->k.hash = e->hash;
+        s->k.w = t->width;
+        s->k.h = t->height;
+        s->k.format = t->color;
+        s->k.algo = (uint32_t)algo;
+        s->k.scale = s->scale;
+        s->k.wrap = ((t->addr_u & 0xF) == 1 ? 1u : 0u) | ((t->addr_v & 0xF) == 1 ? 2u : 0u);
+        s->k.shaders = nv2a_texup_shader_version();
+        e->tu_slot = (uint8_t)(i + 1);
+        e->tu = TU_DISK;
+        nv2a_texup_stats_rw()->jobs++;
+        r = nv2a_texup_load(&s->k, &px, &bytes);
+        if (r == NV2A_TEXUP_ABSENT) {
+            e->tu = TU_WAIT;
+            tu_fifo_push(e);
+        }
+        break;
+    }
+    case TU_DISK:
+    case TU_BUSY:
+        s = tu_slot_of(e);
+        if (!s) {
+            e->tu = TU_NONE;
+            break;
+        }
+        tu_step(e, s);
+        break;
+    default:
+        break;
+    }
+}
+
+/* A slot's next step, at a bind of its entry or at the flip (BO-272: a
+ * result whose texture is not drawn again would otherwise hold its slot
+ * until it is given back, 600 flips later, and the countdown's textures
+ * waited behind the garage's). TU_DISK: the file's read, its upload under
+ * the flip's byte slice, the swap once that buffer completed; TU_BUSY: the
+ * swap (or the refusal) once the job's last buffer completed. */
+static void tu_step(TexEntry *e, TuSlot *s)
+{
+    if (e->tu == TU_DISK) {
+        if (!s->px && !s->tex) {
+            int r = nv2a_texup_load(&s->k, &s->px, &s->bytes);
+            size_t want = (size_t)e->width * s->scale * e->height * s->scale * 4u
+                        + (s->scale == 4 ? (size_t)e->width * 2 * e->height * 2 * 4u : 0);
+            if (r == NV2A_TEXUP_ABSENT) {
+                nv2a_texup_stats_rw()->absent++;
+                e->tu = TU_WAIT;
+                tu_fifo_push(e);
+                return;
+            }
+            if (r == NV2A_TEXUP_READY && s->bytes != want) {
+                free(s->px);
+                s->px = NULL;
+                e->tu = TU_WAIT;
+                tu_fifo_push(e);
+                return;
+            }
+        }
+        if (s->px && !s->tex
+                && nv2a_texup_swap_fits(s->bytes, s_tu_bytes_left,
+                                        nv2a_texup_gov_swap_bytes(&s_gov))) {
+            tu_bcb_ensure();
+            s->tex = tum_from_file(s_dev, s_tu_bcb, e->tex, e->width, e->height, e->levels,
+                                   s->scale, s->px);
+            s_tu_bytes_left -= s->bytes < s_tu_bytes_left ? s->bytes : s_tu_bytes_left;
+            free(s->px);
+            s->px = NULL;
+            if (!s->tex) {
+                e->tu = TU_NO;
+                tu_slot_free((int)(s - s_tu));
+                return;
+            }
+            s_tu_cb_slot[s_tu_cb_n++] = (int)(s - s_tu);
+            s->in_cb = 1;            /* done when this flip's buffer completes */
+            nv2a_texup_stats_rw()->from_disk++;
+        }
+        if (s->tex && atomic_load(&s->done))
+            tu_swap(e, s, s->tex);
+    } else if (e->tu == TU_BUSY) {
+        if (s->job && atomic_load(&s->done) && atomic_load(&s->refused)) {
+            e->tu = TU_NO;           /* the title's texture stays */
+            tu_slot_free((int)(s - s_tu));
+        } else if (s->job && atomic_load(&s->done)) {
+            tu_swap(e, s, tum_job_texture(s->job));
+        }
+    }
+}
+
+/* A frame's command buffer, before its commit: its GPU time to the ring. */
+static void texup_time_cmd(id<MTLCommandBuffer> c)
+{
+    uint64_t f;
+    if (!s_tu_timing)
+        return;
+    f = s_presents;
+    [c addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        double d = [cb GPUEndTime] - [cb GPUStartTime];
+        if (d > 0 && d < 1.0)
+            atomic_fetch_add(&s_gpu_ns[f & 7], (uint64_t)(d * 1e9));
+    }];
+}
+
+/* At every flip, after the frame's commit. */
+static void texup_flip(void)
+{
+    static uint64_t last_ns, last_uploads;
+    uint64_t now = xbox_HostNowNs(), gpu_ns = 0;
+    double frame_ms = last_ns ? (double)(now - last_ns) / 1e6 : 16.7, budget, gpu_ms = -1;
+    int algo = nv2a_texup_algo(), computed = s_tu_last_pred > 0, i;
+    struct nv2a_texup_stats *st = nv2a_texup_stats_rw();
+
+    nv2a_texup_ctl(s_presents);
+    s_tu_timing = algo != 0 || xbox_FrametimeOn();
+    last_ns = now;
+    if (s_presents >= 3) {
+        gpu_ns = atomic_exchange(&s_gpu_ns[(s_presents - 3) & 7], 0);
+        if (gpu_ns)
+            gpu_ms = (double)gpu_ns / 1e6;
+    }
+    {
+        uint64_t mn = atomic_exchange(&s_tu_meas_ns, 0);
+        atomic_exchange(&s_tu_meas_n, 0);
+        xbox_FrametimeGpu(gpu_ms, (double)mn / 1e6, s_tu_last_pred);
+    }
+    if (!s_tu_inited) {
+        last_uploads = s_tex_uploads;
+        s_tu_3d = 0;
+        if (s_presents % 300 == 0 && tu_log())
+            fprintf(stderr, "[TEXUP] flip %llu: off, device %.1f MB\n",
+                    (unsigned long long)s_presents,
+                    (double)[s_dev currentAllocatedSize] / 1048576.0);
+        return;
+    }
+    {
+        /* BO-272: where the title is (its loading screen, the countdown);
+         * graphics.texture_upscale_preload off: always play, as before. */
+        int ld = nv2a_texup_preload() ? nv2a_texup_loading() : NV2A_TEXUP_PLAY;
+        if (ld != s_gov.loading && tu_log())
+            fprintf(stderr, "[TEXUP] title: %s, flip %llu\n",
+                    ld == NV2A_TEXUP_LOADING ? "loading" : ld == NV2A_TEXUP_PRESTART ? "prestart"
+                                                                                  : "play",
+                    (unsigned long long)s_presents);
+        nv2a_texup_gov_loading(&s_gov, ld);
+    }
+    nv2a_texup_gov_frame(&s_gov, now, gpu_ms, frame_ms,
+                         nv2a_texup_preload()
+                             ? nv2a_texup_period_ms(xbox_FlipHostPeriodNs(),
+                                                    xbox_HostFlipIntervalAsked())
+                             : nv2a_texup_period_ms(0, xbox_HostFlipIntervalAsked()),
+                         s_tu_3d, (unsigned)(s_tex_uploads - last_uploads), computed);
+    last_uploads = s_tex_uploads;
+    s_tu_3d = 0;
+    s_tu_last_pred = 0;
+    pthread_mutex_lock(&s_tu_mx);
+    for (i = 0; i < s_tu_fb_n; i++)
+        nv2a_texup_gov_measured(&s_gov, s_tu_fb_algo[i], s_tu_fb_pred[i], s_tu_fb_meas[i]);
+    s_tu_fb_n = 0;
+    pthread_mutex_unlock(&s_tu_mx);
+    s_tu_bytes_left = nv2a_texup_gov_swap_bytes(&s_gov);
+    /* Slots done long ago whose texture was not bound again, or whose
+     * entry went: free (a computed result is on disk). A disk read whose
+     * texture was not bound again in 10 s gives its slot back too (it is
+     * read again at the next bind), so a few such cannot hold all eight. */
+    for (i = 0; i < TU_SLOTS; i++) {
+        TuSlot *s = &s_tu[i];
+        if (!s->used)
+            continue;
+        if (atomic_load(&s->done) && !s->done_flip)
+            s->done_flip = s_presents;
+        /* BO-272: the next step without waiting for a bind (preload off:
+         * at the bind only, as before). */
+        if (nv2a_texup_preload() && s->e && s->e->live && s->e->tu_slot == i + 1
+                && (s->e->tu == TU_DISK || s->e->tu == TU_BUSY)) {
+            tu_step(s->e, s);
+            if (!s->used)
+                continue;
+        }
+        if ((!s->e && (atomic_load(&s->done) || !s->in_cb) && i != s_tu_job)
+                || (s->done_flip && s_presents - s->done_flip > nv2a_texup_free_flips())
+                || (s->e && s->e->tu == TU_DISK && !s->tex && !s->in_cb
+                    && s_presents - s->start_flip > nv2a_texup_free_flips())) {
+            if (s->e)
+                s->e->tu = TU_NONE;
+            tu_slot_free(i);
+        }
+    }
+    if (s_tu_job >= 0 && atomic_load(&s_tu[s_tu_job].done))
+        s_tu_job = -1;
+    if (algo && tum_state() == 1) {
+        /* The jobs: in play one new job a flip and its chunks under the
+         * budget; before the GO and on the loading screen (BO-272) the
+         * budget is larger and, as long as it and the render-thread
+         * allowance last, a job encoded to its end is followed by the next
+         * in the same buffer. */
+        unsigned started = 0, maxj = nv2a_texup_gov_jobs(&s_gov);
+        double left, rt_ms = nv2a_texup_gov_rt_ms(&s_gov);
+        uint64_t rt0 = xbox_HostNowNs();
+        budget = nv2a_texup_gov_budget(&s_gov, now);
+        left = budget;
+        for (;;) {
+            TuSlot *s;
+            double pred;
+            int sample = -1;
+            /* The next job: the first waiting entry still waiting. */
+            while (s_tu_job < 0 && s_tu_fn && started < maxj
+                   && (!started || (double)(xbox_HostNowNs() - rt0) / 1e6 < rt_ms)) {
+                TexEntry *e = &s_tc[s_tu_fifo[s_tu_fh]];
+                s = tu_slot_of(e);
+                s_tu_fh = (s_tu_fh + 1) % TEX_CACHE;
+                s_tu_fn--;
+                if (!e->live || e->tu != TU_WAIT || !s || s->e != e)
+                    continue;
+                s->job = tum_job_new(s_dev, e->tex, e->width, e->height, e->levels,
+                                     (int)s->k.algo, s->scale, s->k.wrap);
+                if (!s->job) {
+                    e->tu = TU_NO;
+                    tu_slot_free((int)(s - s_tu));
+                    continue;
+                }
+                e->tu = TU_BUSY;
+                s_tu_job = (int)(s - s_tu);
+                st->computed++;
+                started++;
+                if (tu_log())
+                    fprintf(stderr, "[TEXUP] job %016llx %ux%u x%u %s: %.2f ms predicted%s\n",
+                            (unsigned long long)e->hash, e->width, e->height, s->scale,
+                            nv2a_texup_algo_name((int)s->k.algo), tum_job_cost(s->job),
+                            s_gov.loading ? " (before the race)" : "");
+            }
+            if (s_tu_job < 0 || left <= 0 || s_tu[s_tu_job].in_cb
+                    || s_tu_cb_nlast >= TU_SLOTS || s_tu_cb_ns >= TU_SLOTS)
+                break;
+            s = &s_tu[s_tu_job];
+            tu_cb_ensure();
+            if (tum_samples_ok())
+                sample = (int)(s_tu_sample_next++ % TUM_SAMPLES);
+            pred = tum_job_encode(s->job, s_tu_cb, left, s_gov.factor[s->k.algo], 0, sample);
+            /* An encode that dispatched nothing made no encoder: its pair
+             * holds an older buffer's times. */
+            if (sample >= 0 && pred > 0)
+                s_tu_cb_samples[s_tu_cb_ns++] = sample;
+            if (!s_tu_cb_algo)
+                s_tu_cb_algo = (int)s->k.algo;
+            left -= pred;
+            s_tu_cb_pred += pred;
+            s_tu_last_pred += pred;
+            if (!tum_job_encoded(s->job))
+                break;                   /* the budget ended inside it */
+            s->in_cb = 1;
+            s_tu_cb_last[s_tu_cb_nlast++] = s_tu_job;
+            /* Encoded to its end: the next job may follow in this buffer
+             * (the slot stays until the buffer completes). Preload off:
+             * the next job waits for this one's buffer, as before. */
+            if (!nv2a_texup_preload())
+                break;
+            s_tu_job = -1;
+        }
+    }
+    if (s_tu_bcb) {
+        /* The disk results' blits: done is all their slots want. */
+        unsigned mask = 0;
+        for (i = 0; i < s_tu_cb_n; i++)
+            mask |= 1u << s_tu_cb_slot[i];
+        [s_tu_bcb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            int k;
+            (void)c;
+            for (k = 0; k < TU_SLOTS; k++)
+                if (mask & (1u << k))
+                    atomic_store(&s_tu[k].done, 1);
+        }];
+        [s_tu_bcb commit];
+        [s_tu_bcb release];
+        s_tu_bcb = nil;
+        s_tu_cb_n = 0;
+    }
+    if (s_tu_cb) {
+        /* The chunks: their GPU time to the governor; the job's last one
+         * reads the result back for the disk cache and marks it done. */
+        struct { int lastv[TU_SLOTS], samples[TU_SLOTS]; } cap;   /* a block takes a struct by value */
+        int nlast = s_tu_cb_nlast, a = s_tu_cb_algo, ns = s_tu_cb_ns;
+        double pred = s_tu_cb_pred;
+        memcpy(cap.lastv, s_tu_cb_last, sizeof cap.lastv);
+        memcpy(cap.samples, s_tu_cb_samples, sizeof cap.samples);
+        [s_tu_cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            /* The chunks' own GPU time (stage-boundary samples, one an
+             * encoder); the buffer's span when the device has none. */
+            double ms = ns > 0 ? 0 : -1;
+            int q;
+            for (q = 0; q < ns; q++) {
+                double m = tum_sample_ms(cap.samples[q]);
+                if (m < 0) {
+                    ms = -1;
+                    break;
+                }
+                ms += m;
+            }
+            if (ms < 0)
+                ms = ([c GPUEndTime] - [c GPUStartTime]) * 1000.0;
+            if (ms > 0 && ms < 1000) {
+                atomic_fetch_add(&s_tu_meas_ns, (uint64_t)(ms * 1e6));
+                atomic_fetch_add(&s_tu_meas_n, 1);
+                pthread_mutex_lock(&s_tu_mx);
+                if (pred > 0 && s_tu_fb_n < 16) {
+                    s_tu_fb_algo[s_tu_fb_n] = a;
+                    s_tu_fb_pred[s_tu_fb_n] = pred;
+                    s_tu_fb_meas[s_tu_fb_n++] = ms;
+                }
+                nv2a_texup_stats_rw()->chunk_gpu_ms += ms;
+                nv2a_texup_stats_rw()->chunk_pred_ms += pred;
+                nv2a_texup_stats_rw()->chunk_buffers++;
+                pthread_mutex_unlock(&s_tu_mx);
+            }
+            for (q = 0; q < nlast; q++) {
+                int last = cap.lastv[q];
+                size_t bytes = 0;
+                uint32_t *px;
+                if (!s_tu[last].job)
+                    continue;
+                px = tum_job_readback(s_tu[last].job, &bytes);
+                if (px && tum_job_check(s_tu[last].job, px)) {
+                    nv2a_texup_save(&s_tu[last].k, px, bytes);
+                } else {
+                    atomic_store(&s_tu[last].refused, 1);
+                    pthread_mutex_lock(&s_tu_mx);
+                    nv2a_texup_stats_rw()->refused++;
+                    pthread_mutex_unlock(&s_tu_mx);
+                    fprintf(stderr, "[TEXUP] refused %016llx %ux%u: the result does not match the"
+                            " title's texture (alpha or brightness); the title's is kept, nothing"
+                            " saved\n", (unsigned long long)s_tu[last].k.hash, s_tu[last].k.w,
+                            s_tu[last].k.h);
+                }
+                free(px);
+                atomic_store(&s_tu[last].done, 1);
+            }
+        }];
+        [s_tu_cb commit];
+        [s_tu_cb release];
+        s_tu_cb = nil;
+        s_tu_cb_pred = 0;
+        s_tu_cb_nlast = 0;
+        s_tu_cb_ns = 0;
+        s_tu_cb_algo = 0;
+    }
+    st->resident_bytes = s_tu_resident;
+    if (s_presents % 300 == 0 && (algo || tu_log())) {
+        struct nv2a_texup_stats x;
+        nv2a_texup_stats(&x);
+        fprintf(stderr, "[TEXUP] flip %llu: %s, device %.1f MB, %u upscaled (%.1f MB), %u waiting;"
+                " jobs %llu, from disk %llu, computed %llu, saved %llu, dropped %llu, refused %llu,"
+                " demoted %llu;"
+                " chunks %.1f ms GPU (%.1f predicted) in %llu buffers; factor %.2f; pauses %llu\n",
+                (unsigned long long)s_presents, nv2a_texup_algo_name(algo),
+                (double)[s_dev currentAllocatedSize] / 1048576.0, x.upscaled,
+                (double)x.resident_bytes / 1048576.0, x.queued, (unsigned long long)x.jobs,
+                (unsigned long long)x.from_disk, (unsigned long long)x.computed,
+                (unsigned long long)x.saved, (unsigned long long)x.dropped,
+                (unsigned long long)x.refused,
+                (unsigned long long)x.demoted, x.chunk_gpu_ms, x.chunk_pred_ms,
+                (unsigned long long)x.chunk_buffers, algo ? s_gov.factor[algo] : 0.0,
+                (unsigned long long)s_gov.pauses);
+    }
+}
+
 static void ui_scale_use(TexEntry *e, const Stage *t, const uint8_t *mem)
 {
     uint8_t bit = s_draw_2d ? 1 : 2;
@@ -2148,16 +2847,39 @@ static void ui_scale_use(TexEntry *e, const Stage *t, const uint8_t *mem)
             (unsigned long long)s_presents);
 }
 
+/* The texture cache's lookup (tex_bind): what makes an entry the stage's,
+ * and a small table from a hash of that key to the entry last found. */
+static int tc_match(const TexEntry *c, const Stage *t)
+{
+    return c->live && c->offset == t->offset && c->color == t->color
+        && c->width == t->width && c->height == t->height
+        && c->pitch == t->pitch && c->palette == t->palette
+        && c->levels == t->levels && c->sign == stage_signed(t);
+}
+
+#define TC_HINT 1024
+static uint16_t s_tc_hint[TC_HINT];   /* entry + 1, 0: none */
+
+static unsigned tc_hint_key(const Stage *t)
+{
+    uint32_t h = t->offset * 0x9E3779B1u;
+    h ^= ((uint32_t)t->color << 24) ^ (t->width << 12) ^ t->height ^ (t->palette * 0x85EBCA6Bu);
+    h ^= h >> 15;
+    return h & (TC_HINT - 1);
+}
+
 static id<MTLTexture> tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
+    unsigned hk;
     unsigned want;
     uint32_t cut;
     int algo;
 
+    s_bind_tu = 0;
     s_bind_scale = 0;
     s_bind_zbias = 0.0f;
     s_bind_solo = 0;
@@ -2199,18 +2921,21 @@ static id<MTLTexture> tex_bind(const Stage *t)
         }
         return s_magenta;
     }
-    for (i = 0; i < TEX_CACHE; i++) {
+    /* BO-277: the entry this stage's key found last, checked, before the
+     * walk over all 256 (as Vulkan). A miss walks as before. */
+    hk = tc_hint_key(t);
+    if (s_tc_hint[hk] && tc_match(&s_tc[s_tc_hint[hk] - 1], t))
+        e = &s_tc[s_tc_hint[hk] - 1];
+    for (i = 0; !e && i < TEX_CACHE; i++) {
         TexEntry *c = &s_tc[i];
-        if (c->live && c->offset == t->offset && c->color == t->color
-                && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels && c->sign == stage_signed(t)) {
+        if (tc_match(c, t)) {
             e = c;
             break;
         }
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
+    s_tc_hint[hk] = (uint16_t)((e ? e : victim) - s_tc + 1);
     /* graphics.ui_scale: a texture a 2D draw binds is scaled, from then on
      * and for every draw (off: want is 0 and nothing here differs). */
     want = nv2a_texscale_factor();
@@ -2234,7 +2959,10 @@ static id<MTLTexture> tex_bind(const Stage *t)
         /* A replaced texture whose variant changed is uploaded again; so is
          * one whose scale is not the one wanted now. */
         int stale = (e->rep && e->rep != nv2a_texrep_generation())
-                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut;
+                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut
+                 /* BO-245: an upscaled texture goes back to the title's when
+                  * the setting changes or the memory cap asks for it. */
+                 || (e->tu_add && (e->tgen != nv2a_texup_generation() || e->tu_demote));
         if (s_draw_2d)
             e->ui = 1;
         if (e->gen != g->flips || stale) {
@@ -2246,6 +2974,8 @@ static id<MTLTexture> tex_bind(const Stage *t)
             e->gen = g->flips;
             if (h != e->hash || stale) {
                 id<MTLTexture> nt;
+                if (e->tu || e->tu_slot || e->tu_add)
+                    tu_detach(e, e->tu == TU_SEEN && h != e->hash);
                 tp = prof_t();
                 nt = tex_upload(t, want, algo, cut);
                 prof_add(&s_pa.texup, tp);
@@ -2279,6 +3009,9 @@ static id<MTLTexture> tex_bind(const Stage *t)
         [e->tex release];
         e->tex = nil;
         e->live = 0;
+        if (e->tu || e->tu_slot || e->tu_add)
+            tu_detach(e, 0);
+        e->tgen = nv2a_texup_generation();
         {
             uint64_t tp = prof_t();
             nt = tex_upload(t, want, algo, cut);
@@ -2315,6 +3048,11 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->tex = nt;
         e->live = 1;
     }
+    /* BO-245: graphics.texture_upscale's steps for this texture (Off: only
+     * an entry with a job still out). */
+    if (nv2a_texup_algo() || e->tu_slot)
+        texup_bind(e, t, mem);
+    s_bind_tu = e->tu_add;
     /* Its scaled picture was being made: asked for once a flip, swapped in
      * when it is there, one texture a flip. A new MTLTexture, so a draw encoded with the unscaled
      * one keeps it. */
@@ -2376,7 +3114,7 @@ static MTLSamplerAddressMode address_mode(uint32_t m)
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static id<MTLSamplerState> sampler(const Stage *t, unsigned scale)
+static id<MTLSamplerState> sampler(const Stage *t, unsigned scale, int add)
 {
     static int point = -1;
     MTLSamplerDescriptor *sd;
@@ -2395,6 +3133,10 @@ static id<MTLSamplerState> sampler(const Stage *t, unsigned scale)
      * size it is drawn at. */
     if (scale)
         mip = 2;
+    /* BO-245: an upscaled texture has `add` levels above the title's level
+     * 0; one the title gave one level is blended down to its own size. */
+    if (add && !mip)
+        mip = 2;
     /* Anisotropy only on a mipmapped sampler with a linear minification
      * filter, as asked (RECOMP_GFX_ANISO). */
     aniso = (mip && mn && !scale) ? nv2a_host_aniso() : 1;
@@ -2403,6 +3145,7 @@ static id<MTLSamplerState> sampler(const Stage *t, unsigned scale)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
     key |= (uint64_t)scale << 40;
+    key |= (uint64_t)add << 44;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
@@ -2417,6 +3160,12 @@ static id<MTLSamplerState> sampler(const Stage *t, unsigned scale)
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.lodMinClamp = scale ? 0.0f : mip ? (float)t->lod_min : 0.0f;
     sd.lodMaxClamp = scale ? (float)(scale_levels(scale) - 1u) : mip ? (float)t->lod_max : 0.0f;
+    if (add) {
+        /* The title's clamps move down by the levels added, except a
+         * minimum of 0, which keeps the new detail. */
+        sd.lodMinClamp = t->levels > 1 && t->lod_min ? (float)(t->lod_min + (uint32_t)add) : 0.0f;
+        sd.lodMaxClamp = t->levels > 1 ? (float)(t->lod_max + (uint32_t)add) : (float)add;
+    }
     st = [s_dev newSamplerStateWithDescriptor:sd];
     [sd release];
     if (!st)
@@ -2715,7 +3464,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     key[35] = modes;
     key[36] = signs;
     key[37] = v->shader_ctl & 0x00FF0000u;  /* stage 2 and 3 input stages */
-    key[38] = v->clip_plane_mode;
+    key[38] = v->clip_plane_mode | (nv2a_alpha_kill_mask(s_stage, nv2a_pb_gpu_state()->flips) << 16);
     ms = nv2a_memo_slot(key, 39, FS_MEMOS - 1);
     if (s_fs_memo[ms].valid && !memcmp(s_fs_memo[ms].r, key, sizeof key)) {
         if (!s_fs_memo[ms].e)
@@ -2733,6 +3482,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
         st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
         st.clip_mode[n] = (uint8_t)((v->clip_plane_mode >> (4 * n)) & 0xFu);
     }
+    st.alpha_kill = (uint8_t)nv2a_alpha_kill_mask(s_stage, nv2a_pb_gpu_state()->flips);
     st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
     st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
@@ -3647,14 +4397,15 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int slot[NV2A_VS_MAX_INPUTS];
     float *vf;
     void *ip;
-    int cull = 0, cull_all = 0;
-    float zbias = 0.0f;
+    int cull = 0, cull_all = 0, zb_split = 0;
+    float zbias = 0.0f, zb_applied = 0.0f;
     int solo = 0;                 /* BO-203: stage 0 is a stage0_only HDR picture */
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     id<MTLTexture> stex[4];
     unsigned sscale[4] = { 0, 0, 0, 0 };
+    int stu[4] = { 0, 0, 0, 0 };   /* BO-245: levels added by graphics.texture_upscale */
 
     if (!init())
         return;
@@ -3804,7 +4555,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         {
             int textured = 0;
             s_draw_2d = 0;
-            if (nv2a_texscale_factor() || ui_scale_log()) {
+            s_tu_draw_3d = 0;
+            if (nv2a_texup_algo()) {
+                /* BO-245: the world's draws (a vertex program, the depth test). */
+                s_tu_draw_3d = d->program && v->depth_enable;
+                s_tu_3d += (unsigned)s_tu_draw_3d;
+            }
+            if (nv2a_texscale_factor() || ui_scale_log() || nv2a_texup_algo()) {
                 const struct nv2a_pb_present *pr = nv2a_pb_present_state();
                 struct nv2a_texscale_draw td2 = { d->program, v->depth_enable,
                                                   v->depth_enable && v->depth_mask,
@@ -3832,6 +4589,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 } else {
                     stex[k] = tex_bind(t);
                     sscale[k] = s_bind_scale;
+                    stu[k] = s_bind_tu;
                     if (zbias == 0.0f)
                         zbias = s_bind_zbias;
                     if (k == 0)
@@ -3851,8 +4609,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* BO-176: a registered decal's depth offset, added to the constant
          * part of the title's own polygon offset (vp_scale.w). */
-        if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips))
-            vc.c[3] += zbias / nv2a_zmax(g->format);
+        if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips)) {
+            zb_applied = zbias / nv2a_zmax(g->format);
+            vc.c[3] += zb_applied;
+        }
 
         if (s_hdr)
             hdr_texlog(g);
@@ -3894,7 +4654,14 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         [s_enc setFrontFacingWinding:v->front_face != 0x900
                                      ? MTLWindingCounterClockwise : MTLWindingClockwise];
-        [s_enc setCullMode:cull == 1 ? MTLCullModeBack
+        /* BO-253: a decal drawn with culling off takes its offset only on
+         * the face the title treats as front (one draw with the back faces
+         * culled, offset; one with the front faces culled, none). Seen from
+         * behind, the LED words of a sign would otherwise come through the
+         * board by the lead the offset gives them. */
+        zb_split = zb_applied != 0.0f && cull == 0 && nv2a_texrep_zbias_facing(g->flips);
+        [s_enc setCullMode:zb_split ? MTLCullModeBack
+                         : cull == 1 ? MTLCullModeBack
                          : cull == 2 ? MTLCullModeFront : MTLCullModeNone];
         {
             float bf[4];
@@ -3913,10 +4680,20 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
-            [s_enc setFragmentSamplerState:sampler(&s_stage[k], sscale[k]) atIndex:k];
+            [s_enc setFragmentSamplerState:sampler(&s_stage[k], sscale[k], stu[k]) atIndex:k];
         }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
+        if (zb_split) {
+            vc.c[3] -= zb_applied;
+            if (d->program)
+                [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
+            else
+                [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
+            [s_enc setCullMode:MTLCullModeFront];
+            [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
+                             indexBuffer:s_ib indexBufferOffset:ib_off];
+        }
         s_draws++;
         rt->gen = ++s_rt_seq;
         if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X') {
@@ -5160,6 +5937,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
             t = prof_t();
             frame_advance();
             prof_add(&s_pa.wait, t);
+            texup_flip();   /* BO-245: chunks after the frame, swaps budgeted */
         }
     }
     hdr_flip();

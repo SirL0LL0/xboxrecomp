@@ -175,7 +175,23 @@ static void log_library(const xst_library *lib, const char *music_dir)
 static volatile int s_stopped;          /* the last scan stopped at the budget */
 static volatile int s_unreadable;       /* the last folder asked for could not be read */
 
+/* One use_library at a time: the scan's thread and, for a folder held back,
+ * the title's (xbox_SoundtrackApplyPending) both write the database. */
+static volatile LONG s_use_lock;
+
+static int use_library_locked(xst_library *lib, const char *music_dir);
+
 static int use_library(xst_library *lib, const char *music_dir)
+{
+    int r;
+    while (InterlockedExchange(&s_use_lock, 1))
+        ;
+    r = use_library_locked(lib, music_dir);
+    InterlockedExchange(&s_use_lock, 0);
+    return r;
+}
+
+static int use_library_locked(xst_library *lib, const char *music_dir)
 {
     xst_library *old;
     uint8_t *db = NULL;
@@ -255,6 +271,24 @@ void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs)
     open_unlock();
 }
 
+int xbox_SoundtrackNameOf(int i, char *out, size_t cap)
+{
+    int r;
+    open_lock();
+    r = xst_soundtrack_name(s_lib, i, out, cap);
+    open_unlock();
+    return r;
+}
+
+int xbox_SoundtrackIndexOfName(const char *utf8)
+{
+    int r;
+    open_lock();
+    r = xst_soundtrack_find(s_lib, utf8);
+    open_unlock();
+    return r;
+}
+
 int xbox_SoundtrackLeftOut(int *unreadable, int *songs_past_limit, int *folders_past_limit)
 {
     int a = 0, b = 0, c = 0;
@@ -310,6 +344,59 @@ static volatile LONG s_scanning;
 static xst_progress  s_progress;
 static void        (*s_done)(int soundtracks, int songs);
 static int         (*s_gate)(void);
+/* A folder read while the gate said no: put in place by
+ * xbox_SoundtrackApplyPending (NULL lib: the folder is off or unreadable). */
+static int          s_pend_set;
+static xst_library *s_pend_lib;
+static char         s_pend_dir[1024];
+static int          s_pend_unreadable;
+
+/* Drops a held-back folder; under open_lock. Returns it to be freed. */
+static xst_library *pend_take(void)
+{
+    xst_library *lib = s_pend_lib;
+    s_pend_lib = NULL;
+    s_pend_set = 0;
+    s_pend_dir[0] = 0;
+    return lib;
+}
+
+int xbox_SoundtrackPending(char *dir, size_t cap, int *soundtracks)
+{
+    int set;
+    open_lock();
+    set = s_pend_set;
+    if (dir && cap)
+        snprintf(dir, cap, "%s", set ? s_pend_dir : "");
+    if (soundtracks)
+        *soundtracks = set && s_pend_lib && s_pend_lib->n_songs ? s_pend_lib->n_st : 0;
+    open_unlock();
+    return set;
+}
+
+int xbox_SoundtrackApplyPending(int *soundtracks, int *songs)
+{
+    xst_library *lib;
+    char dir[1024];
+    int set, unreadable;
+
+    open_lock();
+    set = s_pend_set;
+    unreadable = s_pend_unreadable;
+    snprintf(dir, sizeof dir, "%s", s_pend_dir);
+    lib = s_pend_lib;
+    s_pend_lib = NULL;
+    s_pend_set = 0;
+    s_pend_dir[0] = 0;
+    open_unlock();
+    if (!set)
+        return 0;
+    s_unreadable = unreadable;
+    use_library(lib, dir);
+    fprintf(stderr, LOGP "%s: the folder held back is in use now\n", dir[0] ? dir : "(none)");
+    xbox_SoundtrackInfo(NULL, 0, soundtracks, songs);
+    return 1;
+}
 
 void xbox_SoundtrackSetSwapGate(int (*may_swap)(void))
 {
@@ -354,10 +441,23 @@ static DWORD WINAPI scan_thread(LPVOID arg)
         if (s_gate && !s_gate()) {
             /* The title holds an index into the library in use: not
              * swapped under it (the port's check, now, not when the folder
-             * was chosen: the title may have chosen a soundtrack since). */
+             * was chosen: the title may have chosen a soundtrack since).
+             * Held back, read, for xbox_SoundtrackApplyPending. */
+            xst_library *drop;
+            open_lock();
+            drop = pend_take();
+            if (gen == s_want_gen) {
+                s_pend_set = 1;
+                s_pend_lib = lib;
+                s_pend_unreadable = !lib && dir[0];
+                snprintf(s_pend_dir, sizeof s_pend_dir, "%s", dir);
+                lib = NULL;
+            }
+            open_unlock();
+            xst_free(drop);
             xst_free(lib);
-            fprintf(stderr, LOGP "%s: read; the library in use stays (a soundtrack of it is chosen), "
-                    "the folder is used from the next start\n", dir[0] ? dir : "(none)");
+            fprintf(stderr, LOGP "%s: read; held back while a soundtrack of the library in use is "
+                    "the title's music\n", dir[0] ? dir : "(none)");
             if (done)
                 done(-1, 0);
         } else {
@@ -380,7 +480,10 @@ int xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtracks
 {
     int start;
 
+    xst_library *drop;
+
     open_lock();
+    drop = pend_take();                   /* a folder held back is replaced by this one */
     snprintf(s_want, sizeof s_want, "%s", music_dir ? music_dir : "");
     s_done = done;
     s_want_gen++;
@@ -389,6 +492,7 @@ int xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtracks
     if (start)
         s_scanning = 1;
     open_unlock();
+    xst_free(drop);
     if (start) {
         HANDLE t = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL);
         if (!t) {

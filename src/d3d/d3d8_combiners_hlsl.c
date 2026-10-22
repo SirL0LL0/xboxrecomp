@@ -148,6 +148,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  8 + i, i, i, i);
             EMIT("    }\n");
         }
+        if (state->alpha_kill & (1u << i))
+            EMIT("    if (x%d.a == 0.0) discard;\n", 8 + i);
         EMIT("    if (alpha_only[%d] != 0u) x%d.rgb = 1.0;\n", i, 8 + i);
     }
     EMIT("    x12.a = x8.a;\n");

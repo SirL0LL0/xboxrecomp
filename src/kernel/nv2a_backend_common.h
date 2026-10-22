@@ -490,7 +490,13 @@ struct nv2a_stage {
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
     int      raw_mode;  /* the shader program's mode before the gating */
+    int      alpha_kill; /* CONTROL0 bit 2 ALPHA_KILL_ENABLE: a texel of alpha 0 kills the pixel (BO-226) */
 };
+
+/* The stages whose ALPHA_KILL_ENABLE applies (a sampled texture: not NONE,
+ * PASSTHRU or CLIPPLANE), bit n for stage n; RECOMP_DEBUG=alpha_kill=0 none
+ * (BO-226). */
+uint32_t nv2a_alpha_kill_mask(const struct nv2a_stage *s, uint32_t flips);
 
 #define NV2A_STAGE_MIPS        1u   /* count mip levels as xemu does */
 #define NV2A_STAGE_P8_PALETTE  2u   /* P8 is valid only with a palette */
@@ -1063,20 +1069,23 @@ void  nv2a_host_set_lod_bias(int mode, float value);
  * active only where the window's display can show more than its SDR white
  * (nv2a_host_hdr_display, set by the presenter) or RECOMP_DEBUG=hdr forces
  * it (headless tests). Levels in nits: peak (0: the display's), the scene's
- * paper white, the HUD's white (0: the paper white). On macOS 100 nits is
- * the system's SDR white (EDR 1.0). nv2a_host_hdr_set_headroom: what the
- * display shows now, in SDR whites (macOS changes it with the brightness). */
-#if defined(__APPLE__)
-#define NV2A_HDR_PAPER_DEFAULT 100.0
-#else
+ * paper white, the HUD's white (0: the paper white), the same defaults on
+ * every platform (BO-244). On macOS the output is HDR10 too; its metadata
+ * tells macOS the SDR white's nits so a code of N nits is N nits on the
+ * panel (fb_present_metal.m hdr_meta). nv2a_host_hdr_display: what the
+ * display shows at most and now, in SDR whites (macOS changes the latter
+ * with the brightness slider: granted = the panel's peak / the SDR white,
+ * potential = the panel's peak / 100); nv2a_host_hdr_display_peak: its
+ * EDID's peak in nits (0: none). The default peak on macOS: potential x
+ * 100 = the panel's peak, the EDID's only while no headroom is known. */
 #define NV2A_HDR_PAPER_DEFAULT 200.0
-#endif
 int   nv2a_host_hdr(void);                 /* asked for (setting or debug) */
 int   nv2a_host_hdr_active(void);          /* asked for and possible */
 void  nv2a_host_set_hdr(int on);
 void  nv2a_host_set_hdr_levels(int which, float peak, float paper, float hud);
 void  nv2a_host_hdr_levels(float *peak_nits, float *paper_nits, float *hud_nits);
 void  nv2a_host_hdr_display(float potential, float now);   /* presenter: headroom, x SDR white */
+void  nv2a_host_hdr_display_peak(float edid_nits);         /* presenter (macOS): 0 none */
 /* The tone controls (Vulkan): shadows, a power on luminance below 0.18
  * (1 = the art); highlights, a gain on light past paper white before the
  * roll-off (1 = as stacked); srgb, decode with the piecewise sRGB curve
@@ -1086,11 +1095,16 @@ void  nv2a_host_hdr_tone(float *shadows, float *highlights, int *srgb);
 /* BO-195: the roll-off's softer top (0 = off) and the black level in nits. */
 void  nv2a_host_hdr_shape(float *shoulder, float *black_nits);
 float nv2a_host_hdr_potential(void);       /* 0: unknown (no window) */
+float nv2a_host_hdr_granted(void);         /* BO-244: the headroom macOS grants (held), x SDR white */
 /* The provider of the peak calibration patch (overlay): a texture handle
  * with a symbol at `symbol_nits` on a background at the display's maximum,
  * or NULL. Set by a presenter that can make one. */
 void  nv2a_host_set_hdr_patch_fn(void *(*fn)(float symbol_nits));
 void *nv2a_host_hdr_patch(float symbol_nits);
+/* BO-227: the overlay notes where it drew the patch (window pixels); a
+ * probe asks (1 when drawn since the last ask). */
+void  nv2a_host_hdr_patch_at(float x0, float y0, float x1, float y1);
+int   nv2a_host_hdr_patch_where(float *x0, float *y0, float *x1, float *y1);
 /* For a presenter without a patch texture (Vulkan HDR10): the overlay asks
  * for a pattern in window pixels this frame; the presenter takes it after
  * drawing the overlay. kind 0: a disc at a nits on a background at b nits
@@ -1149,18 +1163,28 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
 struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);
-/* RECOMP_PRESENT_OVERSCAN=crop and RECOMP_PRESENT_FIT=fill16x10, changed
- * while running; any thread, taken at the next present. */
-void nv2a_present_set_overscan(int crop);
+/* RECOMP_PRESENT_OVERSCAN=crop|fill and RECOMP_PRESENT_FIT=fill16x10, changed
+ * while running; any thread, taken at the next present. The overscan mode:
+ * OFF the whole frame, CROP the 640x448 area a TV showed with the sides cut
+ * alike, FILL that area at the frame's full width stretched to the height the
+ * whole frame would have (about 7% taller, nothing cut at the sides). */
+enum { NV2A_OVERSCAN_OFF = 0, NV2A_OVERSCAN_CROP = 1, NV2A_OVERSCAN_FILL = 2 };
+void nv2a_present_set_overscan(int mode);
 void nv2a_present_set_fit(int fill);
 /* The part of an fw x fh frame a window shows and where it goes:
  * nv2a_present_rect, after RECOMP_PRESENT_OVERSCAN=crop (16 rows of 480 off
  * the top and bottom, as a TV's overscan hid them, and the same share of
- * the width, so the aspect holds) and with RECOMP_PRESENT_FIT=fill16x10 (the
+ * the width, so the aspect holds; =fill: those rows only, across the whole
+ * width, into the rectangle the whole frame gets, so visible_x is the full
+ * width) and with RECOMP_PRESENT_FIT=fill16x10 (the
  * window's full height, the frame's sides cropped where wider: the Deck's
  * 16:10 panel). src is in frame pixels; returns `whole` as nv2a_present_rect. */
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst);
+/* Non-zero when nv2a_present_layout shows less than the whole frame or
+ * stretches it (an overscan choice or the fit is on): a presenter that copies
+ * a frame whole in the stock case has to draw it through the layout then. */
+int nv2a_present_layout_cuts(void);
 /* A frame's own shape. A host whose title draws some frames for a wider
  * picture than the configured aspect (its 3D, but not its menus) gives a
  * function: the frame of that flip number is width:height `fn(flip)`, or 0

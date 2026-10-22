@@ -15,6 +15,9 @@ void  fbm_destroy(void);
 void  fbm_vblank_link(SDL_Window *win);
 /* 0 while the window is wholly covered or on another Space. */
 int   fbm_visible(SDL_Window *win);
+/* The main thread's share of the layer, each turn and before the first
+ * present (fb_present_metal.m). */
+void  fbm_main_tick(SDL_Window *win);
 void  fbm_get(void **device, void **queue);
 /* Slot k (0..2) at w x h: its id<MTLTexture>, or NULL. */
 void *fbm_slot(int k, uint32_t w, uint32_t h);

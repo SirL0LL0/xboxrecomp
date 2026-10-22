@@ -293,3 +293,16 @@ Reference material (no code taken)
 
 
 Contributors to xboxrecomp itself are credited in CONTRIBUTORS.md.
+
+
+LGPL-3.0-or-later — texture upscaler shaders (third_party/upscale_shaders)
+--------------------------------------------------------------------------
+
+  FSRCNNX_x2_8-0-4-1.glsl, (c) 2017-2021 igv
+  (https://github.com/igv/FSRCNN-TensorFlow, release 1.1), and
+  nnedi3-nns16-win8x4.hook from bjin's NNEDI3 prescalers
+  (https://github.com/bjin/mpv-prescalers, LGPL-3.0-or-later; NNEDI3 by
+  tritical), with the compute wrappers generated from them. Separate files loaded at runtime by graphics.texture_upscale; not
+  compiled into any binary. Provenance, hashes, changes and how to replace
+  them: third_party/upscale_shaders/NOTICE.md; licence texts:
+  third_party/upscale_shaders/COPYING.LESSER and COPYING.

@@ -92,6 +92,12 @@ void pc_pacer_init(pc_pacer *p, int strategy, const pc_display *d,
     p->lead0_ns = p->lead_ns;
     p->decay_frames = PC_DECAY_FRAMES;
     p->since_back = 1 << 30;
+    p->handover_ns = PC_HANDOVER_NS;
+}
+
+void pc_pacer_set_handover(pc_pacer *p, uint64_t handover_ns)
+{
+    p->handover_ns = handover_ns;
 }
 
 void pc_pacer_relearn(pc_pacer *p)
@@ -146,9 +152,16 @@ void pc_pacer_aim(const pc_pacer *p, uint64_t vblank_ns, uint64_t now_ns, pc_aim
         }
         out->target_ns = aligned + (uint64_t)p->depth * p->period_ns;
         /* The system shows a frame at the first refresh at or after the
-         * time it is given: half a refresh early names this one whatever
-         * the grid estimate is off by. */
-        out->at_ns = out->target_ns - p->period_ns / 2;
+         * time it is given: a little after the refresh before this one
+         * names this one while the grid estimate is off by less than the
+         * hand-over, and leaves the compositor most of a refresh before
+         * the frame's own (BO-239; it was half a refresh before it). */
+        {
+            uint64_t h = p->handover_ns, half = p->period_ns / 2;
+            if (p->handover_half || h > half)
+                h = half;
+            out->at_ns = out->target_ns - p->period_ns + h;
+        }
         break;
     }
     case PC_TIMED:
@@ -184,6 +197,14 @@ int pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns)
             p->slips++;
             p->slips_all++;
             p->calm = 0;
+        } else if (p->strategy == PC_LOCK && glass_ns + p->period_ns / 2 < aim->target_ns) {
+            /* Shown before its refresh: the hand-over named an earlier one. */
+            p->earlies_all++;
+            if (!p->handover_half && p->earlies_all >= PC_EARLIES_BACK
+                    && p->handover_ns < p->period_ns / 2) {
+                p->handover_half = 1;
+                raised = 2;
+            }
         } else if (p->strategy == PC_TIMED && glass_ns > aim->target_ns + PC_LATE_NS) {
             p->lates++;
             p->lates_all++;

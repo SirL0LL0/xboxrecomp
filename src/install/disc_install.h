@@ -86,6 +86,17 @@ typedef struct {
     void      (*progress)(void *ctx, double fraction, const char *text);
     void      (*log)(void *ctx, const char *text);
     int       (*cancelled)(void *ctx);  /* asked between blocks of 1 MiB */
+    /* A folder the program cannot walk by path (an Android document tree: a
+     * content:// URI has no file name). When set it stands for the extracted
+     * folder, `source` and `source_fd` are not looked at, and the installer
+     * asks it for each file by its path as on the disc (forward slashes, the
+     * manifest's spelling; the callback matches the case itself and also
+     * finds the executable one folder below the tree's root). Returns an
+     * open descriptor to read (the installer closes it) and its size in
+     * *size; -1 when the source has no such file; -2 when it has and cannot
+     * be read. Called with ctx, on the installing thread. The checks, the
+     * journal and the messages are those of a folder given by path. */
+    int       (*source_open)(void *ctx, const char *rel, uint64_t *size);
 } xr_install_opts;
 
 typedef struct {

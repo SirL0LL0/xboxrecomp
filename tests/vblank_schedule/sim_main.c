@@ -84,6 +84,10 @@ typedef struct {
     int    wake_arg;               /* what the watchdog is told of it: 0 the real one,
                                     * 1 nothing (0: the test before the BO-211 review),
                                     * 2 not known (-1) */
+    int    old_keeper;             /* the keeper before BO-210: skips, no refill limit,
+                                    * no 14-19 ms guard off Windows, no relearn */
+    double seed_kp_ms;             /* at sw_s the keeper's period is found this wrong */
+    int    wsi;                    /* the window system says the refresh (gamescope) */
 } scen;
 
 typedef struct { uint64_t pt, vbl; uint32_t flip; int meas, rep; } qframe;
@@ -91,6 +95,7 @@ typedef struct { uint64_t t, period; qframe f; int shown; } report;
 
 typedef struct {
     int flips1, late1, refr, rep;
+    int shown;                     /* new frames on the glass (a refill's repeat not) */
     int nlat;
     float lat[260];
 } hwin;
@@ -101,7 +106,9 @@ typedef struct {
     double fps;
     uint64_t kp_min, kp_max;       /* keeper period while used, after warm-up */
     uint64_t kp_final, old_kp_final;
-    int refills, skips;
+    int refills, skips, guarded;
+    double shown_last;             /* new frames shown a second, the last 20 s */
+    double shown_after;            /* the same, 5-25 s after the mode switch */
     double lat_first, lat_last;    /* ms, medians */
     unsigned watch_windows, watch_voids;
 } result;
@@ -129,6 +136,8 @@ static struct {
     /* keeper */
     SkPeriod per;
     SkRun run;
+    uint64_t pub;                  /* the period told (s_vbl_period_ns) */
+    int seeded;
     int want;
     uint32_t from_flip;
     uint64_t prev_rt, old_p;
@@ -145,6 +154,23 @@ static struct {
     hwin win[MAXWIN];
     result r;
 } S;
+
+/* The keeper's row rule before BO-210, for the before-and-after test:
+ * three in a row two deep skipped a present. */
+static int sk_run_old(SkRun *r, int d, int pending)
+{
+    if (d == r->run_d)
+        r->run_n++;
+    else {
+        r->run_d = d;
+        r->run_n = 1;
+    }
+    if (r->run_n >= SK_KEEP_SAME && d != 1 && !pending) {
+        r->run_n = 0;
+        return d < 1 ? 1 : -1;
+    }
+    return 0;
+}
 
 static unsigned rnd(void)
 {
@@ -322,6 +348,8 @@ static void ev_refresh(uint64_t r)
         S.qn--;
         latched = 1;
         shown_frame(r, &f);
+        if (w && !f.rep)
+            w->shown++;
     }
     if (w && display_60() && active(r) && S.flips > 10) {
         w->refr++;
@@ -369,26 +397,49 @@ static void ev_report(void)
                 else if (d < S.old_p * 3 / 2)
                     S.old_p = (S.old_p * 15 + d) / 16;
             }
-            if (S.prev_meas && meas)
+            if (S.prev_meas && meas) {
                 sk_period_feed(&S.per, d);
+                /* What the waiter tells (s_vbl_period_ns): before BO-210
+                 * every step's result, now only a confirmed one. */
+                if (S.c->old_keeper || sk_period_sure(&S.per))
+                    S.pub = S.per.p;
+            }
+        }
+        if (S.c->seed_kp_ms > 0 && !S.seeded && rp.t >= at_ns(S.c->sw_s)) {
+            S.seeded = 1;
+            S.per.p = S.pub = (uint64_t)(S.c->seed_kp_ms * 1e6);
+            S.per.agree = SK_CONFIRM_N;
+            S.per.cand_n = 0;
         }
         S.prev_rt = rp.t;
         S.prev_meas = meas;
         if (!S.c->smooth || f->rep || f->flip <= S.from_flip)
             return;
-        if (!meas || S.per.p < 5 * MS || S.per.p > 50 * MS) {
-            S.run.run_n = 0;
-            return;
-        }
-        if (rp.t > S.t0 + 10 * SEC && rp.t > at_ns(S.c->sw_s + 5)) {
-            if (!S.r.kp_min || S.per.p < S.r.kp_min) S.r.kp_min = S.per.p;
-            if (S.per.p > S.r.kp_max) S.r.kp_max = S.per.p;
-        }
         {
-            int d = sk_depth(rp.t - f->pt, S.per.p);
-            int want = sk_run(&S.run, d, S.want != 0);
-            if (want)
-                S.want = want;
+            /* The keeper's period: the window system's refresh where it
+             * says it, else the one told. Off near 60 Hz Smooth is Low
+             * latency (BO-210; before, only on Windows). */
+            uint64_t kp = S.c->wsi ? (uint64_t)S.rp : S.pub;
+            if (!S.c->old_keeper && !sk_refresh_ok(kp)) {
+                S.run.run_n = 0;
+                S.r.guarded++;
+                return;
+            }
+            if (!meas || kp < 5 * MS || kp > 50 * MS) {
+                S.run.run_n = 0;
+                return;
+            }
+            if (rp.t > S.t0 + 10 * SEC && rp.t > at_ns(S.c->sw_s + 5)) {
+                if (!S.r.kp_min || kp < S.r.kp_min) S.r.kp_min = kp;
+                if (kp > S.r.kp_max) S.r.kp_max = kp;
+            }
+            {
+                int d = sk_depth(rp.t - f->pt, kp);
+                int want = S.c->old_keeper ? sk_run_old(&S.run, d, S.want != 0)
+                                           : sk_run(&S.run, d, S.want != 0, rp.t);
+                if (want)
+                    S.want = want;
+            }
         }
     }
 }
@@ -473,6 +524,7 @@ static void ev_executor(uint64_t now)
         f.meas = S.iv == 1;
         f.rep = 0;
         if (S.c->smooth && S.want < 0) {
+            /* Only the old keeper skips. */
             S.want = 0;
             S.r.skips++;
             sk_run_reset(&S.run);
@@ -484,6 +536,8 @@ static void ev_executor(uint64_t now)
                 enqueue(&f);
                 S.want = 0;
                 S.r.refills++;
+                if (!S.c->old_keeper)
+                    sk_period_clear(&S.per);   /* learned again (BO-210) */
                 if (verbose > 1)
                     printf("    %6.2f s refill (keeper p %.3f, queue %d)\n", (now - S.t0) / 1e9,
                            S.per.p / 1e6, S.qn);
@@ -658,7 +712,7 @@ static void run(const scen *c, unsigned seed, result *out)
             ev_refresh(now);
     }
     S.r.fps = S.flips / c->secs;
-    S.r.kp_final = S.per.p;
+    S.r.kp_final = S.c->wsi ? (uint64_t)S.rp : S.pub;
     S.r.old_kp_final = S.old_p;
     S.r.watch_windows = S.w.windows;
     S.r.watch_voids = S.w.voids;
@@ -676,6 +730,13 @@ static void run(const scen *c, unsigned seed, result *out)
         for (i = 0; i < na; i++) S.r.lat_first += a[i] / na;
         S.r.lat_last = 0;
         for (i = 0; i < nb; i++) S.r.lat_last += b[i] / nb;
+        S.r.shown_last = 0;
+        for (i = nwin - 20; i < nwin; i++)
+            if (i >= 0)
+                S.r.shown_last += S.win[i].shown / 20.0;
+        S.r.shown_after = 0;
+        for (i = (int)c->sw_s + 5; c->sw_s > 0 && i < (int)c->sw_s + 25 && i < nwin; i++)
+            S.r.shown_after += S.win[i].shown / 20.0;
     }
     if (!c->exec_bound)
         S.r.recover_max = recovery();
@@ -687,9 +748,9 @@ static void run(const scen *c, unsigned seed, result *out)
 static void report_line(const scen *c, const result *r)
 {
     printf("  %s: %.1f fps, resets %d (forced %d), lines %d, recovery %.1f s, keeper p %.3f ms"
-           " (old filter %.3f), refills %d skips %d, latency %.1f -> %.1f ms, windows %u (void %u)\n",
+           " (old filter %.3f), refills %d skips %d, shown %.1f/s at the end, latency %.1f -> %.1f ms, windows %u (void %u)\n",
            c->name, r->fps, r->resets, r->forced, r->lines, r->recover_max, r->kp_final / 1e6,
-           r->old_kp_final / 1e6, r->refills, r->skips, r->lat_first, r->lat_last,
+           r->old_kp_final / 1e6, r->refills, r->skips, r->shown_last, r->lat_first, r->lat_last,
            r->watch_windows, r->watch_voids);
 }
 
@@ -783,6 +844,41 @@ static void all(void)
     snprintf(what, sizeof what, "7 suspend 30 s: %d forced reset, %d watchdog resets, recovery %.1f s",
              r.forced, r.resets, r.recover_max);
     check(r.forced == 1 && r.resets == 0 && r.recover_max <= 5, what);
+
+    /* 14. BO-210 live on the Deck (2026-10-18): gamescope ran the panel at
+     * 90 Hz under the game with Smooth on, then 60 again, and the game sat
+     * at 45 fps until Frame pacing went to Low latency. The keeper's period
+     * is found wrong when the panel comes back (5.55 ms here, a third of a
+     * refresh; BO-210's F1 run showed 4.84 on the Deck): every frame reads
+     * too deep, a skip, three readings, a skip. The old keeper: 45 shown a second for good. Now: no skip, the
+     * 14-19 ms guard holds the keeper off until the period is learned again;
+     * and with the window system's refresh (gamescope) never misread. */
+    {
+        double old_shown, old_rec;
+        int old_skips;
+        c = base60;
+        c.hz = 90; c.hz2 = 60; c.sw_s = 60; c.smooth = 1; c.secs = 150;
+        c.seed_kp_ms = 5.55;
+        c.old_keeper = 1;
+        scenario(c, "deck_90_then_60_old_keeper", 23, &r);
+        old_shown = r.shown_after;
+        old_skips = r.skips;
+        old_rec = r.recover_max;
+        c.old_keeper = 0;
+        scenario(c, "deck_90_then_60", 23, &r);
+        snprintf(what, sizeof what, "14 90 Hz then 60, keeper period wrong: %.1f shown/s 5-25 s on"
+                 " (old keeper %.1f, %d skips, %.0f s to recover), %d refills", r.shown_after,
+                 old_shown, old_skips, old_rec, r.refills);
+        check(old_shown < 47 && old_shown > 43 && old_rec > 20 && r.shown_after > 59.0
+              && r.shown_last > 59.0 && r.skips == 0 && r.refills <= 150 && r.recover_max >= 0
+              && r.recover_max <= 5, what);
+        c.wsi = 1;
+        scenario(c, "deck_90_then_60_wsi", 23, &r);
+        snprintf(what, sizeof what, "14b the same with gamescope's refresh cycle: %.1f shown/s,"
+                 " %d refills, recovery %.1f s", r.shown_after, r.refills, r.recover_max);
+        check(r.shown_after > 59.0 && r.shown_last > 59.0 && r.skips == 0 && r.recover_max >= 0 && r.recover_max <= 5,
+              what);
+    }
 
     /* 8 and 9 are below (the Windows stand-down, the Metal pacer). */
 

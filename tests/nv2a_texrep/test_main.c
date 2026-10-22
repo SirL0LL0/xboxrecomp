@@ -246,6 +246,7 @@ int main(void)
         CHECK(nv2a_texrep_zbias(g_dxt, FMT_DXT5, W, H * 2, 0) == 0.0f);
         CHECK(nv2a_texrep_zbias(g_dxt, 0x0Cu, W, H, 0) == 0.0f);
         CHECK(nv2a_texrep_zbias_on(0) == 1);                           /* default: on */
+        CHECK(nv2a_texrep_zbias_facing(0) == 1);       /* BO-253: front faces only by default */
         nv2a_texrep_register_zbias(NULL, 0);
         CHECK(nv2a_texrep_zbias(g_dxt, FMT_DXT5, W, H, 0) == 0.0f);
     }

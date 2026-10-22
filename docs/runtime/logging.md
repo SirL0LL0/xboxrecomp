@@ -109,8 +109,10 @@ Tests: `tests/xr_log`.
 | ERROR | src/d3d/nv2a_pb_vulkan.c:4545 | `ring buffer %d failed` |
 | ERROR | src/d3d/nv2a_pb_vulkan.c:4651 | `base shaders failed` |
 | ERROR | src/d3d/nv2a_pb_vulkan.c:4656 | `base textures failed` |
-| ERROR | src/d3d/android_vk.c:68 | `could not be opened through` |
-| ERROR | src/d3d/android_vk.c:101 | `no Vulkan loader: %s` |
+| ERROR | src/d3d/vk_dyn.c:147 | `could not be opened through` |
+| ERROR | src/d3d/vk_dyn.c:183 | `no Vulkan loader: %s` |
+| ERROR | src/d3d/vk_dyn.c:206 | `no Vulkan loader: %s` |
+| ERROR | src/d3d/vk_dyn.c:250 | `no Vulkan loader: %s` |
 | ERROR | src/d3d/nv2a_vk_glsl.c:167 | `SPIR-V cache: cannot append` |
 | NOTICE | src/video/fb_present_sdl.c:501 | `[PRESENT] display %d mode` |
 | NOTICE | src/video/fb_present_sdl.c:507 | `[PRESENT] window: display %d` |

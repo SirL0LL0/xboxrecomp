@@ -7,11 +7,17 @@
  *              legacy stays legacy; nothing known is timed.
  *   lock       on a 120 Hz and a 60 Hz grid every frame of a locked vblank is
  *              aimed at the refresh `depth` after its own, the targets one
- *              guest frame apart, the time handed to the system half a
- *              refresh before it; a frame picked up after its refresh is
+ *              guest frame apart, the time handed to the system 3 ms after
+ *              the refresh before it (at most half a refresh); a frame picked up after its refresh is
  *              late, aimed at the next it can make, and not counted; four
  *              slips raise the depth at 120 Hz and never at 60 Hz, where one
  *              more refresh would put a frame two frames behind its vblank.
+ *   handover   BO-239: the time handed over names the frame's own refresh
+ *              with the grid estimate 1.2 ms off either way, at 60, 120
+ *              and 240 Hz, picked up on time and late; it is 13.7 ms before
+ *              the refresh at 60 Hz; RECOMP_PRESENT_HANDOVER past half a
+ *              refresh is half a refresh; frames shown a refresh early put
+ *              it back at half a refresh; slips still raise the depth.
  *   timed      the vblank plus the lead; six late frames add 2 ms.
  *   statistics even 120 Hz (2-2-2), the 1-3-1-3 repeat, 144 Hz, a variable
  *              display with small and with large jitter, 30 fps content, a
@@ -99,7 +105,7 @@ static int lock_run(double hz, int mult, int frames, pc_pacer *p, uint64_t *firs
         uint64_t want = vsync + (uint64_t)p->depth * R;
         /* The grid is the last on-glass stamp, which is up to 40 us off. */
         if (a.late || a.target_ns < want || a.target_ns > want + 40000
-                || a.at_ns != a.target_ns - R / 2)
+                || a.at_ns != a.target_ns - R + (PC_HANDOVER_NS < R / 2 ? PC_HANDOVER_NS : R / 2))
             bad++;
         if (prev && (a.target_ns - prev > (uint64_t)mult * R + 40000
                      || a.target_ns - prev + 40000 < (uint64_t)mult * R))
@@ -228,6 +234,125 @@ static void lock(void)
         raised += pc_pacer_glass(&p, &a, a.target_ns + (i % 50 == 0 ? R : 0));
     }
     check(raised == 0 && p.depth == 1, "one slip in fifty frames: the depth stays");
+}
+
+/* The first refresh of the true grid (g + k * R) at or after t. */
+static uint64_t first_at_or_after(uint64_t g, uint64_t R, uint64_t t)
+{
+    return t <= g ? g - (g - t) / R * R : g + (t - g + R - 1) / R * R;
+}
+
+/* BO-239: hand-over after the refresh before the frame's own. On a true grid
+ * g + k * R the pacer's estimate is off by err (the last on-glass stamp); the
+ * system shows a frame at the first true refresh at or after at_ns. Returns
+ * the frames whose at_ns named a refresh other than their own. */
+static int handover_run(double hz, int mult, int64_t err, uint64_t pick_ns, int depth,
+                        uint64_t *lead_min)
+{
+    pc_display d = disp(hz, 0, 0);
+    pc_pacer p;
+    uint64_t R, g = 2000 * MS, phase = 5 * MS;
+    int i, bad = 0;
+
+    pc_pacer_init(&p, PC_LOCK, &d, phase, 0, depth);
+    R = p.period_ns;
+    *lead_min = ~0ull;
+    for (i = 1; i <= 300; i++) {
+        uint64_t vsync = g + (uint64_t)i * mult * R, v = vsync - phase, shown;
+        pc_aim a;
+        p.grid_ns = (uint64_t)((int64_t)(vsync - (uint64_t)mult * R) + err);
+        pc_pacer_aim(&p, v, v + pick_ns, &a);
+        /* The refresh the target means (the estimate's point nearest it). */
+        uint64_t own = first_at_or_after(g, R, a.target_ns - R / 2);
+        shown = first_at_or_after(g, R, a.at_ns > v + pick_ns ? a.at_ns : v + pick_ns);
+        if (shown != own)
+            bad++;
+        if (own - a.at_ns < *lead_min)
+            *lead_min = own - a.at_ns;
+    }
+    return bad;
+}
+
+static void handover(void)
+{
+    static const int64_t errs[] = { -1200000, -600000, 0, 600000, 1200000 };
+    pc_pacer p;
+    pc_display d;
+    pc_aim a;
+    uint64_t R, v, lead, lead60 = ~0ull;
+    int i, k, bad = 0, raised;
+
+    printf("handover\n");
+    for (k = 0; k < 5; k++) {
+        bad += handover_run(60, 1, errs[k], 300000, 1, &lead);
+        if (lead < lead60)
+            lead60 = lead;
+        bad += handover_run(60, 1, errs[k], 6 * MS, 1, &lead);    /* picked up late */
+        bad += handover_run(120, 2, errs[k], 300000, 1, &lead);
+        bad += handover_run(120, 2, errs[k], 300000, 2, &lead);
+        bad += handover_run(240, 4, errs[k], 300000, 1, &lead);
+    }
+    check(bad == 0, "the grid 1.2 ms off: every frame shown at its own refresh");
+    check(lead60 >= 16666667 - 3 * MS - 1200000 && lead60 > 12 * MS,
+          "60 Hz: handed over 13.7 ms (12.5 at the worst grid) before its refresh (was 8.3)");
+
+    d = disp(60, 0, 0);
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    R = p.period_ns;
+    p.grid_ns = 1000 * MS;
+    v = 1000 * MS + 10 * R - 5 * MS;
+    pc_pacer_aim(&p, v, v + 300000, &a);
+    check(a.at_ns == a.target_ns - R + 3 * MS && a.target_ns == 1000 * MS + 11 * R,
+          "60 Hz: 3 ms after the refresh before its own");
+    pc_pacer_set_handover(&p, 12 * MS);
+    pc_pacer_aim(&p, v, v + 300000, &a);
+    check(a.at_ns == a.target_ns - R + R / 2, "a hand-over past half a refresh: half a refresh");
+    d = disp(120, 0, 0);
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    p.grid_ns = 1000 * MS;
+    pc_pacer_aim(&p, v, v + 300000, &a);
+    check(a.at_ns == a.target_ns - p.period_ns + 3 * MS, "120 Hz: 3 ms after the refresh before");
+    d = disp(240, 0, 0);
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    p.grid_ns = 1000 * MS;
+    pc_pacer_aim(&p, v, v + 300000, &a);
+    check(a.at_ns == a.target_ns - p.period_ns + p.period_ns / 2, "240 Hz: half a refresh (3 ms is more)");
+
+    /* Shown a refresh early (the system took the nearest refresh): back to
+     * half a refresh after PC_EARLIES_BACK, once. */
+    d = disp(60, 0, 0);
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    R = p.period_ns;
+    p.grid_ns = 1000 * MS;
+    raised = 0;
+    for (i = 1; i <= PC_GRACE_FRAMES + 10; i++) {
+        int r;
+        v = 1000 * MS + (uint64_t)i * R - 5 * MS;
+        pc_pacer_aim(&p, v, v + 300000, &a);
+        r = pc_pacer_glass(&p, &a, a.target_ns - (p.handover_half ? 0 : R));
+        if (r == 2)
+            raised++;
+    }
+    pc_pacer_aim(&p, v + R, v + R + 300000, &a);
+    check(raised == 1 && p.handover_half && p.earlies_all == PC_EARLIES_BACK
+          && a.at_ns == a.target_ns - R + R / 2 && p.slips_all == 0 && p.depth == 1,
+          "frames shown a refresh early: half a refresh again, no slip counted");
+    pc_pacer_relearn(&p);
+    check(p.handover_half, "relearn keeps it");
+
+    /* Slips still raise the depth at 120 Hz with the new hand-over. */
+    d = disp(120, 0, 0);
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    R = p.period_ns;
+    p.grid_ns = 1000 * MS;
+    raised = 0;
+    for (i = 1; i <= PC_GRACE_FRAMES + 4; i++) {
+        v = 1000 * MS + (uint64_t)i * 2 * R - 5 * MS;
+        pc_pacer_aim(&p, v, v + 300000, &a);
+        raised += pc_pacer_glass(&p, &a, a.target_ns + R);
+    }
+    check(raised == 1 && p.depth == 2 && p.slips_all == 4 && p.earlies_all == 0,
+          "120 Hz: four slips still raise the depth, none taken as early");
 }
 
 static void timed(void)
@@ -385,6 +510,7 @@ int main(void)
 {
     strategy();
     lock();
+    handover();
     timed();
     statistics();
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);

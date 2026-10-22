@@ -8,8 +8,8 @@
  *         the renderer's NewFrame, overlay_begin_frame(), overlay_end_frame(),
  *         the renderer's RenderDrawData
  *     with the draw data overlay_end_frame returns.
- * overlay_begin_frame does ImGui_ImplSDL2_NewFrame, ImGui::NewFrame and
- * builds the pages; it is false when there is nothing to draw (the backend
+ * overlay_begin_frame does ImGui::NewFrame and builds the pages (ImGui's
+ * SDL half runs on the main thread, xbox_OverlayPlatformFrame); it is false when there is nothing to draw (the backend
  * then skips the rest). overlay_end_frame is ImGui::Render.
  */
 #ifndef XBOX_OVERLAY_INTERNAL_H
@@ -21,6 +21,12 @@
 /* The ImGui context and the SDL platform backend, made at the first draw.
  * `vulkan` selects ImGui_ImplSDL2_InitForVulkan. */
 bool overlay_core_init(bool vulkan);
+/* Made by the main thread (xbox_OverlayPlatformFrame): 1 once it is. */
+bool overlay_core_is_ready();
+/* A backend's draw holds this from its first ImGui call to its last: the
+ * main thread hands events over under it (overlay_ui.cpp). */
+void overlay_lock();
+void overlay_unlock();
 /* A backend could not start: the overlay turns itself off (an open one is
  * closed), so the title is not left paused behind nothing. */
 void overlay_fail();

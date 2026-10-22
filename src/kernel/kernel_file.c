@@ -19,6 +19,8 @@
 #endif
 #include "kernel.h"
 #include "kernel_saveguard.h"
+#include "xbox_memory_layout.h"   /* RECOMP_TLS */
+#include "../platform/xr_log.h"
 #include <stddef.h>     /* offsetof */
 #include <string.h>
 #include <stdio.h>
@@ -33,6 +35,30 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #endif
+
+/* The guest call site of the kernel call in progress (kernel_bridge.c). */
+extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+/* The backends below define these; the wrappers at the end of the file are
+ * the xbox_* entry points and add what both backends need alike: one
+ * request at a time on a synchronous file object (BO-221). */
+#define xbox_NtCreateFile            be_NtCreateFile
+#define xbox_NtReadFile              be_NtReadFile
+#define xbox_NtWriteFile             be_NtWriteFile
+#define xbox_NtClose                 be_NtClose
+#define xbox_NtQueryInformationFile  be_NtQueryInformationFile
+#define xbox_NtSetInformationFile    be_NtSetInformationFile
+static NTSTATUS __stdcall be_NtCreateFile(PHANDLE, ACCESS_MASK, PXBOX_OBJECT_ATTRIBUTES,
+    PXBOX_IO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG);
+static NTSTATUS __stdcall be_NtReadFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+    PXBOX_IO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER);
+static NTSTATUS __stdcall be_NtWriteFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+    PXBOX_IO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER);
+static NTSTATUS __stdcall be_NtClose(HANDLE);
+static NTSTATUS __stdcall be_NtQueryInformationFile(HANDLE, PXBOX_IO_STATUS_BLOCK, PVOID,
+    ULONG, XBOX_FILE_INFORMATION_CLASS);
+static NTSTATUS __stdcall be_NtSetInformationFile(HANDLE, PXBOX_IO_STATUS_BLOCK, PVOID,
+    ULONG, XBOX_FILE_INFORMATION_CLASS);
 
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
@@ -300,7 +326,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
-NTSTATUS __stdcall xbox_NtCreateFile(
+static NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
@@ -424,7 +450,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtReadFile(
+static NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -439,10 +465,17 @@ NTSTATUS __stdcall xbox_NtReadFile(
 
     overwrite_settle(FileHandle);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        /* Only a read that delivered moves the position (NT: a failed
+         * request, END_OF_FILE included, leaves CurrentByteOffset alone).
+         * Put it back if this one did not (BO-221, see the POSIX backend). */
+        LARGE_INTEGER zero = {0}, was;
+        BOOL have = SetFilePointerEx(FileHandle, zero, &was, FILE_CURRENT);
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
         ov.OffsetHigh = ByteOffset->HighPart;
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
+        if (have && (!result || bytes_read == 0))
+            SetFilePointerEx(FileHandle, was, NULL, FILE_BEGIN);
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
@@ -465,7 +498,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     return STATUS_UNSUCCESSFUL;
 }
 
-NTSTATUS __stdcall xbox_NtWriteFile(
+static NTSTATUS __stdcall xbox_NtWriteFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -480,10 +513,14 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
     overwrite_settle(FileHandle);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        LARGE_INTEGER zero = {0}, was;   /* as in NtReadFile (BO-221) */
+        BOOL have = SetFilePointerEx(FileHandle, zero, &was, FILE_CURRENT);
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
         ov.OffsetHigh = ByteOffset->HighPart;
         result = WriteFile(FileHandle, Buffer, Length, &bytes_written, &ov);
+        if (have && (!result || bytes_written == 0))
+            SetFilePointerEx(FileHandle, was, NULL, FILE_BEGIN);
     } else {
         result = WriteFile(FileHandle, Buffer, Length, &bytes_written, NULL);
     }
@@ -505,7 +542,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 static void dir_context_release(HANDLE FileHandle);
 
-NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+static NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
@@ -530,7 +567,7 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
-NTSTATUS __stdcall xbox_NtQueryInformationFile(
+static NTSTATUS __stdcall xbox_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -613,7 +650,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtSetInformationFile(
+static NTSTATUS __stdcall xbox_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -1151,7 +1188,7 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
-NTSTATUS __stdcall xbox_NtCreateFile(
+static NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
@@ -1242,7 +1279,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtReadFile(
+/* A position asked for past the end of a read-only file: the read or the
+ * seek is going nowhere a title means to go, and whatever it reads next
+ * there is the end. Said through XR_ERROR, so a release build with
+ * diagnostic logging off keeps it too, sixteen times a run: the file, where
+ * the position was, where it was asked to go, the size and the guest call
+ * site (BO-221). */
+static void file_note_past_end(HANDLE h, int fd, const char *what, long long to)
+{
+    static volatile LONG said;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || to <= (long long)st.st_size
+        || (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY
+        || InterlockedIncrement(&said) > 16)
+        return;
+    XR_ERROR("  [FD] %s past the end: fd %d %s pos %lld -> %lld, size %lld, from=0x%08X\n",
+             what, fd, w32_handle_path(h) ? w32_handle_path(h) : "?",
+             (long long)lseek(fd, 0, SEEK_CUR), to, (long long)st.st_size,
+             g_xbox_kernel_caller);
+}
+
+static NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -1258,10 +1315,37 @@ NTSTATUS __stdcall xbox_NtReadFile(
     }
 
     overwrite_settle(fd);
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = read(fd, Buffer, Length);
+    /* BO-221: the descriptor still names the file this handle opened (one
+     * fstat; a mismatch is logged once per handle, with a backtrace). */
+    w32_handle_check(FileHandle, "read");
+    /* An explicit offset reads there without touching the position, and
+     * only a read that delivered moves it, to the end of what it read: on
+     * a synchronous file object NT sets CurrentByteOffset when the request
+     * succeeds, and a read at or past the end (STATUS_END_OF_FILE) leaves it
+     * where it was. lseek-then-read left the position at the offset asked
+     * for, so one read at a garbage offset put the handle there for good and
+     * every later sequential read hit the end: the bank loader's loop on
+     * sound\Ident2.awd at 0x282844A6 (BO-221). */
+    ssize_t n;
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        off_t at = (off_t)ByteOffset->QuadPart;
+        file_note_past_end(FileHandle, fd, "read", (long long)at);
+        n = pread(fd, Buffer, Length, at);
+        if (n > 0)
+            lseek(fd, at + n, SEEK_SET);
+    } else {
+        n = read(fd, Buffer, Length);
+    }
+    if (n == 0 && Length > 0) {
+        struct stat est;
+        off_t pos = lseek(fd, 0, SEEK_CUR);
+        int ok = w32_handle_check(FileHandle, "read at EOF");
+        if (w32_fd_trace_on() || !ok)
+            fprintf(stderr, "  [FD] EOF read: fd %d %s pos %lld size %lld\n", fd,
+                    w32_handle_path(FileHandle) ? w32_handle_path(FileHandle) : "?",
+                    (long long)pos, fstat(fd, &est) == 0 ? (long long)est.st_size : -1LL);
+    }
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1279,7 +1363,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtWriteFile(
+static NTSTATUS __stdcall xbox_NtWriteFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -1295,10 +1379,19 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     }
 
     overwrite_settle(fd);
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
-
-    ssize_t n = write(fd, Buffer, Length);
+    /* As in NtReadFile: an explicit offset writes there, and only a write
+     * that went through moves the position (BO-221). FILE_WRITE_TO_END_OF_FILE
+     * and FILE_USE_FILE_POINTER_POSITION are negative and take the plain
+     * write at the position. */
+    ssize_t n;
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        off_t at = (off_t)ByteOffset->QuadPart;
+        n = pwrite(fd, Buffer, Length, at);
+        if (n > 0)
+            lseek(fd, at + n, SEEK_SET);
+    } else {
+        n = write(fd, Buffer, Length);
+    }
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1315,7 +1408,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 static void dir_context_release(HANDLE FileHandle);
 
-NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+static NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
@@ -1341,7 +1434,7 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
-NTSTATUS __stdcall xbox_NtQueryInformationFile(
+static NTSTATUS __stdcall xbox_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -1414,7 +1507,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtSetInformationFile(
+static NTSTATUS __stdcall xbox_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -1429,6 +1522,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+            /* BO-221: a read-only file put past its end (a few lines,
+             * whatever the diagnostic setting). */
+            w32_handle_check(FileHandle, "seek");
+            file_note_past_end(FileHandle, fd, "seek", (long long)info->CurrentByteOffset.QuadPart);
             if (lseek(fd, (off_t)info->CurrentByteOffset.QuadPart, SEEK_SET) < 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1728,6 +1825,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
         xbox_saveguard_settle(dpath);
         ctx->dir = opendir(dpath);
+        if (ctx->dir)
+            w32_fd_note_foreign(dirfd(ctx->dir), "opendir");
         if (!ctx->dir) {
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
@@ -1792,6 +1891,251 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 }
 
 #endif /* _WIN32 */
+
+/* ======================================================================== */
+/* ====  One request at a time on a synchronous file object (BO-221)  ===== */
+/* ======================================================================== */
+#undef xbox_NtCreateFile
+#undef xbox_NtReadFile
+#undef xbox_NtWriteFile
+#undef xbox_NtClose
+#undef xbox_NtQueryInformationFile
+#undef xbox_NtSetInformationFile
+
+/*
+ * NT serialises the requests on a file object opened for synchronous I/O
+ * (FILE_SYNCHRONOUS_IO_ALERT/NONALERT, FO_SYNCHRONOUS_IO): a read, a write,
+ * a position query or set waits for the one in progress, so each sees the
+ * position the last one left. Here every request is a host call on its own
+ * thread, so each takes the handle's lock for the whole of it. Asynchronous
+ * handles take no lock: their requests carry their offset and NT does not
+ * serialise them either.
+ *
+ * XAPI SetFilePointer(FILE_CURRENT, d) is two of those requests, a position
+ * query and a set to that + d. On the console nothing runs between the two
+ * (one CPU, and the title's threads do not preempt each other there), and
+ * Burnout 3 counts on it: its main thread asks a stream handle where it is
+ * (0x1CECAF) while its file thread seeks and reads the same handle. With
+ * the threads running at once the set lands after the file thread's seek
+ * and before its read, and that read gets the wrong sector (Fe.awd's header
+ * buffer got sector 2, the bank loader looped: the race-start hang), or a
+ * position the stream never meant. So a set that follows the same thread's
+ * query of the same handle, with the position moved by another thread in
+ * between, moves by what the caller added to the answer: the order in which
+ * the query and set ran together, before the other thread's requests.
+ */
+typedef struct {
+    HANDLE           h;
+    int              ready;
+    unsigned         gen;          /* bumped at each change of the position */
+    CRITICAL_SECTION cs;
+} file_sync_t;
+
+#define FILE_SYNC_MAX 1024
+static file_sync_t s_fsync[FILE_SYNC_MAX];
+static volatile LONG s_fsync_spin;
+
+static RECOMP_TLS HANDLE    t_q_handle;   /* this thread's last position query */
+static RECOMP_TLS long long t_q_pos;
+static RECOMP_TLS unsigned  t_q_gen;
+
+static void fsync_spin_lock(void)
+{
+    while (InterlockedCompareExchange(&s_fsync_spin, 1, 0) != 0) { }
+}
+static void fsync_spin_unlock(void) { InterlockedExchange(&s_fsync_spin, 0); }
+
+static unsigned fsync_hash(HANDLE h)
+{
+    uintptr_t v = (uintptr_t)h;
+    return (unsigned)((v >> 4) ^ (v >> 14)) % FILE_SYNC_MAX;
+}
+
+static void fsync_add(HANDLE h)
+{
+    unsigned i, k = fsync_hash(h);
+    fsync_spin_lock();
+    for (i = 0; i < FILE_SYNC_MAX; i++, k = (k + 1) % FILE_SYNC_MAX)
+        if (!s_fsync[k].h) {
+            if (!s_fsync[k].ready) { InitializeCriticalSection(&s_fsync[k].cs); s_fsync[k].ready = 1; }
+            s_fsync[k].gen = 0;
+            s_fsync[k].h = h;
+            break;
+        }
+    fsync_spin_unlock();
+}
+
+/* The handle's entry, locked; NULL for a handle that takes no lock. */
+static file_sync_t *fsync_enter(HANDLE h)
+{
+    file_sync_t *e = NULL;
+    unsigned i, k;
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return NULL;
+    k = fsync_hash(h);
+    fsync_spin_lock();
+    for (i = 0; i < FILE_SYNC_MAX; i++, k = (k + 1) % FILE_SYNC_MAX)
+        if (s_fsync[k].h == h) { e = &s_fsync[k]; break; }
+    fsync_spin_unlock();
+    if (!e)
+        return NULL;
+    EnterCriticalSection(&e->cs);
+    if (e->h != h) {                 /* closed while this one waited */
+        LeaveCriticalSection(&e->cs);
+        return NULL;
+    }
+    return e;
+}
+
+static void fsync_leave(file_sync_t *e)
+{
+    if (e) LeaveCriticalSection(&e->cs);
+}
+
+NTSTATUS __stdcall xbox_NtCreateFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
+    ULONG CreateDisposition, ULONG CreateOptions)
+{
+    NTSTATUS st = be_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+                                  AllocationSize, FileAttributes, ShareAccess,
+                                  CreateDisposition, CreateOptions);
+    /* FILE_SYNCHRONOUS_IO_ALERT 0x10, FILE_SYNCHRONOUS_IO_NONALERT 0x20 */
+    if (NT_SUCCESS(st) && FileHandle && *FileHandle && (CreateOptions & 0x30u)
+        && !(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
+        fsync_add(*FileHandle);
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtReadFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    file_sync_t *e = fsync_enter(FileHandle);
+    NTSTATUS st = be_NtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                IoStatusBlock, Buffer, Length, ByteOffset);
+    if (e && NT_SUCCESS(st) && IoStatusBlock && IoStatusBlock->Information)
+        e->gen++;
+    fsync_leave(e);
+    t_q_handle = NULL;
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtWriteFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    file_sync_t *e = fsync_enter(FileHandle);
+    NTSTATUS st = be_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                 IoStatusBlock, Buffer, Length, ByteOffset);
+    if (e && NT_SUCCESS(st) && IoStatusBlock && IoStatusBlock->Information)
+        e->gen++;
+    fsync_leave(e);
+    t_q_handle = NULL;
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtQueryInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    file_sync_t *e = fsync_enter(FileHandle);
+    NTSTATUS st = be_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                            Length, FileInformationClass);
+    t_q_handle = NULL;
+    if (e && NT_SUCCESS(st) && FileInformationClass == XboxFilePositionInformation) {
+        t_q_handle = FileHandle;
+        t_q_pos = (long long)((PXBOX_FILE_POSITION_INFORMATION)FileInformation)->CurrentByteOffset.QuadPart;
+        t_q_gen = e->gen;
+    }
+    fsync_leave(e);
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtSetInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    file_sync_t *e = fsync_enter(FileHandle);
+    NTSTATUS st;
+    if (e && FileInformationClass == XboxFilePositionInformation && FileInformation
+        && t_q_handle == FileHandle && t_q_gen != e->gen) {
+        /* A query-then-set split by another thread's requests (above): move
+         * by the caller's distance from where the position is now. */
+        PXBOX_FILE_POSITION_INFORMATION want = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+        XBOX_FILE_POSITION_INFORMATION now, rel;
+        XBOX_IO_STATUS_BLOCK qios;
+        static volatile LONG said;
+        st = be_NtQueryInformationFile(FileHandle, &qios, &now, sizeof now, XboxFilePositionInformation);
+        if (NT_SUCCESS(st)) {
+            long long d = (long long)want->CurrentByteOffset.QuadPart - t_q_pos;
+            rel.CurrentByteOffset.QuadPart = now.CurrentByteOffset.QuadPart + d;
+            if (XR_DIAG_ON() && InterlockedIncrement(&said) <= 16)
+                XR_ERROR("  [FD] position set after a query, split by another thread: "
+                         "asked %lld (queried %lld), now %lld -> %lld, from=0x%08X\n",
+                         (long long)want->CurrentByteOffset.QuadPart, t_q_pos,
+                         (long long)now.CurrentByteOffset.QuadPart,
+                         (long long)rel.CurrentByteOffset.QuadPart, g_xbox_kernel_caller);
+            st = be_NtSetInformationFile(FileHandle, IoStatusBlock, &rel, sizeof rel,
+                                         FileInformationClass);
+        } else {
+            st = be_NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                         FileInformationClass);
+        }
+    } else {
+        st = be_NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                     FileInformationClass);
+    }
+    if (e && NT_SUCCESS(st) && FileInformationClass == XboxFilePositionInformation)
+        e->gen++;
+    fsync_leave(e);
+    t_q_handle = NULL;
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+{
+    /* Wait for a request in progress on the handle; then it takes no lock. */
+    file_sync_t *e = fsync_enter(Handle);
+    if (e) {
+        fsync_spin_lock();
+        e->h = NULL;
+        fsync_spin_unlock();
+        LeaveCriticalSection(&e->cs);
+    }
+    if (t_q_handle == Handle)
+        t_q_handle = NULL;
+    return be_NtClose(Handle);
+}
+
+
+long long xbox_FileHandleTell(HANDLE FileHandle)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER zero = {0}, at;
+    if (!FileHandle || FileHandle == INVALID_HANDLE_VALUE
+        || !SetFilePointerEx(FileHandle, zero, &at, FILE_CURRENT))
+        return -1;
+    return (long long)at.QuadPart;
+#else
+    int fd = w32_handle_fd(FileHandle);
+    return fd < 0 ? -1 : (long long)lseek(fd, 0, SEEK_CUR);
+#endif
+}
+
+const char *xbox_FileHandlePath(HANDLE FileHandle)
+{
+#if defined(_WIN32)
+    (void)FileHandle;
+    return NULL;
+#else
+    return w32_handle_path(FileHandle);
+#endif
+}
+
 
 /* ======================================================================== */
 /* ====================  Platform-independent  ============================ */

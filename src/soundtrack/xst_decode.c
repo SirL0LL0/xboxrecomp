@@ -517,9 +517,11 @@ static stb_vorbis *ogg_open(const char *path)
 
     if (!f)
         return NULL;
+    /* close_on_free: the file is the stream's, and a stream that does not
+     * open has closed it already (vorbis_deinit). Closing it again here was
+     * a second fclose of a freed FILE: on glibc that closes its descriptor
+     * number again, which by then may be a file another thread opened. */
     v = stb_vorbis_open_file(f, 1, &err, NULL);
-    if (!v)
-        fclose(f);
     return v;
 }
 
