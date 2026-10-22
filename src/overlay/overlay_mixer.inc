@@ -135,7 +135,7 @@ static void mx_ab_toggle()
     }
     s_mx_gen = apu_bus_file_gen();
     fprintf(stderr, LOGP "mixer: listening to %s\n",
-            s_mx_live_b ? mx_preset_name(s_mx_b_idx) : "A (your mix)");
+            s_mx_live_b ? mx_preset_name(s_mx_b_idx) : "A (la tua mix)");
 }
 
 /* A change from this page: heard now; A is also written to its file, once
@@ -197,9 +197,9 @@ static const char *const k_mx_route[] = { "The game's panning", "Sends", "A plac
 static const int k_mx_route_v[] = { APU_BUS_ROUTE_TITLE, APU_BUS_ROUTE_SENDS, APU_BUS_ROUTE_PAN };
 static const char *const k_mx_lim[] = { "Off (hard clamp, as shipped)", "Soft clip", "Peak limiter (+1.33 ms)" };
 static const int k_mx_lim_v[] = { APU_BUS_LIM_OFF, APU_BUS_LIM_SOFT, APU_BUS_LIM_PEAK };
-static const char *const k_mx_hz[] = { "Off", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
+static const char *const k_mx_hz[] = { "Spento", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
 static const int k_mx_hz_v[] = { 0, 60, 80, 100, 120, 150 };
-static const char *const k_mx_keep[] = { "Off", "The last 30 s", "The last 60 s" };
+static const char *const k_mx_keep[] = { "Spento", "Gli ultimi 30 s", "Gli ultimi 60 s" };
 static const int k_mx_keep_v[] = { 0, 30, 60 };
 
 static void mx_aud_path(char *out, size_t n)
@@ -209,7 +209,7 @@ static void mx_aud_path(char *out, size_t n)
     snprintf(out, n, "%s/mixer-audition.clip", dir);
 }
 
-static const char *const k_mx_xo[] = { "Full range", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
+static const char *const k_mx_xo[] = { "Tutta banda", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
 
 static char s_mx_busnames[APU_BUS_MAX][40];
 static const char *s_mx_busname_p[APU_BUS_MAX];
@@ -247,102 +247,102 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
     const bool on = apu_bus_enabled() != 0;
 
     if (on && s_mx_live_b)
-        add(MK_INFO, "YOU HEAR B, the reference preset. Edits here change B and are not saved. F7 / Back+Y: back to A.", NULL);
+        add(MK_INFO, "SENTI B, il preset di riferimento. Le modifiche qui cambiano B e non sono salvate. F7 / Back+Y: torna ad A.", NULL);
 
     if (s_mx_view == MX_MAIN) {
-        MxItem &en = act(MA_ENABLE, "Mixer", "Off plays the game's mix untouched. With the Factory preset on, the output is still identical bit for bit; everything below is a change you make.");
-        snprintf(en.text, sizeof en.text, "%s", on ? "On" : "Off");
+        MxItem &en = act(MA_ENABLE, "Mixer", "Spento suona la mix del gioco intatta. Con il preset Fabbrica acceso, l'uscita e' ancora identica bit per bit; tutto quello che segue e' una modifica tua.");
+        snprintf(en.text, sizeof en.text, "%s", on ? "Acceso" : "Spento");
         if (!on) {
-            add(MK_INFO, "Turn the mixer on to hear and edit the buses below.", NULL);
+            add(MK_INFO, "Accendi il mixer per sentire e modificare le bus qui sotto.", NULL);
             return n;
         }
-        add(MK_INFO, "The game keeps running while the mixer is open, so you hear changes as you make them.", NULL);
-        MxItem &ab = act(MA_AB, "Listening to", "A is your mix, kept in mixer.toml. B is a reference held in memory. F7, or Back + Y on a pad, switches between them at any time, even with this menu closed.");
-        snprintf(ab.text, sizeof ab.text, "%s", s_mx_live_b ? "B (reference)" : "A (your mix)");
-        MxItem &br = act(MA_BREF, "B is", "Left / right: the preset B holds. Edits made while B is heard change B only and are not saved.");
+        add(MK_INFO, "Il gioco continua a girare mentre il mixer e' aperto, cosi' senti le modifiche mentre le fai.", NULL);
+        MxItem &ab = act(MA_AB, "In ascolto di", "A e' la tua mix, tenuta in mixer.toml. B e' un riferimento tenuto in memoria. F7, o Back + Y su un pad, passa dall'una all'altra in qualsiasi momento, anche con questo menu chiuso.");
+        snprintf(ab.text, sizeof ab.text, "%s", s_mx_live_b ? "B (riferimento)" : "A (la tua mix)");
+        MxItem &br = act(MA_BREF, "B e'", "Sinistra / destra: il preset che B tiene. Le modifiche fatte mentre senti B cambiano solo B e non sono salvate.");
         snprintf(br.text, sizeof br.text, "%s", mx_preset_name(s_mx_b_idx));
-        MxItem &pr = act(MA_PRESET, "Load a preset into A", "Left / right to choose, A to load it over your mix (mixer.toml is rewritten). Files named mixer-<name>.toml beside it are listed too.");
+        MxItem &pr = act(MA_PRESET, "Carica un preset in A", "Sinistra / destra per scegliere, A per caricarlo sulla tua mix (mixer.toml viene riscritto). Sono elencati anche i file mixer-<name>.toml accanto.");
         snprintf(pr.text, sizeof pr.text, "%s", mx_preset_name(s_mx_preset_idx));
-        act(MA_SAVE_COPY, "Save a copy of A as a preset file", "Writes mixer-1.toml (or the next free number) beside mixer.toml. Rename it as you like: mixer-<name>.toml.");
+        act(MA_SAVE_COPY, "Salva una copia di A come file di preset", "Scrive mixer-1.toml (o il prossimo numero libero) accanto a mixer.toml. Rinominalo come vuoi: mixer-<name>.toml.");
         /* Audition: a recorded stretch of the game's sound, looped through
          * the mixer in place of the live sound. */
         s_mx_aud_keep = apu_bus_audition_kept_seconds();
-        choice("Audition recording", &s_mx_aud_keep, k_mx_keep, k_mx_keep_v, 3, "Keeps the last 30 or 60 seconds of the game's sound in memory while you play (about 3 MB per second), so you can loop it below. Off records nothing and holds no memory.");
+        choice("Registrazione di prova", &s_mx_aud_keep, k_mx_keep, k_mx_keep_v, 3, "Tiene in memoria gli ultimi 30 o 60 secondi del suono del gioco mentre giochi (circa 3 MB al secondo), cosi' puoi ripeterli qui sotto. Spento non registra niente e non occupa memoria.");
         {
             apu_bus_audition_info ai;
             apu_bus_audition_get(&ai);
             const int st = apu_bus_audition_state();
-            MxItem &au = act(MA_AUD, "Audition", "A loops the recording through the mixer in place of the live sound (the game keeps running, unheard), so every change is heard on the same material. A again returns to the live sound. Right selects the saved clip instead. The loop point is cross-faded over 2 s.");
+            MxItem &au = act(MA_AUD, "Prova", "A fa girare la registrazione nel mixer al posto del suono dal vivo (il gioco continua a girare, in silenzio), cosi' ogni modifica si sente sullo stesso materiale. A di nuovo torna al suono dal vivo. Destra sceglie invece il clip salvato. Il punto di loop e' sfumato in 2 s.");
             if (st == APU_BUS_AUD_OFF)
-                snprintf(au.text, sizeof au.text, s_mx_aud_keep ? "Off (live sound), %.0f s recorded" : "Off (live sound)", (double)ai.kept_s);
+                snprintf(au.text, sizeof au.text, s_mx_aud_keep ? "Spento (suono dal vivo), %.0f s registrati" : "Spento (suono dal vivo)", (double)ai.kept_s);
             else
-                snprintf(au.text, sizeof au.text, "%s  %.1f / %.1f s", st == APU_BUS_AUD_FILE ? "Looping the saved clip" : "Looping the recording",
+                snprintf(au.text, sizeof au.text, "%s  %.1f / %.1f s", st == APU_BUS_AUD_FILE ? "Ripete il clip salvato" : "Ripete la registrazione",
                          (double)ai.position_s, (double)ai.length_s);
             if (st != APU_BUS_AUD_OFF)
-                act(MA_AUD_SAVE, "Save this clip", "Saves the looping clip to mixer-audition.clip beside mixer.toml, so you can loop it again after a restart.");
+                act(MA_AUD_SAVE, "Salva questo clip", "Salva il clip in mixer-audition.clip accanto a mixer.toml, cosi' puoi ripeterlo di nuovo dopo un riavvio.");
         }
         for (int b = 0; b < nbus; b++) {
             static char bus_hint[32][220];      /* the item keeps the pointer; one per bus */
-            snprintf(bus_hint[b & 31], sizeof bus_hint[0], "Left / right: the bus gain, 0.5 dB a step (hold: faster). %s: its route, sends, trims and LFE send. LB mutes, RB solos, %s resets the bus.",
+            snprintf(bus_hint[b & 31], sizeof bus_hint[0], "Sinistra / destra: il gain della bus, 0,5 dB per passo (tieni premuto: piu' veloce). %s: la sua rotta, gli invii, i trim e l'invio LFE. LB silenzia, RB isola, %s azzera la bus.",
                      act_name(0), act_name(3));
             MxItem &m = add(MK_BUS, apu_bus_name(b), bus_hint[b & 31]);
             m.bus = b;
             m.f = &c.bus[b].gain_db;
             m.mn = -60.0f; m.mx = 12.0f; m.step = 0.5f; m.off_below = true;
         }
-        choice("Limiter", &c.limiter, k_mx_lim, k_mx_lim_v, 3, "What happens above the ceiling. Off: samples past full scale are clamped, as shipped. Soft clip: a tanh knee from 3 dB under the ceiling, no delay. Peak limiter: 64 samples of look-ahead, all channels linked.");
-        db("Ceiling", &c.ceiling_db, -12.0f, 0.0f, false, "The level the soft clip or the limiter holds, dBFS.");
-        choice("LFE low-pass", &c.lfe_lowpass_hz, k_mx_hz, k_mx_hz_v, 6, "A 24 dB/octave low-pass on the LFE feed. The console's Dolby Digital encoder band-limited the LFE at 120 Hz; here the game's LFE feed is full range unless this is on.");
-        choice("Mains high-pass", &c.mains_highpass_hz, k_mx_hz, k_mx_hz_v, 6, "A 24 dB/octave high-pass on the five main speakers (all buses), for small speakers with the bass sent to the LFE.");
-        act(MA_SPEAKERS, "Speakers: trim and delay", "A level trim and a delay for each of the six speakers.");
-        MxItem &dk = act(MA_DUCK, "Ducking", "One slot: a bus goes down while another sounds.");
+        choice("Limitatore", &c.limiter, k_mx_lim, k_mx_lim_v, 3, "Cosa succede sopra il soffitto. Spento: i campioni oltre il fondo scala vengono limitati, come in origine. Soft clip: un ginocchio tanh da 3 dB sotto il soffitto, senza ritardo. Peak limiter: 64 campioni di anticipo, tutti i canali collegati.");
+        db("Soffitto", &c.ceiling_db, -12.0f, 0.0f, false, "Il livello che il soft clip o il limitatore tengono, dBFS.");
+        choice("Passa-basso LFE", &c.lfe_lowpass_hz, k_mx_hz, k_mx_hz_v, 6, "Un passa-basso a 24 dB/ottava sul segnale LFE. L'encoder Dolby Digital della console limitava l'LFE a 120 Hz; qui il segnale LFE del gioco e' a tutta banda se questo non e' acceso.");
+        choice("Passa-alto dei diffusori principali", &c.mains_highpass_hz, k_mx_hz, k_mx_hz_v, 6, "Un passa-alto a 24 dB/ottava sui cinque diffusori principali (tutte le bus), per diffusori piccoli con i bassi mandati all'LFE.");
+        act(MA_SPEAKERS, "Diffusori: trim e ritardo", "Un trim di livello e un ritardo per ciascuno dei sei diffusori.");
+        MxItem &dk = act(MA_DUCK, "Ducking", "Uno slot: una bus scende mentre un'altra suona.");
         if (c.duck.enabled)
             snprintf(dk.text, sizeof dk.text, "%s under %s, %.1f dB", apu_bus_name(c.duck.target),
                      apu_bus_name(c.duck.source), (double)c.duck.depth_db);
         else
-            snprintf(dk.text, sizeof dk.text, "Off");
-        act(MA_RESET_OVERS, "Reset the over-full-scale counters", NULL);
+            snprintf(dk.text, sizeof dk.text, "Spento");
+        act(MA_RESET_OVERS, "Azzera i contatori oltre il fondo scala", NULL);
     } else if (s_mx_view == MX_BUS) {
         apu_bus_params &p = c.bus[s_mx_bus];
-        db("Gain", &p.gain_db, -60.0f, 12.0f, true, "The whole bus.");
-        { MxItem &m = add(MK_BOOL, "Mute", NULL); m.i = &p.mute; }
-        { MxItem &m = add(MK_BOOL, "Solo", "Only the soloed buses sound."); m.i = &p.solo; }
-        choice("Route", &p.route, k_mx_route, k_mx_route_v, 3, "The game's panning: its own speaker sends, with trims and field shaping (for sounds the game positions). Sends: six sends of your own at the sound's level. A place in the room: the sound panned to a position in the 5.1 plane, constant power (for music, the player's engine and exhaust, speech, UI).");
+        db("Gain", &p.gain_db, -60.0f, 12.0f, true, "Tutta la bus.");
+        { MxItem &m = add(MK_BOOL, "Muto", NULL); m.i = &p.mute; }
+        { MxItem &m = add(MK_BOOL, "Solo", "Suonano solo le bus in solo."); m.i = &p.solo; }
+        choice("Rotta", &p.route, k_mx_route, k_mx_route_v, 3, "Il pan del gioco: i suoi invii ai diffusori, con trim e sagoma del campo (per i suoni che il gioco posiziona). Invii: sei invii tuoi al livello del suono. Un posto nella stanza: il suono panato verso una posizione nel piano 5.1, a potenza costante (per la musica, il motore e lo scarico del giocatore, le voci, l'interfaccia).");
         if (p.route == APU_BUS_ROUTE_PAN) {
-            MxItem &mv = act(MA_PAN_MOVE, "Position", "A / Enter, then the D-pad or stick moves the sound in the room; A or B when done. Or drag in the diagram with the mouse. The room's corners are the speakers (FL, FR, SL, SR), C is the middle of the front wall, the listener sits in the middle.");
-            snprintf(mv.text, sizeof mv.text, "%s", s_mx_grab ? "moving..." : "move");
-            unit("Position X (left - right)", &p.pan_x, -1.0f, 1.0f, "-1 is the left wall, +1 the right one.");
-            unit("Position Y (rear - front)", &p.pan_y, -1.0f, 1.0f, "-1 is the rear wall, +1 the front one, 0 the listener's row: there all five speakers share the sound.");
-            unit("Width", &p.pan_width, 0.0f, 1.0f, "A stereo sound's left and right channels sit this far to the left and right of the position (1 at the front: left on FL, right on FR). A mono sound is put at both places with half its power each, which spreads it to the neighbouring speakers.");
-            unit("Centre divergence", &p.pan_divergence, 0.0f, 1.0f, "0: what falls on the centre speaker stays there. 1: it is played by FL and FR instead, at -3 dB each (a phantom centre).");
+            MxItem &mv = act(MA_PAN_MOVE, "Posizione", "A / Invio, poi il direzionale o l'analogico muove il suono nella stanza; A o B quando hai finito. Oppure trascina nel diagramma con il mouse. Gli angoli della stanza sono i diffusori (FL, FR, SL, SR), C e' il centro della parete anteriore, l'ascoltatore sta in mezzo.");
+            snprintf(mv.text, sizeof mv.text, "%s", s_mx_grab ? "in movimento..." : "muovi");
+            unit("Posizione X (sinistra - destra)", &p.pan_x, -1.0f, 1.0f, "-1 e' la parete sinistra, +1 quella destra.");
+            unit("Posizione Y (posteriore - anteriore)", &p.pan_y, -1.0f, 1.0f, "-1 e' la parete posteriore, +1 quella anteriore, 0 la fila dell'ascoltatore: li' tutti e cinque i diffusori condividono il suono.");
+            unit("Larghezza", &p.pan_width, 0.0f, 1.0f, "I canali sinistro e destro di un suono stereo stanno a questa distanza a sinistra e a destra della posizione (1 sul fronte: sinistro su FL, destro su FR). Un suono mono e' messo in entrambi i punti con meta' potenza ciascuno, e questo lo sparge sui diffusori vicini.");
+            unit("Divergenza centrale", &p.pan_divergence, 0.0f, 1.0f, "0: quello che arriva al diffusore centrale ci resta. 1: lo suonano invece FL e FR, a -3 dB ciascuno (un centro fantasma).");
         } else if (p.route == APU_BUS_ROUTE_TITLE) {
-            unit("Field width", &p.field_width, 0.0f, 2.0f, "The game's left/right spread of each sound, front pair and surround pair alike: 1 as the game pans, 0 everything on the centre line, 2 wider. A sound's power stays the same.");
-            unit("Centre divergence", &p.field_divergence, -1.0f, 1.0f, "Above 0: that share of what the game sends to the centre speaker goes to FL and FR instead. Below 0: that share of what FL and FR have in common goes to the centre. 0 as the game pans.");
-            db("Front trim", &p.trim_db[APU_BUS_TRIM_FRONT], -60.0f, 12.0f, true, "Front left and right, relative to the game's own panning.");
-            db("Centre trim", &p.trim_db[APU_BUS_TRIM_CENTRE], -60.0f, 12.0f, true, "The centre, relative to the game's own panning.");
-            db("Rear trim", &p.trim_db[APU_BUS_TRIM_REAR], -60.0f, 12.0f, true, "The surrounds, relative to the game's own panning.");
-            db("LFE trim", &p.trim_db[APU_BUS_TRIM_LFE], -60.0f, 12.0f, true, "What the game itself sends to the LFE from this bus.");
+            unit("Larghezza del campo", &p.field_width, 0.0f, 2.0f, "L'apertura sinistra/destra di ogni suono secondo il gioco, sia per la coppia frontale sia per quella surround: 1 come panneggia il gioco, 0 tutto sulla linea centrale, 2 piu' aperto. La potenza del suono non cambia.");
+            unit("Divergenza centrale", &p.field_divergence, -1.0f, 1.0f, "Sopra 0: quella quota di quello che il gioco manda al diffusore centrale va invece a FL e FR. Sotto 0: quella quota di quello che FL e FR hanno in comune va al centro. 0 come panneggia il gioco.");
+            db("Trim anteriore", &p.trim_db[APU_BUS_TRIM_FRONT], -60.0f, 12.0f, true, "Sinistro e destro anteriori, rispetto al pan del gioco.");
+            db("Trim centrale", &p.trim_db[APU_BUS_TRIM_CENTRE], -60.0f, 12.0f, true, "Il centro, rispetto al pan del gioco.");
+            db("Trim posteriore", &p.trim_db[APU_BUS_TRIM_REAR], -60.0f, 12.0f, true, "I surround, rispetto al pan del gioco.");
+            db("Trim LFE", &p.trim_db[APU_BUS_TRIM_LFE], -60.0f, 12.0f, true, "Quello che il gioco manda all'LFE da questa bus.");
         } else {
-            static const char *const sn[6] = { "Send to front left", "Send to front right", "Send to centre",
-                                               "Send to LFE (full range)", "Send to surround left", "Send to surround right" };
+            static const char *const sn[6] = { "Invia a front left", "Invia a front right", "Invia al centro",
+                                               "Invia all'LFE (tutta banda)", "Invia a surround left", "Invia a surround right" };
             static const int order[6] = { 0, 1, 2, 4, 5, 3 };
             for (int k = 0; k < 6; k++)
                 db(sn[order[k]], &p.send_db[order[k]], -60.0f, 12.0f, true,
-                   "0 dB is the sound's own level. A: off / 0 dB. Left / right: 0.5 dB a step, faster when held; under -60 dB the send is off.");
+                   "0 dB e' il livello del suono stesso. A: spento / 0 dB. Sinistra / destra: 0,5 dB per passo, piu' veloce tenendo premuto; sotto i -60 dB l'invio e' spento.");
         }
-        db("LFE send (through the crossover)", &p.lfe_send_db, -40.0f, 12.0f, true, "An extra send of the bus to the LFE through the low-pass below, on top of the route. Off by default; A switches it between off and -10 dB.");
+        db("Invio LFE (attraverso il crossover)", &p.lfe_send_db, -40.0f, 12.0f, true, "Un invio extra della bus all'LFE attraverso il passa-basso qui sotto, in piu' alla rotta. Spento per default; A lo commuta fra spento e -10 dB.");
         it[n - 1].on_db = -10.0f;
-        choice("LFE send crossover", &p.lfe_crossover_hz, k_mx_xo, k_mx_hz_v, 6, "The 24 dB/octave low-pass on that send.");
-        act(MA_BUS_RESET, "Reset this bus", NULL);
+        choice("Crossover dell'invio LFE", &p.lfe_crossover_hz, k_mx_xo, k_mx_hz_v, 6, "Il passa-basso a 24 dB/ottava di quell'invio.");
+        act(MA_BUS_RESET, "Azzera questa bus", NULL);
     } else if (s_mx_view == MX_SPEAKERS) {
-        static const char *const tn[6] = { "Front left trim", "Front right trim", "Centre trim", "LFE trim",
-                                           "Surround left trim", "Surround right trim" };
-        static const char *const dn[6] = { "Front left delay", "Front right delay", "Centre delay", "LFE delay",
-                                           "Surround left delay", "Surround right delay" };
+        static const char *const tn[6] = { "Trim front left", "Trim front right", "Trim centrale", "Trim LFE",
+                                           "Trim surround left", "Trim surround right" };
+        static const char *const dn[6] = { "Ritardo front left", "Ritardo front right", "Ritardo centrale", "Ritardo LFE",
+                                           "Ritardo surround left", "Ritardo surround right" };
         for (int s = 0; s < 6; s++)
-            db(tn[s], &c.speaker_trim_db[s], -24.0f, 12.0f, false, "After the mix, before the limiter. On a stereo output only the front pair applies.");
+            db(tn[s], &c.speaker_trim_db[s], -24.0f, 12.0f, false, "Dopo la mix, prima del limitatore. Su un'uscita stereo vale solo la coppia frontale.");
         for (int s = 0; s < 6; s++) {
-            MxItem &m = add(MK_MS, dn[s], "0 to 50 ms, in steps of 0.5 ms (24 samples): 1 ms is 34 cm of path.");
+            MxItem &m = add(MK_MS, dn[s], "Da 0 a 50 ms, a passi di 0,5 ms (24 campioni): 1 ms sono 34 cm di percorso.");
             m.f = &c.speaker_delay_ms[s]; m.mn = 0.0f; m.mx = 50.0f; m.step = 0.5f;
         }
     } else {
@@ -351,13 +351,13 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
             s_mx_busname_p[b] = s_mx_busnames[b];
             s_mx_busvals[b] = b;
         }
-        { MxItem &m = add(MK_BOOL, "Ducking", "The target bus goes down by the depth while the source bus is above the threshold."); m.i = &c.duck.enabled; }
-        choice("Source", &c.duck.source, s_mx_busname_p, s_mx_busvals, nbus, "The bus that is listened to.");
-        choice("Target", &c.duck.target, s_mx_busname_p, s_mx_busvals, nbus, "The bus that goes down.");
-        db("Threshold", &c.duck.threshold_db, -60.0f, 0.0f, false, "The source's level, dBFS RMS over a 0.67 ms frame, above which the target is ducked.");
-        db("Depth", &c.duck.depth_db, 0.5f, 24.0f, false, "How far the target goes down, dB.");
-        { MxItem &m = add(MK_MS, "Attack", "Time constant of the way down."); m.f = &c.duck.attack_ms; m.mn = 1.0f; m.mx = 500.0f; m.step = 5.0f; }
-        { MxItem &m = add(MK_MS, "Release", "Time constant of the way back."); m.f = &c.duck.release_ms; m.mn = 10.0f; m.mx = 3000.0f; m.step = 50.0f; }
+        { MxItem &m = add(MK_BOOL, "Ducking", "La bus di destinazione scende della profondita' mentre quella di sorgente e' sopra la soglia."); m.i = &c.duck.enabled; }
+        choice("Sorgente", &c.duck.source, s_mx_busname_p, s_mx_busvals, nbus, "La bus che si ascolta.");
+        choice("Destinazione", &c.duck.target, s_mx_busname_p, s_mx_busvals, nbus, "La bus che scende.");
+        db("Soglia", &c.duck.threshold_db, -60.0f, 0.0f, false, "Il livello della sorgente, dBFS RMS su un frame di 0,67 ms, oltre il quale la destinazione scende.");
+        db("Profondita'", &c.duck.depth_db, 0.5f, 24.0f, false, "Quanto scende la destinazione, dB.");
+        { MxItem &m = add(MK_MS, "Attacco", "Costante di tempo della discesa."); m.f = &c.duck.attack_ms; m.mn = 1.0f; m.mx = 500.0f; m.step = 5.0f; }
+        { MxItem &m = add(MK_MS, "Rilascio", "Costante di tempo del ritorno."); m.f = &c.duck.release_ms; m.mn = 10.0f; m.mx = 3000.0f; m.step = 50.0f; }
     }
     return n;
 }
@@ -442,7 +442,7 @@ static bool mx_adjust(MxItem &m, int dir, apu_bus_config &c)
             mx_aud_path(path, sizeof path);
             if (dir > 0) {
                 if (apu_bus_audition_loop_file(path) != 0)
-                    snprintf(s_mx_note, sizeof s_mx_note, "No saved clip (mixer-audition.clip) to loop.");
+                    snprintf(s_mx_note, sizeof s_mx_note, "Nessun clip salvato (mixer-audition.clip) da ripetere.");
             } else {
                 apu_bus_audition_stop();
             }
@@ -490,7 +490,7 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
         if (mx_preset_get(s_mx_preset_idx, &p)) {
             if (s_mx_live_b) mx_ab_toggle();
             c = p;
-            snprintf(s_mx_note, sizeof s_mx_note, "Loaded \"%s\" into A.", mx_preset_name(s_mx_preset_idx));
+            snprintf(s_mx_note, sizeof s_mx_note, "\"%s\" caricato in A.", mx_preset_name(s_mx_preset_idx));
             return true;
         }
         snprintf(s_mx_note, sizeof s_mx_note, "\"%s\" could not be read.", mx_preset_name(s_mx_preset_idx));
@@ -505,9 +505,9 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
             FILE *f = fopen(path, "rb");
             if (f) { fclose(f); continue; }
             if (apu_bus_save_file(path, &a) == 0)
-                snprintf(s_mx_note, sizeof s_mx_note, "Saved mixer-%d.toml beside mixer.toml.", k);
+                snprintf(s_mx_note, sizeof s_mx_note, "Salvato mixer-%d.toml accanto a mixer.toml.", k);
             else
-                snprintf(s_mx_note, sizeof s_mx_note, "Could not write %s.", path);
+                snprintf(s_mx_note, sizeof s_mx_note, "Impossibile scrivere %s.", path);
             break;
         }
         mx_scan_user();
@@ -519,16 +519,16 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
             apu_bus_audition_stop();
         else if (apu_bus_audition_loop_last() != 0)
             snprintf(s_mx_note, sizeof s_mx_note, apu_bus_audition_kept_seconds()
-                     ? "Not enough recorded yet: play for at least five seconds, then loop."
-                     : "No recording yet: set Audition recording to 30 or 60 s, play a while, then loop.");
+                     ? "Non c'e' ancora abbastanza registrato: gioca almeno cinque secondi, poi ripeti."
+                     : "Non c'e' ancora nessuna registrazione: imposta Registrazione di prova a 30 o 60 s, gioca un po', poi ripeti.");
         return false;
     case MA_AUD_SAVE: {
         char path[1200];
         mx_aud_path(path, sizeof path);
         if (apu_bus_audition_save(path) == 0)
-            snprintf(s_mx_note, sizeof s_mx_note, "Saved the clip as mixer-audition.clip beside mixer.toml.");
+            snprintf(s_mx_note, sizeof s_mx_note, "Clip salvato come mixer-audition.clip accanto a mixer.toml.");
         else
-            snprintf(s_mx_note, sizeof s_mx_note, "Could not write %s.", path);
+            snprintf(s_mx_note, sizeof s_mx_note, "Impossibile scrivere %s.", path);
         return false;
     }
     case MA_SPEAKERS: s_mx_view = MX_SPEAKERS; s_mx_scroll = true; return false;
@@ -554,7 +554,7 @@ static void mx_value(const MxItem &m, char *out, size_t n)
         break;
     case MK_MS: snprintf(out, n, "%.1f ms", (double)*m.f); break;
     case MK_UNIT: snprintf(out, n, "%+.2f", (double)*m.f); break;
-    case MK_BOOL: snprintf(out, n, "%s", *m.i ? "On" : "Off"); break;
+    case MK_BOOL: snprintf(out, n, "%s", *m.i ? "Acceso" : "Spento"); break;
     case MK_CHOICE: {
         const char *t = "";
         for (int j = 0; j < m.nvals; j++)
@@ -767,14 +767,14 @@ static void build_mixer(float fs, ImDrawList *dl)
         ImVec2 p = ImGui::GetCursorScreenPos();
         char t[160];
         if (s_mx_view == MX_BUS) snprintf(t, sizeof t, "Mixer  >  %s", apu_bus_name(s_mx_bus));
-        else if (s_mx_view == MX_SPEAKERS) snprintf(t, sizeof t, "Mixer  >  Speakers");
+        else if (s_mx_view == MX_SPEAKERS) snprintf(t, sizeof t, "Mixer  >  Diffusori");
         else if (s_mx_view == MX_DUCK) snprintf(t, sizeof t, "Mixer  >  Ducking");
         else snprintf(t, sizeof t, "Mixer");
         dl->AddText(ImVec2(p.x, p.y), col(T->text_hi), t);
         if (apu_bus_enabled()) {
             const char *l = apu_bus_audition_state() != APU_BUS_AUD_OFF
-                ? (s_mx_live_b ? "AUDITION LOOP, B" : "AUDITION LOOP, A")
-                : s_mx_live_b ? "listening to B" : "listening to A";
+                ? (s_mx_live_b ? "PROVA IN RIPETIZIONE, B" : "PROVA IN RIPETIZIONE, A")
+                : s_mx_live_b ? "in ascolto di B" : "in ascolto di A";
             float w = ImGui::CalcTextSize(l).x;
             dl->AddText(ImVec2(p.x + ImGui::GetContentRegionAvail().x - w - fs * 0.5f, p.y),
                         s_mx_live_b ? col(T->warn) : col(T->hint), l);
@@ -834,10 +834,10 @@ static void build_mixer(float fs, ImDrawList *dl)
             float x = p.x + rw * 0.36f;
             if (bp.mute) { cdl->AddText(ImVec2(x, ty), col(T->warn), "M"); }
             if (bp.solo) { cdl->AddText(ImVec2(x + fs * 1.1f, ty), col(T->perf_good), "S"); }
-            if (bp.route == APU_BUS_ROUTE_SENDS) cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->hint), "sends");
+            if (bp.route == APU_BUS_ROUTE_SENDS) cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->hint), "invii");
             else if (bp.lfe_send_db > APU_BUS_OFF_DB || bp.trim_db[0] != 0 || bp.trim_db[1] != 0
                      || bp.trim_db[2] != 0 || bp.trim_db[3] != 0)
-                cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->hint), "trims");
+                cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->hint), "trim");
             mx_meter(cdl, ImVec2(p.x + rw * 0.50f, p.y + rh * 0.36f), rw * 0.27f, rh * 0.28f,
                      mt.bus_rms_db[m.bus], -200.0f, false);
         }
@@ -900,7 +900,7 @@ static void build_mixer(float fs, ImDrawList *dl)
                 overs += mt.spk_over[s];
             }
             char st[200];
-            snprintf(st, sizeof st, "RMS, peak hold (dBFS)     over full scale: %u samples     limiter %.1f dB     duck %.1f dB",
+            snprintf(st, sizeof st, "RMS, picco trattenuto (dBFS)     oltre il fondo scala: %u campioni     limitatore %.1f dB     duck %.1f dB",
                      overs, (double)(mt.limiter_db > 0.05f ? -mt.limiter_db : 0.0f),
                      (double)(mt.duck_db > 0.05f ? -mt.duck_db : 0.0f));
             txt_fit(dl, hs, ImVec2(p.x, y + hs * 2.3f), overs ? col(T->warn) : col(T->hint), st, avail.x);
@@ -913,8 +913,8 @@ static void build_mixer(float fs, ImDrawList *dl)
                         line, nullptr, wrap_w);
         if (s_mx_grab) {
             static char grab[160];
-            snprintf(grab, sizeof grab, pad_hints() ? "D-pad / stick  move the sound in the room      %s or %s  done"
-                                                    : "Arrows  move the sound in the room      %s or %s  done",
+            snprintf(grab, sizeof grab, pad_hints() ? "Direzionale / analogico  muovi il suono nella stanza      %s o %s  fine"
+                                                    : "Frecce  muovi il suono nella stanza      %s o %s  fine",
                      act_name(0), act_name(1));
             foot_set(grab, true);
             return;
@@ -922,13 +922,13 @@ static void build_mixer(float fs, ImDrawList *dl)
         static char keys[240];
         if (pad_hints())
             snprintf(keys, sizeof keys, s_mx_view == MX_MAIN
-                         ? "D-pad  select / change   %s  open   LB  mute   RB  solo   %s  reset   %s  back   Back+Y  A/B"
-                         : "D-pad  select / change    %s  toggle    %s  default    %s  back    Back+Y  A/B",
+                         ? "Direzionale  seleziona / cambia   %s  apri   LB  muto   RB  solo   %s  azzera   %s  indietro   Back+Y  A/B"
+                         : "Direzionale  seleziona / cambia    %s  commuta    %s  default    %s  indietro    Back+Y  A/B",
                      act_name(0), act_name(3), act_name(1));
         else
             snprintf(keys, sizeof keys, "%s", s_mx_view == MX_MAIN
-                         ? "Arrows  select / change   Enter  open   Q  mute   E  solo   Del  reset   Esc  back   F7  A/B"
-                         : "Arrows  select / change    Enter  toggle    Del  default    Esc  back    F7  A/B");
+                         ? "Frecce  seleziona / cambia   Invio  apri   Q  muto   E  solo   Canc  azzera   Esc  indietro   F7  A/B"
+                         : "Frecce  seleziona / cambia    Invio  commuta    Canc  default    Esc  indietro    F7  A/B");
         foot_set(keys);
     }
 }
