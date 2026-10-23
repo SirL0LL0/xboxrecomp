@@ -19,12 +19,12 @@ extern "C" void xbox_OverlayMetalDraw(void *device, void *cmdbuf, void *rpdesc, 
 {
     if (s_failed)
         return;
+    /* The context is the main thread's to make (xbox_OverlayPlatformFrame). */
+    if (!overlay_core_is_ready())
+        return;
+    overlay_lock();
+    struct unlock_at_end { ~unlock_at_end() { overlay_unlock(); } } unlock_guard;
     if (!s_init) {
-        if (!overlay_core_init(false)) {
-            s_failed = true;
-            overlay_fail();
-            return;
-        }
         ImGui_ImplMetal_Init((__bridge id<MTLDevice>)device);
         s_init = true;
         fprintf(stderr, "[OVERLAY] Dear ImGui %s, Metal renderer\n", IMGUI_VERSION);

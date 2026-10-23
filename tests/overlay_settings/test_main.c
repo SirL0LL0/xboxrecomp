@@ -72,6 +72,14 @@ void nv2a_host_set_hdr_levels(int w, float a, float b, float c) { (void)w; (void
 void nv2a_host_set_hdr_tone(int which, float v) { (void)which; (void)v; }        /* BO-110 */
 static unsigned st_ui_scale = 99;
 void nv2a_texscale_set_factor(unsigned f) { st_ui_scale = f; }
+/* BO-245: graphics.texture_upscale, its scale and the road switch. */
+static int st_texup = -1, st_texup_roads = -1;
+static unsigned st_texup_scale;
+void nv2a_texup_set_algo(int a) { st_texup = a; }
+void nv2a_texup_set_scale(unsigned s) { st_texup_scale = s; }
+void nv2a_texup_set_roads(int on) { st_texup_roads = on; }
+static int st_texup_preload = -1;
+void nv2a_texup_set_preload(int on) { st_texup_preload = on; }
 #if !defined(_WIN32)
 /* The file writer's one-at-a-time flag (src/platform/win32_compat.c). */
 int32_t InterlockedExchange(volatile int32_t *p, int32_t v)
@@ -134,6 +142,32 @@ static void test_restart_flags(void)
     CHECK(flagged >= 3);
 }
 
+/* Every setting has its row in the table: the table is indexed by the
+ * enum (designated), so a setting added to the enum without one would be a
+ * row of zeros. Each key once. */
+static void test_table_whole(void)
+{
+    int i, j;
+
+    for (i = 0; i < XS_COUNT; i++) {
+        const xs_setting *s = xbox_SettingGet((xs_id)i);
+        if (!s->key || !*s->key) {
+            (printf)("FAIL setting %d has no row in the table\n", i);
+            s_fail++;
+            continue;
+        }
+        for (j = 0; j < i; j++)
+            if (xbox_SettingGet((xs_id)j)->key && !strcmp(xbox_SettingGet((xs_id)j)->key, s->key)) {
+                (printf)("FAIL %s twice in the table (%d, %d)\n", s->key, j, i);
+                s_fail++;
+            }
+        if (s->type == XS_CHOICE && (!s->choices || !s->choices[0])) {
+            (printf)("FAIL %s: a choice without choices\n", s->key);
+            s_fail++;
+        }
+    }
+}
+
 int main(void)
 {
     const char *path = "overlay_settings_test.toml";
@@ -150,6 +184,7 @@ int main(void)
         "volume = 0.5\n"               /* the environment sets it too */
         "mute = true\n"
         "custom_music_dir = \"/music/My \\\"Best\\\" \xC5\x90szi \xC5\xB1r\"\n"   /* a text setting, UTF-8 */
+        "custom_music_soundtrack = \"\"\n"   /* BO-230: an empty value that means something (EA GAMES TRAX chosen) */
         "[input]\n"
         "deadzone = 3277\n"
         "rumble = 1.8\n"               /* an older slider's value, between two steps */
@@ -179,6 +214,8 @@ int main(void)
     set_env("RECOMP_AUDIO_MENU_SOUNDS", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
     set_env("RECOMP_GFX_SCENERY_DETAIL", NULL);
+    set_env("RECOMP_GFX_RIVAL_MARKER", NULL);
+    set_env("RECOMP_DISPLAY_CRASHNAV_MAP", NULL);
     set_env("RECOMP_GAME_RACE_CLOCK", NULL);
 
     /* A release build, nothing in the environment: quiet until the file says. */
@@ -196,12 +233,18 @@ int main(void)
     /* The saved diagnostic_log = true is in force at start, by "setting". */
     CHECK(g_xr_log_diag == 1 && !xr_log_forced() && !strcmp(xr_log_source(), "setting"));
     test_restart_flags();
+    test_table_whole();
     /* A text setting: into its variable, readable, not "unknown". */
     CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
           && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
     {
         int locked = 1;
         CHECK(!strcmp(xbox_SettingsText("audio.custom_music_dir", &locked), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
+        /* BO-230: the soundtrack choice: "" in the file is a value, no key is not */
+        CHECK(xbox_SettingsTextIsSet("audio.custom_music_soundtrack") && !xbox_SettingsText("audio.custom_music_soundtrack", NULL)[0]);
+        CHECK(xbox_SettingsTextIsSet("audio.custom_music_dir") && !xbox_SettingsTextIsSet("display.present_mode"));
+        CHECK(xbox_SettingValue(XS_AUDIO_CUSTOM_AT_START) == 1 && !xbox_SettingGet(XS_AUDIO_CUSTOM_AT_START)->user
+              && !strcmp(xbox_SettingGet(XS_AUDIO_CUSTOM_AT_START)->key, "audio.custom_music_at_start"));
         CHECK(!locked);
         CHECK(!strcmp(xbox_SettingsText("no.such_key", NULL), ""));
     }
@@ -304,6 +347,36 @@ int main(void)
         xbox_SettingReset(XS_GRAPHICS_SCENERY_DETAIL);
         e = recomp_env(RENV_GFX_SCENERY_DETAIL);
         CHECK(!e || !*e || !strcmp(e, "original"));
+    }
+    {
+        /* The rival marker's switch (a guest patch at "farther"): as
+         * shipped by default, live, and back. */
+        const char *e = recomp_env(RENV_GFX_RIVAL_MARKER);
+        CHECK(xbox_SettingValue(XS_DISPLAY_RIVAL_MARKER) == 0 && !xbox_SettingGet(XS_DISPLAY_RIVAL_MARKER)->user);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+        CHECK(!strcmp(xbox_SettingGet(XS_DISPLAY_RIVAL_MARKER)->key, "display.rival_marker"));
+        xbox_SettingSet(XS_DISPLAY_RIVAL_MARKER, 1);
+        e = recomp_env(RENV_GFX_RIVAL_MARKER);
+        CHECK(e && !strcmp(e, "farther"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_DISPLAY_RIVAL_MARKER);
+        e = recomp_env(RENV_GFX_RIVAL_MARKER);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+    }
+    {
+        /* The Crash Nav map's shape with the widescreen HUD (BO-222):
+         * stretched by default, live, and back. */
+        const char *e = recomp_env(RENV_DISPLAY_CRASHNAV_MAP);
+        CHECK(xbox_SettingValue(XS_DISPLAY_CRASHNAV_MAP) == 0 && !xbox_SettingGet(XS_DISPLAY_CRASHNAV_MAP)->user);
+        CHECK(!e || !*e || !strcmp(e, "stretched"));
+        CHECK(!strcmp(xbox_SettingGet(XS_DISPLAY_CRASHNAV_MAP)->key, "display.crashnav_map"));
+        xbox_SettingSet(XS_DISPLAY_CRASHNAV_MAP, 1);
+        e = recomp_env(RENV_DISPLAY_CRASHNAV_MAP);
+        CHECK(e && !strcmp(e, "native"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_DISPLAY_CRASHNAV_MAP);
+        e = recomp_env(RENV_DISPLAY_CRASHNAV_MAP);
+        CHECK(!e || !*e || !strcmp(e, "stretched"));
     }
     {
         /* The score board (a host hook, BO-165): original untouched, a
@@ -439,6 +512,12 @@ int main(void)
     CHECK(st_trigger == 20);
     xbox_SettingSet(XS_DISPLAY_FIT, 1);
     CHECK(st_fit == 1);
+    /* BO-235: the third choice reaches the layout as 2 and the environment as "fill". */
+    xbox_SettingSet(XS_DISPLAY_OVERSCAN, 2);
+    CHECK(st_overscan == 2);
+    CHECK(recomp_env(RENV_PRESENT_OVERSCAN) && !strcmp(recomp_env(RENV_PRESENT_OVERSCAN), "fill"));
+    xbox_SettingSet(XS_DISPLAY_OVERSCAN, 1);
+    CHECK(st_overscan == 1 && !strcmp(recomp_env(RENV_PRESENT_OVERSCAN), "crop"));
     xbox_SettingSet(XS_DISPLAY_OVERSCAN, 0);
     CHECK(st_overscan == 0);
     xbox_SettingSet(XS_DISPLAY_FILTER, 1);
@@ -484,6 +563,31 @@ int main(void)
     xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 0);
     CHECK(st_ui_scale == 0);
     CHECK(recomp_env(RENV_GFX_UI_SCALE) && !strcmp(recomp_env(RENV_GFX_UI_SCALE), "off"));
+    /* BO-245: the world's textures: off as shipped, live; the scale and
+     * the road switch. */
+    CHECK(xbox_SettingValue(XS_GRAPHICS_TEXUP) == 0);
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_TEXUP)->key, "graphics.texture_upscale"));
+    xbox_SettingSet(XS_GRAPHICS_TEXUP, 1);
+    CHECK(st_texup == 1);
+    CHECK(recomp_env(RENV_GFX_TEXUP) && !strcmp(recomp_env(RENV_GFX_TEXUP), "fsrcnnx"));
+    xbox_SettingSet(XS_GRAPHICS_TEXUP, 2);
+    CHECK(st_texup == 2);
+    xbox_SettingSet(XS_GRAPHICS_TEXUP_SCALE, 1);
+    CHECK(st_texup_scale == 4);
+    xbox_SettingSet(XS_GRAPHICS_TEXUP_SCALE, 0);
+    CHECK(st_texup_scale == 2);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_TEXUP_ROADS) == 0);
+    xbox_SettingSet(XS_GRAPHICS_TEXUP_ROADS, 1);
+    CHECK(st_texup_roads == 1);
+    xbox_SettingSet(XS_GRAPHICS_TEXUP_ROADS, 0);
+    CHECK(st_texup_roads == 0);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_TEXUP_PRELOAD) == 1);   /* BO-272: on as shipped */
+    xbox_SettingSet(XS_GRAPHICS_TEXUP_PRELOAD, 0);
+    CHECK(st_texup_preload == 0);
+    xbox_SettingSet(XS_GRAPHICS_TEXUP_PRELOAD, 1);
+    CHECK(st_texup_preload == 1);
+    xbox_SettingSet(XS_GRAPHICS_TEXUP, 0);
+    CHECK(st_texup == 0);
     xbox_SettingSet(XS_GRAPHICS_AA, 1);
     xbox_SettingSet(XS_GRAPHICS_SHARPEN, 0.4);
     CHECK(st_aa == 1 && st_sharpen > 0.39f && st_sharpen < 0.41f);
@@ -556,6 +660,8 @@ int main(void)
             const char *m = strstr(text, "custom_music_dir = \"/music/My \\\"Best\\\" \xC5\x90szi \xC5\xB1r\"");
             CHECK(m && a && m > a);
             CHECK(!strstr(text, "audio.custom_music_dir"));
+            CHECK(strstr(text, "custom_music_soundtrack = \"\""));             /* BO-230: kept empty */
+            CHECK(!strstr(text, "custom_music_at_start"));                      /* untouched: not written */
         }
         CHECK(strstr(text, "mode = \"performance\""));
         CHECK(strstr(text, "deadzone = 6554"));
@@ -579,6 +685,24 @@ int main(void)
                 CHECK(c && c > g);
             }
         }
+    }
+
+    /* Two text settings of a section no stepped setting opened: one header
+     * (a second [console] would be an error for TOML and the reader). */
+    xbox_SettingsSetText("console.hdd_key", "00112233445566778899aabbccddeeff");
+    xbox_SettingsSetText("console.eeprom", "/tmp/eeprom.bin");
+    xbox_SettingsFlush();
+    text = read_file(path);
+    {
+        const char *cs = text ? strstr(text, "[console]") : NULL;
+        char err[256];
+        recomp_cfg *c;
+        CHECK(cs && !strstr(cs + 1, "[console]"));
+        CHECK(cs && strstr(cs, "hdd_key = ") && strstr(cs, "eeprom = "));
+        c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c)
+            recomp_cfg_free(c);
     }
 
     /* Back on: the default, and the file forgets it. */

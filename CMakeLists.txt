@@ -97,7 +97,22 @@ if(XR_SDL_HOST)
         if(Vulkan_FOUND AND glslang_FOUND)
             set(XBOXRECOMP_HAVE_VULKAN ON)
             add_compile_definitions(XBOXRECOMP_HAVE_VULKAN=1)
-            message(STATUS "xboxrecomp: Vulkan backend on (${Vulkan_LIBRARY}, glslang ${glslang_VERSION})")
+            # BO-231: Android, Windows and Linux open the Vulkan loader at run
+            # time (src/d3d/vk_dyn.h), so a PC without one, or with one too old
+            # for Vulkan 1.3, starts and says so instead of failing in the
+            # system's loader before main. Only the headers are needed to
+            # build; nothing links the Vulkan library. macOS links MoltenVK
+            # (the development path; the shipped Mac build is Metal).
+            add_library(xr_vulkan INTERFACE)
+            if(ANDROID OR WIN32 OR (UNIX AND NOT APPLE))
+                set(XR_VK_DYNAMIC_HOST ON)
+                target_include_directories(xr_vulkan INTERFACE ${Vulkan_INCLUDE_DIRS})
+                message(STATUS "xboxrecomp: Vulkan backend on (loaded at run time, headers ${Vulkan_INCLUDE_DIRS}, glslang ${glslang_VERSION})")
+            else()
+                set(XR_VK_DYNAMIC_HOST OFF)
+                target_link_libraries(xr_vulkan INTERFACE Vulkan::Vulkan)
+                message(STATUS "xboxrecomp: Vulkan backend on (${Vulkan_LIBRARY}, glslang ${glslang_VERSION})")
+            endif()
         elseif(WIN32)
             message(FATAL_ERROR "xboxrecomp: the Windows build needs Vulkan headers/import library "
                     "(Vulkan_INCLUDE_DIR, Vulkan_LIBRARY) and glslang (CMAKE_PREFIX_PATH); "

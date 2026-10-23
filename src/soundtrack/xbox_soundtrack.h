@@ -99,6 +99,12 @@ xst_library *xst_scan_progress(const char *dir, xst_progress *progress);
 void         xst_free(xst_library *lib);
 
 const xst_song *xst_song_by_id(const xst_library *lib, uint32_t id);
+/* Soundtrack i's (0-based, in the title's order) name as UTF-8, as the title
+ * lists it (cut and folded to Latin-1); 0 when there is none. */
+int xst_soundtrack_name(const xst_library *lib, int i, char *out, size_t cap);
+/* The index of the soundtrack that has this name (given as UTF-8, folded the
+ * same way before the comparison), or -1. The first when two share a name. */
+int xst_soundtrack_find(const xst_library *lib, const char *utf8);
 
 /* The ST.DB image: xst_db_size bytes. Returns the bytes written, 0 when
  * `cap` is too small. */
@@ -148,7 +154,8 @@ void        xst_stream_format(const xst_stream *s, unsigned *rate, unsigned *cha
  * (the in-game overlay, driven with a pad): where to start, a folder's
  * folders, and how much music is in each. No drawing here.
  *
- * It opens on the places: the current choice, the home folder, Music,
+ * It opens on the places: the current choice and the folder it is in (in
+ * the current choice the cursor is on ".."), the home folder, Music,
  * Downloads, and what is mounted (/Volumes on macOS; /run/media, /media and
  * /mnt on Linux, the Steam Deck's SD card among them; the drive letters on
  * Windows; shared storage on Android). In a folder the rows are "use this
@@ -159,6 +166,7 @@ void        xst_stream_format(const xst_stream *s, unsigned *rate, unsigned *cha
  */
 #define XSB_MAX_ROWS      1024
 #define XSB_COUNT_BUDGET  20000
+#define XSB_COUNT_MS      3000            /* and as long as a row's count may take */
 
 typedef enum { XSB_USE, XSB_OFF, XSB_UP, XSB_PLACE, XSB_DIR } xsb_kind;
 typedef struct xsb_row {
@@ -197,11 +205,30 @@ void xsb_where(char *out, size_t cap);
  * *select is the row to put the cursor on after a move. */
 xsb_result xsb_activate(int i, char *chosen, size_t cap, int *select);
 /* One level up; from a place's own folder back to the places; from the
- * places XSB_CLOSED. */
+ * places XSB_CLOSED. Entered from the current choice or the folder it is
+ * in, it goes on up to the top of the disk, then to the places. */
 xsb_result xsb_back(int *select);
 /* Tests: the places come from these instead of the system's (home folder,
  * NULL-terminated media roots). NULL, NULL: the system's again. */
 void xsb_set_roots(const char *home, const char *const *media_roots);
+
+/* BO-289. A close never waits for the counting thread: one held by a share
+ * that does not answer leaves on its own later, and its count is dropped.
+ * For a `mark` (it runs on that thread): xsb_stopping() is 1 once the
+ * browser closed or moved to another list, so a long look can give up;
+ * xsb_slow_volume(dir) is 1 for a folder on a network share (macOS smbfs,
+ * nfs, afpfs, webdav, macFUSE; Linux NFS, SMB/CIFS, sshfs, rclone, gvfs;
+ * a Windows network drive), which is counted or checked by its own
+ * entries and not walked. A `mark` may return -1: not known (shown as a
+ * row with `more` and songs 0). */
+int  xsb_stopping(void);
+int  xsb_slow_volume(const char *dir);
+/* Tests: a hook called at each folder a count walks into (on the counting
+ * thread), and a part of a path that makes a folder count as on a slow
+ * volume; NULL, NULL: none. xsb_workers() is the number of counting
+ * threads not yet gone. */
+void xsb_set_test_hooks(void (*dir_hook)(const char *dir), const char *slow_part);
+int  xsb_workers(void);
 
 /* ── xst_host.c ────────────────────────────────────────────────────── */
 
@@ -227,14 +254,29 @@ int  xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtrack
 
 /* Optional, the port's: asked on the scan's thread right before a folder it
  * has read replaces the library in use. 0 keeps the library in use (the
- * title holds an index into it: a soundtrack of it is chosen) and frees the
- * new one; `done` is then called with soundtracks = -1 (the folder is used
- * from the next start). NULL: always replaced. */
+ * title holds an index into it: a soundtrack of it is chosen) and holds the
+ * new one back, read and ready; `done` is then called with soundtracks = -1,
+ * and the port puts it in place with xbox_SoundtrackApplyPending at a moment
+ * the title holds no index into the old one (BO-243). NULL: always
+ * replaced. */
 void xbox_SoundtrackSetSwapGate(int (*may_swap)(void));
+/* 1 while a folder read is held back by the gate (the folder, when `dir`;
+ * its number of soundtracks, when `soundtracks`). */
+int  xbox_SoundtrackPending(char *dir, size_t cap, int *soundtracks);
+/* The folder held back by the gate replaces the library in use now (the
+ * caller's thread). 1 when it did, with its counts (each may be NULL); 0
+ * when nothing was held back. A new xbox_SoundtrackSetFolder drops it. */
+int  xbox_SoundtrackApplyPending(int *soundtracks, int *songs);
 /* 1 while a scan runs; the counts so far (each may be NULL). */
 int  xbox_SoundtrackScanning(int *folders, int *files, int *songs);
 /* The folder in use ("" when off) and its counts. */
 void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs);
+/* The soundtracks in use, by name (the two above on the library in use,
+ * under the lock a swap takes): soundtrack i's name as UTF-8 (0: none), and
+ * the index of the one with this name (-1: none). The port remembers a
+ * choice by name because the list changes with the folder. */
+int  xbox_SoundtrackNameOf(int i, char *out, size_t cap);
+int  xbox_SoundtrackIndexOfName(const char *utf8);
 /* What the folder in use had that is not offered: files that could not be
  * read, songs past XST_MAX_SONGS in a folder, folders past
  * XST_MAX_SOUNDTRACKS (each may be NULL). Returns their sum. */

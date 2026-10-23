@@ -32,13 +32,13 @@ extern "C" void xbox_OverlayVulkanDraw(const struct nvk_core *core, VkCommandBuf
 {
     if (s_failed || !core)
         return;
+    /* The context is the main thread's to make (xbox_OverlayPlatformFrame). */
+    if (!overlay_core_is_ready())
+        return;
+    overlay_lock();
+    struct unlock_at_end { ~unlock_at_end() { overlay_unlock(); } } unlock_guard;
     if (!s_init) {
         ImGui_ImplVulkan_InitInfo ii{};
-        if (!overlay_core_init(true)) {
-            s_failed = true;
-            overlay_fail();
-            return;
-        }
         s_fmt = fmt;
         s_images = image_count < 2 ? 2 : image_count;
         ii.ApiVersion = VK_API_VERSION_1_3;

@@ -434,7 +434,11 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         words++;
 
         if (s_left) {                         /* a parameter */
-            note(s_subch, s_method);
+            /* The inventory is only reported with RECOMP_PB_SCAN: counting
+             * every word without it cost ~0.34 ms a frame of the render
+             * thread (BO-277, WPR on Windows). */
+            if (s_scan_enabled)
+                note(s_subch, s_method);
             /* Same walk, two consumers: the survey counts, the executor
              * acts. Keeping them on one decode means they can never
              * disagree about what the stream said. */

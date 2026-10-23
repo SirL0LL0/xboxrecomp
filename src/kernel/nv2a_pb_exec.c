@@ -35,6 +35,7 @@
 #include "kernel_pacing.h"
 #include "kernel_pause.h"
 #include "host_time.h"            /* xbox_HostSleepNs, for flip pacing */
+#include "flip_grid.h"            /* the host flip grid's next edge */
 #include "latency_trace.h"        /* RECOMP_TRACE=latency */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "xbox_crash.h"           /* g_xbox_flip_count */
@@ -6004,7 +6005,11 @@ static int      s_flip_pacing = -1;   /* -1 unread, 0 off, 1 on */
  * runs fast. */
 static uint64_t s_host_env_ns;        /* RECOMP_FLIP_PACING=host:<Hz>, 0 none */
 static uint64_t s_host_due_ns;        /* the grid's next edge */
+static uint64_t s_host_per_ns;        /* the grid's period in force */
 static int      s_host_pending;       /* the pending swap is on the grid */
+static int      s_host_frame;         /* the frame being presented was held to it */
+static uint32_t s_host_swaps;         /* swaps seen, for the title (xbox_FlipHostGridNote) */
+static uint64_t s_host_ready_ns;      /* the held frame was ready to go (its FLIP_STALL) */
 /* RECOMP_TRACE=pacing: what the swaps asked for and what the executor did,
  * per window of flips (pace_report). Counted whether pacing is on or not. */
 static struct {
@@ -6073,6 +6078,80 @@ static int flip_pacing_on(void)
     return s_flip_pacing;
 }
 
+/* RECOMP_DEBUG=flip_cost=<us>[,flip_cost_jitter=<us>] (BO-241 test): the
+ * executor works that much longer on each frame held to the host grid,
+ * spread evenly by the jitter either way, so a run without a slow machine
+ * misses the grid's edges as one does. One cached flag when off. */
+static void flip_cost_sleep(void)
+{
+    static int us = -1, jit;
+    static uint32_t rnd = 0x9E3779B9u;
+    int d;
+
+    if (us < 0) {
+        const char *v = recomp_env(RENV_FLIP_COST), *j = recomp_env(RENV_FLIP_COST_JITTER);
+        us = v ? atoi(v) : 0;
+        jit = j ? atoi(j) : 0;
+        if (us < 0) us = 0;
+        if (jit < 0 || jit > us) jit = us;
+        if (us)
+            fprintf(stderr, "  [GPU] flip_cost: %d us +- %d a frame on the host grid\n", us, jit);
+    }
+    if (!us)
+        return;
+    rnd = rnd * 1664525u + 1013904223u;
+    d = us + (jit ? (int)((rnd >> 8) % (uint32_t)(2 * jit + 1)) - jit : 0);
+    if (d > 0)
+        xbox_HostSleepNs((uint64_t)d * 1000u);
+}
+
+/* hr_spin (BO-241): while the host grid runs, the executor spins instead
+ * of sleeping when it has nothing to do -- the hold to the grid's edge
+ * here, and the ack loop's 50 us naps between kicks (xbox_memory_layout.c).
+ * On the Deck at 90 Hz the naps cost the executor ~13% of its clock against
+ * 60 Hz mode, where the vblank hold spins (the governor reads a thread that
+ * sleeps a third of each frame as half idle). On by default whenever the
+ * grid runs (graphics.high_refresh), behind the idle guard below;
+ * RECOMP_DEBUG=hr_spin=0 naps as before.
+ * Off the grid nothing changes: callers test s_host_due_ns first. Executor
+ * thread only. */
+static int hr_spin_asked(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = recomp_env(RENV_HR_SPIN);
+        on = !(v && *v == '0');
+        fprintf(stderr, "  [GPU] hr_spin %s: the executor %s while idle on the host grid\n",
+                on ? "on" : "off", on ? "spins" : "naps");
+    }
+    return on;
+}
+
+/* The idle guard (from be12b9c8, without its hr_early_ack): spin only while
+ * the frames leave little to hold for. The share of the period each grid
+ * frame held for, averaged over ~8 frames; on below 30%, off above 40%. A
+ * race on the Deck at 90 Hz holds ~11%; a pause menu most of the period,
+ * where a spin would run a core for nothing. Executor thread writes;
+ * the ack thread reads s_spin_ok (a stale value only delays the switch). */
+static volatile int s_spin_ok;
+static uint32_t     s_hold_share_q16 = 1u << 15;   /* 0.5 to start */
+
+static void hr_spin_guard(uint64_t ready, uint64_t due, uint64_t per)
+{
+    uint64_t h = due > ready ? due - ready : 0;
+    uint32_t share = per ? (uint32_t)((h >= per ? per : h) * 65536u / per) : 0;
+    s_hold_share_q16 = s_hold_share_q16 - (s_hold_share_q16 >> 3) + (share >> 3);
+    if (s_hold_share_q16 < 19661u)        /* 0.30 */
+        s_spin_ok = 1;
+    else if (s_hold_share_q16 > 26214u)   /* 0.40 */
+        s_spin_ok = 0;
+}
+
+int nv2a_pb_idle_spin(void)
+{
+    return s_host_due_ns && hr_spin_asked() && s_spin_ok;
+}
+
 /* NO_OPERATION: a swap's software method schedules its vblank. */
 static void flip_pacing_swap(uint32_t param)
 {
@@ -6105,6 +6184,8 @@ static void flip_pacing_swap(uint32_t param)
     s_pace.swaps++;
     s_last_iv = arg & 7;
     s_last_late = 0;
+    s_host_swaps++;
+    s_host_frame = 0;
     {
         int vb = flip_pacing_on();
         uint64_t per = xbox_FlipHostPeriodNs();
@@ -6114,21 +6195,39 @@ static void flip_pacing_swap(uint32_t param)
             per = s_host_env_ns;
 
         if (per && (arg & 7)) {
-            /* The next edge of the host grid; a frame later than a whole
-             * period starts the grid again from now, as a late swap does. */
-            uint64_t t = xbox_HostNowNs();
-            s_host_due_ns += per;
-            if (s_host_due_ns + per < t || s_host_due_ns > t + 2 * per) {
+            flip_cost_sleep();
+            /* The next edge of the host grid, on the display's refreshes
+             * when they are reported (flip_grid.h); a frame later than a
+             * whole period starts the grid again from now, as a late swap
+             * does. */
+            uint64_t t = xbox_HostNowNs(), ref = 0, pd = 0, due;
+            int g = s_host_env_ns ? 0 : xbox_DisplayGrid(t, &ref, &pd), late;
+            /* host:<Hz> stands in for a display: one with its refreshes on
+             * a fixed phase (the grid's first edge), as a real one has. */
+            if (s_host_env_ns) {
+                static uint64_t env_ref;
+                if (!env_ref)
+                    env_ref = t;
+                ref = env_ref;
+                pd = s_host_env_ns;
+                g = 2;
+            }
+            due = fg_next_edge(s_host_due_ns, per, g, ref, pd, t, &per, &late);
+            if (late) {
                 s_pace.late++;
                 s_last_late = 1;
-                s_host_due_ns = t;
             }
+            s_host_due_ns = due;
+            s_host_per_ns = per;
             s_host_pending = 1;
             s_swap_pending = 1;
+            xbox_FlipHostGridNote(s_host_swaps, due, per);
             /* The vblank schedule starts again from now when the grid ends. */
             s_swap_last = xbox_VblankCount();
             return;
         }
+        xbox_FlipHostGridNote(s_host_swaps, 0, 0);
+        s_host_due_ns = 0;            /* a grid asked for again starts from now */
         if (!vb)
             return;
     }
@@ -6158,14 +6257,32 @@ static void flip_pacing_stall(void)
     s_swap_pending = 0;
     t0 = xbox_HostNowNs();
     if (s_host_pending) {
+        /* A timed wait for the edge. A sleep can wake a little late (tens
+         * of microseconds on macOS and Linux, up to half a millisecond on
+         * Windows); only on a grid faster than 200 Hz, where that is a
+         * tenth of a period, is the last half millisecond spun. */
+        uint64_t t = xbox_HostNowNs();
+        uint64_t spin = s_host_per_ns && s_host_per_ns < 5000000ull ? 500000ull : 0;
+        s_host_ready_ns = t;
         s_host_pending = 0;
-        /* Sleep to a millisecond before the edge, then spin: a sleep
-         * alone wakes up to a millisecond late, a whole frame at 1000 Hz. */
-        uint64_t t;
-        while ((t = xbox_HostNowNs()) < s_host_due_ns) {
-            if (s_host_due_ns - t > 1500000ull)
-                xbox_HostSleepNs(s_host_due_ns - t - 1000000ull);
+        s_host_frame = 1;
+        if (hr_spin_asked()) {
+            static uint32_t frames, spun;
+            hr_spin_guard(t, s_host_due_ns, s_host_per_ns);
+            if (s_spin_ok)
+                spin = s_host_per_ns ? s_host_per_ns : 1;   /* all of it */
+            spun += s_spin_ok != 0;
+            if (++frames == 900) {
+                fprintf(stderr, "  [GPU] hr_spin: last 900 grid frames, %u spun (hold share %.2f)\n",
+                        spun, s_hold_share_q16 / 65536.0);
+                frames = spun = 0;
+            }
         }
+        if (t < s_host_due_ns && s_host_due_ns - t > spin)
+            xbox_HostSleepNs(s_host_due_ns - t - spin);
+        if (spin)
+            while (xbox_HostNowNs() < s_host_due_ns)
+                xbox_CpuRelax();
         goto done;
     }
     /* present.pacing=sleep: block on the vblank's condition variable (the
@@ -6219,8 +6336,18 @@ static void flip_present(int early)
         /* The frame's own vblank, for a presenter that aims its present
          * (present_cadence.h): the one just raised, or with
          * RECOMP_PRESENT_EARLY the one the swap still waits for. */
-        xbox_PacingFrameVblank(early && s_swap_pending ? xbox_VblankEdgeNs(s_swap_target)
-                                                       : xbox_VblankLastDue());
+        /* A frame held to the host grid: its edge, so a presenter aims
+         * each frame at its own refresh. */
+        xbox_PacingFrameVblank(s_host_frame || (early && s_host_pending) ? s_host_due_ns
+                               : early && s_swap_pending ? xbox_VblankEdgeNs(s_swap_target)
+                                                         : xbox_VblankLastDue());
+        /* A frame on the grid: its swap and edge, for when it is shown. */
+        /* Ready to go when its stall began: a sleep that wakes a little
+         * after the edge does not make it late. */
+        if (s_host_frame || (early && s_host_pending))
+            xbox_FlipHostHanded(s_gpu.flips, s_host_swaps, s_host_due_ns, s_host_per_ns,
+                                s_host_frame ? s_host_ready_ns : xbox_HostNowNs());
+        s_host_frame = 0;
         if (s_present.offset)
             s_backend->on_flip(s_present.offset, s_present.pitch);
         else

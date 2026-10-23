@@ -117,6 +117,12 @@ static void vulkan_devices(xbox_report_buf *b)
     uint32_t n = 8, i, loader = VK_API_VERSION_1_0;
     VkResult rc;
 
+#if defined(XR_VK_DYNAMIC)
+    if (!xr_vk_loader_ok()) {      /* BO-231: opened at run time, may be absent */
+        xbox_report_printf(b, "(no Vulkan loader: %s)\n", xr_vk_loader_error());
+        return;
+    }
+#endif
     vkEnumerateInstanceVersion(&loader);
     memset(&app, 0, sizeof app);
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;

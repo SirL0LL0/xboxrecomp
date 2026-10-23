@@ -103,6 +103,16 @@ read so) and the 32-bit `mov reg, [mem]` (a float moved as bits); "store_f32" ta
 and rewrites the stored float, for a value that shares its register with
 other uses.
 
+kind "cmp_f32": a float compared where it lies, `comiss|ucomiss xmm,
+dword ptr [mem]` (Burnout 3's rival marker compares the rival's depth with
+a distance in its constant pool, 35.0, shared with other code). The lifter
+snapshots the compare's operands into _fca / _fcb (doubles) and the jcc
+reads them; the call rewrites _fcb, the memory operand, with the
+expression (`loaded` is the float the compare read). Memory is untouched:
+
+    _fca = xmm0.f[0]; _fcb = MEMF(0x3B175C); /* comiss */
+    _fcb = RECOMP_PATCH_F32("display.rival_marker", "farther", 0, (75.0), _fcb); /* patch 0x... */
+
 kind "mark" changes nothing in the guest: after the instruction at va (any
 instruction) the generated code calls RECOMP_PATCH_MARK("name"), and a host
 that registered a function for that name (recomp_patch_on_mark) learns the
@@ -123,7 +133,7 @@ import json
 import re
 
 _KINDS = frozenset({"load_u32", "load_u8", "cmp_u8", "cmp_u32", "store_u8",
-                    "store_u32", "load_f32", "store_f32", "mark"})
+                    "store_u32", "load_f32", "store_f32", "cmp_f32", "mark"})
 _INT_KINDS = frozenset({"load_u32", "load_u8", "cmp_u8", "cmp_u32", "store_u8",
                         "store_u32"})
 _BYTE_KINDS = frozenset({"load_u8", "cmp_u8", "store_u8"})
@@ -479,6 +489,11 @@ class PatchReport:
             # x87 `fld dword ptr [mem]`: the float just pushed is the top of
             # the stack (a double there).
             where, bits = "fp_top()", False
+        elif (p.kind == "cmp_f32" and ok and m in ("comiss", "ucomiss")
+                and dst.type == "reg" and dst.reg in _XMM
+                and src.type == "mem" and src.mem_size == 4):
+            # The compare's snapshot of the memory operand (lifter: comiss).
+            where, bits = "_fcb", False
         elif p.kind == "store_f32" and ok and dst.type == "mem" and dst.mem_size == 4:
             if m == "movss" and src.type == "reg" and src.reg in _XMM:
                 where, bits = f"MEMF({_fmt_mem(dst)})", False
@@ -488,6 +503,8 @@ class PatchReport:
             want = ("`movss xmm, [mem]`, `fld dword ptr [mem]` or 32-bit "
                     "`mov reg, [mem]`"
                     if p.kind == "load_f32" else
+                    "`comiss|ucomiss xmm, dword ptr [mem]`"
+                    if p.kind == "cmp_f32" else
                     "`movss [mem], xmm` or 32-bit `mov [mem], reg`")
             self._err(f"patch 0x{p.va:08X}: {m} is not a {want}")
             return None

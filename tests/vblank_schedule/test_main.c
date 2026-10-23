@@ -24,6 +24,7 @@
 #include "platform/recomp_env.h"
 #include "video/dxgi_vblank_model.h"
 #include "pacing_diag.h"
+#include "video/frames_lost_rule.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -372,6 +373,9 @@ static void display_switch(void)
  * at relearn_s the lock is told to relearn (the cadence diagnosis on a
  * pacing fault). Returns the worst distance of a vblank edge from the 60 Hz
  * refresh grid over [from_s, to_s). */
+static int s_fold_hint;   /* fold_run: the window system states the refresh (BO-210) */
+static uint64_t s_fold_hint_fixed;   /* ... or states this, whatever the display does */
+static int s_fold_hint_ok;           /* xbox_VblankDisplayCycleOk() at the run's end */
 static double fold_run(double at_s, int miss, double relearn_s, double from_s, double to_s)
 {
     static uint64_t base = 9000 * NS_PER_S;
@@ -386,10 +390,13 @@ static double fold_run(double at_s, int miss, double relearn_s, double from_s, d
     unsigned rng = 777;
     const double p2 = 1e9 / 60.0, p1 = 1e9 / 90.0;
 
+    xbox_VblankDisplayCycle(s_fold_hint_fixed ? s_fold_hint_fixed : s_fold_hint ? (uint64_t)p1 : 0);
     while (now < end) {
         if (npend && pend[0] <= next) {
             int i;
             now = pend[0];
+            if (s_fold_hint && !s_fold_hint_fixed)
+                xbox_VblankDisplayCycle(now >= sw ? (uint64_t)p2 : (uint64_t)p1);
             xbox_VblankDisplayRefresh(now, 0);
             for (i = 1; i < npend; i++)
                 pend[i - 1] = pend[i];
@@ -425,6 +432,8 @@ static double fold_run(double at_s, int miss, double relearn_s, double from_s, d
                 pend[npend++] = at + (rng >> 8) % 300000u;
         }
     }
+    s_fold_hint_ok = xbox_VblankDisplayCycleOk();
+    xbox_VblankDisplayCycle(0);
     return (double)worst / 1e6;
 }
 
@@ -456,6 +465,36 @@ static void long_session(void)
     snprintf(what, sizeof what, "relearn at 20 s: vblank %.2f ms off the refresh at most"
              " from 21 s", w2);
     check(w2 < 1.0, what);
+    /* BO-210: with the window system's refresh (gamescope's refresh cycle)
+     * the lock takes the new rate at the first report after the switch,
+     * and a relearn at the next report: on the 60 Hz grid 0.2 s after. */
+    s_fold_hint = 1;
+    w = w2 = 0;
+    for (i = 0; i < sizeof at / sizeof at[0]; i++) {
+        double a = fold_run(at[i], 9, 0, at[i] + 0.2, at[i] + 3), b = fold_run(at[i], 9, 20, 20.2, 23);
+        if (a > w) w = a;
+        if (b > w2) w2 = b;
+    }
+    snprintf(what, sizeof what, "refresh stated, 90 -> 60 Hz: %.2f ms off 0.2-3 s after;"
+             " relearn: %.2f", w, w2);
+    check(w < 1.0 && w2 < 1.0, what);
+    {
+        /* A stated refresh that is not the display's (16.67 ms while the
+         * panel runs 90 Hz: a limiter's target): eight reports off its grid
+         * and the lock learns from the reports; once the panel is at 60 the
+         * reports agree and it is taken again. */
+        int ok90, ok60;
+        s_fold_hint_fixed = 16666667u;
+        fold_run(1000, 0, 0, 1, 5);
+        ok90 = s_fold_hint_ok;
+        w = fold_run(5.0, 9, 0, 7, 20);
+        ok60 = s_fold_hint_ok;
+        s_fold_hint_fixed = 0;
+        snprintf(what, sizeof what, "refresh stated 16.67 at 90 Hz: dropped (%s); at 60 taken"
+                 " again (%s), %.2f ms off", ok90 ? "no" : "yes", ok60 ? "yes" : "no", w);
+        check(!ok90 && ok60 && w < 1.0, what);
+    }
+    s_fold_hint = 0;
 }
 
 /* The cadence diagnosis (pacing_diag.h) against the XDK swap rule: the
@@ -831,6 +870,23 @@ static void dxgi_model(void)
           && r[15].max_dev < 0.3 && !r[15].hitches, "fixed 120: locked, m = 2");
 }
 
+/* BO-210: the counters line's "frames lost" rule. */
+static void frames_lost_rule(void)
+{
+    char what[160];
+    int a = flr_lost(60, 45, 16666667u, 0);        /* the Deck's 45 at 60 Hz: said */
+    int b = flr_lost(60, 40, 24999000u, 0);        /* a 40 fps limit: not said */
+    int c = flr_lost(60, 45, 22221000u, 0);        /* a 45 fps limit: not said */
+    int d = flr_lost(60, 59.5, 16666667u, 0);      /* normal */
+    int e = flr_lost(30, 30, 16666667u, 0);        /* a crash camera's 30 */
+    int f = flr_lost(60, 45, 0, 0);                /* no stated refresh: said */
+    int g = flr_lost(60, 45, 16666667u, 1);        /* hidden window */
+    int h = flr_lost(60, 50, 11111111u, 0);        /* 90 Hz panel, frames lost: said */
+    snprintf(what, sizeof what, "frames lost rule: 45@60 %d, limit 40 %d, limit 45 %d, normal %d,"
+             " 30 fps %d, no cycle %d, hidden %d, 90 Hz %d", a, b, c, d, e, f, g, h);
+    check(a && !b && !c && !d && !e && f && !g && h, what);
+}
+
 int main(void)
 {
     printf("vblank_schedule:\n");
@@ -845,6 +901,7 @@ int main(void)
     display_lock();
     display_switch();      /* before display_link: its irregular stated periods stand the lock down */
     long_session();
+    frames_lost_rule();
     cadence_diag();
     /* Before display_link: its irregular stamps leave the kernel's
      * stand-down counter up for a while. */

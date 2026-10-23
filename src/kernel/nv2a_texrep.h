@@ -160,7 +160,12 @@ struct nv2a_texrep_zbias {
 void  nv2a_texrep_register_zbias(const struct nv2a_texrep_zbias *tex, unsigned n);
 /* Whether the backends apply the offsets now: RECOMP_DEBUG=zbias=0 never,
  * zbias_ab=n on for n flips and off for n (comparisons); else always. */
-int   nv2a_texrep_zbias_on(uint32_t flip);   /* flip: the executor's flip count */
+int   nv2a_texrep_zbias_on(uint32_t flip);
+/* BO-253: a decal drawn with culling off takes its offset on the front faces
+ * only (the backend draws it twice: back faces culled with the offset, front
+ * faces culled without), so what is seen from behind is not lifted through
+ * what it sits on. RECOMP_DEBUG=zbias_all=1: both faces, as BO-176 shipped. */
+int   nv2a_texrep_zbias_facing(uint32_t flip);   /* flip: as zbias_on */   /* flip: the executor's flip count */
 /* The bias of a registered texture, 0 for any other. */
 float nv2a_texrep_zbias(const uint8_t *guest, uint32_t color, uint32_t w,
                         uint32_t h, uint32_t pitch);

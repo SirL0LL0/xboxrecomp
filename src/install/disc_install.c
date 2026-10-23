@@ -20,6 +20,8 @@
 #include <direct.h>
 #include <io.h>
 #include <sys/stat.h>
+#define close _close
+#define fdopen _fdopen
 #else
 #include <dirent.h>
 #include <sys/stat.h>
@@ -88,11 +90,35 @@ static int p_mkdir(const char *p)
     return 0;
 }
 
+/* Makes `tmp` (a writable copy); on ENOENT makes its parent first, then
+ * tries again. The directories above one that exists are never looked at:
+ * some Android ROMs hide /storage/emulated/0/Android/data from the app
+ * (stat fails) although the app's own folder under it is there (BO-229). */
+static int p_mkdirs_at(char *tmp)
+{
+    size_t i;
+    int ok;
+
+    if (p_mkdir(tmp))
+        return 1;
+    if (errno != ENOENT)
+        return 0;
+    for (i = strlen(tmp); i > 0; i--)
+        if (tmp[i] == '/' || tmp[i] == '\\')
+            break;
+    if (i == 0 || (i == 2 && tmp[1] == ':'))
+        return 0;   /* no parent left to make */
+    tmp[i] = '\0';
+    ok = p_mkdirs_at(tmp);
+    tmp[i] = '/';
+    return ok && p_mkdir(tmp);
+}
+
 /* `p` and the directories above it. errno says why not. */
 static int p_mkdirs(const char *p)
 {
     char tmp[PATH_N];
-    size_t i, n = strlen(p);
+    size_t n = strlen(p);
     int dir = 0;
 
     if (!n || n >= sizeof tmp) {
@@ -102,15 +128,9 @@ static int p_mkdirs(const char *p)
     if (p_stat(p, &dir, NULL))
         return dir ? 1 : (errno = ENOTDIR, 0);
     memcpy(tmp, p, n + 1);
-    for (i = 1; i < n; i++)
-        if ((tmp[i] == '/' || tmp[i] == '\\') && !(i == 2 && tmp[1] == ':')) {
-            char c = tmp[i];
-            tmp[i] = '\0';
-            if (!p_stat(tmp, NULL, NULL) && !p_mkdir(tmp))
-                return 0;
-            tmp[i] = c;
-        }
-    return p_mkdir(tmp);
+    while (n > 1 && (tmp[n - 1] == '/' || tmp[n - 1] == '\\'))
+        tmp[--n] = '\0';
+    return p_mkdirs_at(tmp);
 }
 
 /* Over an existing file too. */
@@ -377,7 +397,19 @@ static int folder_path(const char *root, const char *rel, char *out, size_t n)
 static int src_open(inst *in, const char *rel, src_file *sf)
 {
     memset(sf, 0, sizeof *sf);
-    if (in->img) {
+    if (in->o->source_open) {
+        int fd = in->o->source_open(in->o->ctx, rel, &sf->size);
+        if (fd == -1)
+            return 0;
+        if (fd < 0)
+            return -1;
+        sf->fp = fdopen(fd, "rb");
+        if (!sf->fp) {
+            close(fd);
+            return -1;
+        }
+        setvbuf(sf->fp, NULL, _IONBF, 0);
+    } else if (in->img) {
         sf->xf = xdvdfs_find(in->img, rel);
         if (!sf->xf)
             return 0;
@@ -524,7 +556,24 @@ static int identify(inst *in)
 
     if (mi < 0)
         return set_fail(in, XR_INSTALL_INTERNAL, "The manifest does not list %s.", m->exe);
-    if (o->source_fd >= 0) {
+    if (o->source_open) {
+        /* A document tree: no path; the callback finds the executable. */
+        uint64_t sz;
+        int fd = o->source_open(o->ctx, m->exe, &sz);
+        if (fd < 0 && fd != -2) {
+            fd = o->source_open(o->ctx, "default.xex", &sz);
+            if (fd >= 0) {
+                close(fd);
+                return set_fail(in, XR_INSTALL_XBOX360, "This folder is an Xbox 360 disc (it "
+                                "has a default.xex), not an original Xbox one.");
+            }
+            return set_fail(in, XR_INSTALL_NO_EXE, "There is no %s in the chosen folder or one "
+                            "folder below it: this is not an extracted Xbox disc.", m->exe);
+        }
+        if (fd >= 0)
+            close(fd);
+        rc = XDVDFS_OK;
+    } else if (o->source_fd >= 0) {
         rc = xdvdfs_open_fd(o->source_fd, &in->img, err, sizeof err);
     } else if (!o->source || !p_stat(o->source, &dir, NULL)) {
         return set_fail(in, XR_INSTALL_NO_SOURCE, "%s does not exist.", o->source ? o->source : "?");

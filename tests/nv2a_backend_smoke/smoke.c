@@ -189,6 +189,19 @@ static void quad_uv(float x0, float y0, float x1, float y1, const uint32_t c[4],
     M(0x17FC, 0);
 }
 
+/* The composite (context rows 0..3) of a screen-space title: identity.
+ * Fixed-function immediate batches go through it since 154c6418 (BO-198); a
+ * zero composite divides by w = 0 and drops the batch, on both paths alike, so
+ * every case that draws a quad loads it first (surf, surf_clip, scene). */
+static void identity_composite(void)
+{
+    uint32_t i;
+
+    M(0x1EA4, 0);                          /* CONSTANT_LOAD: row 0 */
+    for (i = 0; i < 16; i++)
+        M(0x0B80 + 4 * i, f2u((i % 5) == 0 ? 1.0f : 0.0f));
+}
+
 /* The swizzled checker (8x8-texel orange/blue squares, white top row, green
  * left column so orientation shows) and the YUY2 ramp after it: luma left
  * to right, Cr top to bottom. The same images as d3d11_backend_smoke. */
@@ -323,6 +336,7 @@ static void scene(int sc, uint32_t buf, uint32_t other)
     static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
     int a;
 
+    identity_composite();
     M(0x0200, W << 16);                    /* SURFACE_CLIP_HORIZONTAL */
     M(0x0204, H << 16);                    /* SURFACE_CLIP_VERTICAL   */
     M(0x0208, 0x00000128u);                /* SURFACE_FORMAT: A8R8G8B8, Z24S8 */
@@ -554,6 +568,7 @@ static int writeback_cases(const struct nv2a_pb_backend *b, const uint32_t *ref,
 /* A 32-bit surface at buf, w x h, pitch w * 4; with `clear`, cleared to argb. */
 static void surf(uint32_t buf, uint32_t w, uint32_t h, int clear, uint32_t argb)
 {
+    identity_composite();
     M(0x0200, w << 16);
     M(0x0204, h << 16);
     M(0x0208, 0x00000128u);
@@ -684,6 +699,7 @@ static int alias_cases(const struct nv2a_pb_backend *b)
  * clip case keeps (another pitch is another surface). */
 static void surf_clip(uint32_t buf, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
+    identity_composite();
     M(0x0200, (w << 16) | x);
     M(0x0204, (h << 16) | y);
     M(0x0208, 0x00000128u);
@@ -932,19 +948,6 @@ static int swizzled_case(const struct nv2a_pb_backend *b)
     return diff != 0;
 }
 
-/* The composite (context rows 0..3) of a screen-space title: identity.
- * Fixed-function immediate batches go through it since 154c6418 (BO-198); a
- * zero composite, which nothing here had loaded, divides by w = 0 and drops
- * the batch. */
-static void identity_composite(void)
-{
-    uint32_t i;
-
-    M(0x1EA4, 0);                          /* CONSTANT_LOAD: row 0 */
-    for (i = 0; i < 16; i++)
-        M(0x0B80 + 4 * i, f2u((i % 5) == 0 ? 1.0f : 0.0f));
-}
-
 static int poly_offset_case(const struct nv2a_pb_backend *b)
 {
     static const uint32_t col[2] = {0xFFFF0000u, 0xFF0000FFu};
@@ -953,7 +956,6 @@ static int poly_offset_case(const struct nv2a_pb_backend *b)
 
     nv2a_pb_set_backend(b);
     surf_clip(BUF0, 0, 0, W, H);
-    identity_composite();
     M(0x1D8C, 0xFFFFFF00u);
     M(0x1D90, 0xFF000000u);
     M(0x1D94, 0xF3);
@@ -1568,7 +1570,19 @@ int main(int argc, char **argv)
         {
             int same = compare(s_scene_name[sc], cpu_px, gpu_px);
             int pc = probes_ok(sc, "cpu", cpu_px), pg = probes_ok(sc, "gpu", gpu_px);
-            if (!same || !pc || !pg)
+            /* Two blank frames match: a scene whose draws were all dropped
+             * (a zero composite did that, BO-198) must not pass. */
+            int cd = 0, gd = 0, drawn;
+            uint32_t i;
+            for (i = 0; i < W * H; i++) {
+                cd |= (cpu_px[i] & 0xFFFFFFu) != 0x603010u;
+                gd |= (gpu_px[i] & 0xFFFFFFu) != 0x603010u;
+            }
+            drawn = cd && gd;
+            if (!drawn)
+                fprintf(stderr, "[backend-smoke] %-10s FAIL: nothing drawn over the clear colour\n",
+                        s_scene_name[sc]);
+            if (!same || !pc || !pg || !drawn)
                 failures++;
         }
     }

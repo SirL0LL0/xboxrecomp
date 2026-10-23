@@ -92,6 +92,7 @@ typedef enum {
     XS_INTERFACE_MENU_ENTRY, /* the overlay's entry in the title's own Settings menu, on by default */
     XS_AUDIO_CUSTOM_LEVEL,   /* the user's own music against the title's: off / quieter / match / louder (apu_level.h) */
     XS_DISPLAY_SCORE_BOARD,  /* a title hook: the HUD's score board as shipped or smooth */
+    XS_DISPLAY_RIVAL_MARKER, /* an opt-in guest patch: where the marker over a rival changes look */
     XS_AUDIO_MENU_SOUNDS,    /* the title's own menu sounds in the overlay, on by default */
     XS_GRAPHICS_HDR,         /* BO-110: HDR output (EDR on macOS), off = the SDR path */
     XS_GRAPHICS_HDR_PEAK,    /* the display's peak, nits; 0: what the display reports */
@@ -102,7 +103,13 @@ typedef enum {
     XS_GRAPHICS_HDR_DECODE,  /* Vulkan: 2.2 / srgb, how 8-bit values become light (no row) */
     XS_DISPLAY_FRAME_PACING, /* auto / low_latency / smooth: the present queue (fb_present_vulkan.c, BO-110) */
     XS_GAME_RACE_CLOCK,      /* an opt-in guest patch: a race keeps real time on a slow host from its start, off as shipped */
-    XS_DISPLAY_LANGUAGE,     /* the dashboard's language the title reads at start-up */
+    XS_AUDIO_CUSTOM_AT_START, /* BO-230: with a music folder, start on the custom soundtrack last chosen, on as shipped */
+    XS_GRAPHICS_TEXUP,       /* BO-245: the world's textures upscaled on the GPU: off / fsrcnnx / nnedi3 (nv2a_texup.h) */
+    XS_GRAPHICS_TEXUP_SCALE, /* and its factor: 2x / 4x */
+    XS_GRAPHICS_TEXUP_ROADS, /* and the road surfaces too (off: the title's road skip list) */
+    XS_DISPLAY_CRASHNAV_MAP, /* BO-222: with the widescreen HUD, a title's map screen full width or 4:3 */
+    XS_GRAPHICS_TEXUP_PRELOAD, /* BO-272: the upscaler works through the loading screen and countdown, on as shipped */
+    XS_DISPLAY_LANGUAGE,       /* the dashboard's language the title reads at start-up */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
@@ -169,6 +176,10 @@ const char *xbox_SettingsPath(void);
  * such a setting uses this, not getenv. */
 const char *xbox_SettingsText(const char *key, int *locked);
 void        xbox_SettingsSetText(const char *key, const char *value);
+/* 1 when the text setting was given a value (the file has the key, or it was
+ * set): for a key whose empty value means something (audio.custom_music_soundtrack,
+ * an empty string kept in the file), absent and "" differ. */
+int         xbox_SettingsTextIsSet(const char *key);
 
 /* The power mode's "stock" (Maximum, the busy-wait) is offered on some hosts
  * only (BO-75: on the Deck and Windows it measured no steadier than Balanced

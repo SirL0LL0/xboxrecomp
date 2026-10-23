@@ -390,3 +390,41 @@ const char *recomp_env_list_var(recomp_env_id id)
         return NULL;
     return s_list_var[s_keys[id].tier];
 }
+
+int recomp_host_is_steam_deck(void)
+{
+#if defined(__ANDROID__)
+    return 0;
+#else
+    const char *e = getenv("SteamDeck");
+
+    if (e && !strcmp(e, "1"))
+        return 1;
+#if defined(__linux__)
+    {
+        /* The board does not change: read once. */
+        static int dmi = -1;
+        if (dmi < 0) {
+            char vendor[32] = "", product[32] = "";
+            FILE *f = fopen("/sys/devices/virtual/dmi/id/sys_vendor", "r");
+            if (f) {
+                if (!fgets(vendor, sizeof vendor, f))
+                    vendor[0] = 0;
+                fclose(f);
+            }
+            f = fopen("/sys/devices/virtual/dmi/id/product_name", "r");
+            if (f) {
+                if (!fgets(product, sizeof product, f))
+                    product[0] = 0;
+                fclose(f);
+            }
+            dmi = !strncmp(vendor, "Valve", 5)
+                  && (!strncmp(product, "Jupiter", 7) || !strncmp(product, "Galileo", 7));
+        }
+        if (dmi)
+            return 1;
+    }
+#endif
+    return 0;
+#endif
+}

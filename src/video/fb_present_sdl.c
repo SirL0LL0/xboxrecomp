@@ -6,12 +6,23 @@
  * only runs on the process main thread, and the guest used to own that thread
  * for the whole run. So the shape is inverted here:
  *
- *   process main thread   SDL window, the one SDL event loop, the presents
+ *   process main thread   SDL window, the one SDL event loop, input
+ *   "present" pthread     the layer presenters' presents (Vulkan, Metal)
  *   "guest-main" pthread  the boot sequence and the recompiled entry point
  *
+ * The present thread waits on the frame slots' condition variable for a new
+ * frame or a request from the main thread (redraw, quit; frame_wake.h), so
+ * no frame waits for SDL's event pump, which under gamescope's Xwayland can
+ * block for a whole frame and more (BO-210). The main thread hands it what
+ * it needs of the window (presentable or not; on macOS the layer's size and
+ * the display, fbm_main_tick) and the overlay's input; AppKit and the
+ * window's lifecycle stay on the main thread. The SDL renderer path (no
+ * layer) still presents on the main thread.
+ *
  * xbox_HostWindowMain() does the inversion: it opens the window, starts the
- * guest on a pthread with the main thread's stack size and QoS, and pumps
- * events and presents until the guest returns or the window is closed.
+ * guest on a pthread with the main thread's stack size and QoS, starts the
+ * present thread, and pumps events until the guest returns or the window is
+ * closed.
  *
  * Frames come from the backend's flip (cpu_on_flip calls
  * xbox_FramebufferWindowPresent on the nv2a-ack thread, with the surface the
@@ -38,9 +49,10 @@
  * backend copies its frame into, and the main thread presents them FIFO.
  *
  * The settings overlay (src/overlay, overlay.h) rides on both layer presenters:
- * every event of the loop goes to it first, it is drawn into the drawable after
- * the game's image, and while it is open the loop presents on every turn, not
- * only on a new game frame. The SDL renderer path has none.
+ * every event of the loop goes to it first (main thread), it is drawn into the
+ * drawable after the game's image (present thread), and while it is open the
+ * present thread presents on every turn, not only on a new game frame. The
+ * SDL renderer path has none.
  *
  * RECOMP_HEADLESS=1 (or no display, or SDL video failing to start) skips all
  * of it: the guest runs on the main thread exactly as before.
@@ -104,12 +116,15 @@
 #include "kernel/nv2a_pb_state.h"
 #include "kernel/nv2a_backend_common.h"
 #include "window_title.h"
+#include "frames_lost_rule.h"
+#include "frame_wake.h"
 #include <strings.h>
 #if defined(__APPLE__)
 #include "fb_present_metal.h"
 #endif
 #if defined(XBOXRECOMP_HAVE_VULKAN)
 #include "fb_present_vulkan.h"
+#include <SDL_vulkan.h>
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
@@ -169,9 +184,21 @@ static int             s_trace_drops = -1;
 static uint64_t        s_pub_ns[8];
 static uint64_t        s_last_pickup_ns, s_last_present_ns;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Signalled at each publish and each request, under s_lock: the present
+ * thread waits on it (frame_wake.h, BO-210); so does the main loop on the SDL
+ * renderer path. */
+static pthread_cond_t  s_pub_cv = PTHREAD_COND_INITIALIZER;
+static volatile uint64_t s_last_pub_ns;     /* the last publish, host ns */
 static volatile int    s_running;            /* window up: flips copy */
-static Uint32          s_frame_event;        /* wakes the main loop */
-static volatile int    s_wake_pending;
+static Uint32          s_frame_event;        /* wakes the main loop (a lost device) */
+/* The present thread: its requests (FW_CTL_*, under s_lock), and what the
+ * main thread tells it of the window. */
+static unsigned        s_pt_ctl;
+static volatile int    s_win_ok = 1;         /* not minimised, hidden or (Android) away */
+static volatile int    s_app_away;           /* Android: the app is in the background */
+/* What reached the window, for the counters and the closing line: the
+ * present thread's (the main thread's on the SDL renderer path). */
+static uint64_t        s_shown_seq, s_presents, s_dropped, s_upload_ns;
 static volatile int    s_in_present;         /* ack thread inside Present */
 /* Layer mode (macOS, Metal backend): the window has a CAMetalLayer and no
  * SDL_Renderer, and a slot is a GPU texture in fb_present_metal.m (indexed by
@@ -180,7 +207,8 @@ static int             s_layer;
 /* Vulkan slot mode (RECOMP_PB_BACKEND=vulkan): s_layer is set too, and a
  * slot is an image in fb_present_vulkan.c. */
 static int             s_vk;
-/* The settings overlay is open: the main loop turns fast and presents. */
+/* The settings overlay is open: the present thread presents every turn
+ * (the present thread's; read by the counters). */
 static int             s_overlay_open;
 static int             s_overlay_note;  /* the overlay shows a line without being open */
 
@@ -193,6 +221,35 @@ static uint64_t now_ns(clockid_t c)
     clock_gettime(c, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+
+/* RECOMP_DEBUG=pump_stall=<ms>[,pump_stall_after=<s>] (BO-210 test): the
+ * main loop sleeps before each event read, standing in for a blocking X11
+ * pump. Zero cost when off: one cached flag. */
+static int pump_stall_ms(void)
+{
+    static int ms = -1;
+    static double after;
+    static uint64_t t0;
+    if (ms < 0) {
+        const char *v = recomp_env(RENV_PUMP_STALL);
+        const char *a = recomp_env(RENV_PUMP_STALL_AFTER);
+        ms = v ? atoi(v) : 0;
+        after = a ? atof(a) : 0.0;
+        t0 = now_ns(CLOCK_MONOTONIC);
+    }
+    if (!ms)
+        return 0;
+    if ((double)(now_ns(CLOCK_MONOTONIC) - t0) < after * 1e9)
+        return 0;
+    return ms;
+}
+
+static void pump_stall_sleep(int ms)
+{
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -289,16 +346,11 @@ static void publish(uint32_t w, uint32_t h, uint32_t bpp, uint64_t t0)
         s_back = t;
         s_ready_seq++;
         s_pub_ns[s_ready_seq & 7] = now_ns(CLOCK_MONOTONIC);
+        __atomic_store_n(&s_last_pub_ns, s_pub_ns[s_ready_seq & 7], __ATOMIC_RELEASE);
+        pthread_cond_signal(&s_pub_cv);
     }
     pthread_mutex_unlock(&s_lock);
-
-    /* Wake the main loop, once per batch of frames it has not looked at. */
-    if (!__atomic_exchange_n(&s_wake_pending, 1, __ATOMIC_ACQ_REL)) {
-        SDL_Event ev;
-        memset(&ev, 0, sizeof ev);
-        ev.type = s_frame_event;
-        SDL_PushEvent(&ev);
-    }
+    /* No SDL event: the present thread waits on s_pub_cv (BO-210). */
 
     __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_copy_ns, now_ns(CLOCK_MONOTONIC) - t0, __ATOMIC_RELAXED);
@@ -639,12 +691,26 @@ static void shot_parse(void)
 
 /* A shot asked for by name (xbox_HostWindowShot): the next present is read
  * back into that file, whatever it shows (black before the first frame, an
- * open overlay over the paused title). The window's thread only. */
+ * open overlay over the paused title). Under s_lock; the present thread
+ * takes it. */
 static char s_shot_req[512];
+
+/* A request for the present thread: its wait ends at once. Any thread. */
+static void pt_request(unsigned bits)
+{
+    pthread_mutex_lock(&s_lock);
+    s_pt_ctl |= bits;
+    pthread_cond_signal(&s_pub_cv);
+    pthread_mutex_unlock(&s_lock);
+}
 
 void xbox_HostWindowShot(const char *path)
 {
+    pthread_mutex_lock(&s_lock);
     snprintf(s_shot_req, sizeof s_shot_req, "%s", path ? path : "");
+    s_pt_ctl |= FW_CTL_DIRTY;
+    pthread_cond_signal(&s_pub_cv);
+    pthread_mutex_unlock(&s_lock);
 }
 
 static char     s_burst_prefix[480];
@@ -652,8 +718,10 @@ static unsigned s_burst_n;
 
 void xbox_HostWindowShotBurst(const char *prefix, unsigned n)
 {
+    pthread_mutex_lock(&s_lock);
     snprintf(s_burst_prefix, sizeof s_burst_prefix, "%s", prefix ? prefix : "");
     s_burst_n = n;
+    pthread_mutex_unlock(&s_lock);
 }
 
 /* Shots may be asked for while running: the presenters keep their images
@@ -1192,6 +1260,9 @@ static int android_lifecycle(void *user, SDL_Event *ev)
 {
     (void)user;
     if (ev->type == SDL_APP_WILLENTERBACKGROUND || ev->type == SDL_APP_DIDENTERBACKGROUND) {
+        /* The present thread presents nothing while away (SDL's own thread
+         * used to block in its pump then, and the presents with it). */
+        __atomic_store_n(&s_app_away, 1, __ATOMIC_RELEASE);
         if (!s_bg_paused && !xbox_HostPaused()) {
             s_bg_paused = 1;
             xbox_HostPause(1);
@@ -1212,6 +1283,8 @@ static int android_lifecycle(void *user, SDL_Event *ev)
             fprintf(stderr, "[PRESENT] the app is in the background: the title is held\n");
     } else if (ev->type == SDL_APP_DIDENTERFOREGROUND) {
         fprintf(stderr, "[PRESENT] the app is back in front\n");
+        __atomic_store_n(&s_app_away, 0, __ATOMIC_RELEASE);
+        pt_request(FW_CTL_DIRTY);
         if (s_bg_paused) {
             s_bg_paused = 0;
             xbox_HostPause(0);
@@ -1221,22 +1294,511 @@ static int android_lifecycle(void *user, SDL_Event *ev)
 }
 #endif
 
+/* The counters line (BO-210): what happens to the executor's frames on
+ * their way to the glass, one line per 10 s. Printed every window with
+ * diagnostic logging on; always (at most once a minute) when fewer frames
+ * were presented or shown than flipped by more than 3 a second for a whole
+ * window, with one 'back to normal' line after. The Deck's 45 fps at 60
+ * executor flips (BO-210) had no line at all. The present thread only (the
+ * main thread on the SDL renderer path). */
+#define CNT_WINDOW_NS 10000000000ull
+static struct {
+    uint64_t t0, flips, pub, pick, drop, wf, wo, wt, presents;
+    uint64_t picked, wake_frame, wake_other, wake_timeout, hand_max_ns;
+    uint64_t low_since, last_alarm;
+    int low, hidden;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    FbvCounts v;
+#endif
+} s_cnt;
+
+static void counters_tick(uint64_t now, uint64_t dropped, uint64_t presents, int visible)
+{
+    uint64_t flips = __atomic_load_n(&nv2a_pb_gpu_state()->flips, __ATOMIC_RELAXED);
+    uint64_t pub = __atomic_load_n(&s_ready_seq, __ATOMIC_RELAXED);
+    double dt, fr, got, nr = 0, sr = -1;
+    char line[640], vk[320];
+    int low, first = 0, limited = 0;
+    uint64_t cyc = 0;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    FbvCounts v;
+    memset(&v, 0, sizeof v);
+#endif
+    /* Hidden, or the overlay open (the title paused or redrawn under it),
+     * at any time in the window: no alarm for it. */
+    if (!visible || s_overlay_open)
+        s_cnt.hidden = 1;
+    if (!s_cnt.t0 || now < s_cnt.t0) {
+        s_cnt.t0 = now;
+        first = 1;
+    } else if (now - s_cnt.t0 < CNT_WINDOW_NS) {
+        return;
+    }
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk)
+        fbv_counts(&v);   /* once a window: it clears the longest present */
+#endif
+    if (first)
+        goto base;
+    dt = (double)(now - s_cnt.t0) / 1e9;
+    fr = (double)(uint32_t)((uint32_t)flips - (uint32_t)s_cnt.flips) / dt;
+    vk[0] = 0;
+    got = (double)(presents - s_cnt.presents) / dt;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk) {
+        nr = (double)(v.presents_new - s_cnt.v.presents_new) / dt;
+        got = nr;
+        if (v.have_wait) {
+            sr = (double)(v.shown - s_cnt.v.shown) / dt;
+            if (sr < got)
+                got = sr;
+        }
+        snprintf(vk, sizeof vk, "; presents %llu new + %llu refills + %llu redraws (no skips),"
+                 " shown %s%llu (+%llu refill repeats); longest present %.1f ms; refresh: window"
+                 " system %.3f ms, present_wait steps %.3f ms; %s, depth %d, rows too deep %u,"
+                 " refills held back %u",
+                 (unsigned long long)(v.presents_new - s_cnt.v.presents_new),
+                 (unsigned long long)(v.refills - s_cnt.v.refills),
+                 (unsigned long long)(v.presents_redraw - s_cnt.v.presents_redraw),
+                 v.have_wait ? "" : "(no present_wait) ",
+                 (unsigned long long)(v.shown - s_cnt.v.shown),
+                 (unsigned long long)(v.shown_rep - s_cnt.v.shown_rep), v.present_max_ns / 1e6,
+                 v.wsi_cycle_ns / 1e6, v.period_ns / 1e6, v.smooth ? "smooth on" : "smooth off",
+                 v.depth, v.deep, v.held);
+    }
+#endif
+    (void)nr;
+    snprintf(line, sizeof line, "flips %u (%.1f/s), handed over %llu, picked up %llu, replaced %llu"
+             "%s; %s wakes: frame %llu, other %llu, timeout %llu; longest handover"
+             " %.1f ms",
+             (unsigned)((uint32_t)flips - (uint32_t)s_cnt.flips), fr,
+             (unsigned long long)(pub - s_cnt.pub),
+             (unsigned long long)(s_cnt.picked - s_cnt.pick),
+             (unsigned long long)(dropped - s_cnt.drop), vk,
+             s_layer ? "present-thread" : "main-thread",
+             (unsigned long long)(s_cnt.wake_frame - s_cnt.wf),
+             (unsigned long long)(s_cnt.wake_other - s_cnt.wo),
+             (unsigned long long)(s_cnt.wake_timeout - s_cnt.wt), s_cnt.hand_max_ns / 1e6);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    cyc = s_vk ? v.wsi_cycle_ns : 0;
+#endif
+    limited = flr_limited(fr, cyc);
+    low = flr_lost(fr, got, cyc, s_cnt.hidden);
+    if (low) {
+        if (!s_cnt.low)
+            s_cnt.low_since = s_cnt.t0;
+        s_cnt.low = 1;
+        if (!s_cnt.last_alarm || now - s_cnt.last_alarm >= 60000000000ull) {
+            s_cnt.last_alarm = now;
+            XR_NOTICE("[PACING] frames lost after the flip: %.1f a second reached the display of"
+                      " %.1f flipped; counters %.0f s: %s\n", got, fr, dt, line);
+        } else {
+            fprintf(stderr, "[PACING] counters %.0f s (frames lost): %s\n", dt, line);
+        }
+    } else if (limited) {
+        /* A frame limit (the window system's refresh slower than the
+         * title's frame): fewer shown by design, said in the diagnostic
+         * line only, and no 'back to normal' for it. */
+        fprintf(stderr, "[PACING] counters %.0f s (frame limit: refresh %.3f ms): %s\n", dt,
+                cyc / 1e6, line);
+        s_cnt.low = 0;
+    } else {
+        if (s_cnt.low)
+            XR_NOTICE("[PACING] frames after the flip back to normal: %.1f a second of %.1f"
+                      " flipped (low for %.0f s); counters %.0f s: %s\n", got, fr,
+                      (now - s_cnt.low_since) / 1e9 - dt, dt, line);
+        else
+            fprintf(stderr, "[PACING] counters %.0f s: %s\n", dt, line);
+        s_cnt.low = 0;
+    }
+    s_cnt.t0 = now;
+    s_cnt.hidden = !visible || s_overlay_open;
+base:
+    s_cnt.flips = flips;
+    s_cnt.pub = pub;
+    s_cnt.pick = s_cnt.picked;
+    s_cnt.drop = dropped;
+    s_cnt.wf = s_cnt.wake_frame;
+    s_cnt.wo = s_cnt.wake_other;
+    s_cnt.wt = s_cnt.wake_timeout;
+    s_cnt.presents = presents;
+    s_cnt.hand_max_ns = 0;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    s_cnt.v = v;
+#endif
+}
+
+/* RECOMP_PRESENT_STATS=1: a [PRESENT] line every 5 s, from the thread that
+ * presents. */
+static void stats_tick(const char *who)
+{
+    static uint64_t t_stat, cpu_stat, pres_stat, flips_stat;
+    static const char *last_who;
+    uint64_t t = now_ns(CLOCK_MONOTONIC);
+    if (who != last_who) {               /* this thread's first call */
+        last_who = who;
+        t_stat = t;
+        cpu_stat = now_ns(CLOCK_THREAD_CPUTIME_ID);
+        pres_stat = s_presents;
+        flips_stat = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+        return;
+    }
+    if (t - t_stat >= 5000000000ull) {
+        uint64_t cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
+        double dt = (double)(t - t_stat) / 1e9;
+        uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+        fprintf(stderr, "[PRESENT] %.1f flips/s copied, %.1f presents/s,"
+                " %s %.1f%% of a core, ack copy %.3f ms/flip\n",
+                (double)(fl - flips_stat) / dt,
+                (double)(s_presents - pres_stat) / dt, who,
+                100.0 * (double)(cpu - cpu_stat) / (double)(t - t_stat),
+                fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        if (s_vk)
+            fbv_timing_report("presents");
+#endif
+        t_stat = t;
+        cpu_stat = cpu;
+        pres_stat = s_presents;
+        flips_stat = fl;
+    }
+}
+
+/* ── The present thread (layer presenters: Vulkan, Metal) ─────────────────
+ *
+ * Waits for work on s_pub_cv (frame_wake.h): a new frame, or a request of
+ * the main thread's (FW_CTL_DIRTY: expose, resize, a shot, the overlay
+ * opening; FW_CTL_QUIT). While the overlay is open, or a notice is up, it
+ * presents on every turn as the main loop did, paced by the present itself.
+ * s_lock is held for the wait and the slot swap only, never across a present.
+ * The window's flags come from the main thread (s_win_ok): no SDL window call
+ * here but the presenters' own. */
+static SDL_Window *s_pt_win;
+static int         s_pt_vsync, s_pt_stats;
+static pthread_t   s_pt_th;
+
+static void *present_thread(void *arg)
+{
+    SDL_Window *win = s_pt_win;
+    uint64_t shown_seq = 0;
+    uint32_t shown_flip = 0;
+    int dirty = 1;                       /* paint black before the first frame */
+    int shoot = 0, burst = 0, new_frame = 0, retry_soon = 0, failed = 0;
+    char req[sizeof s_shot_req] = "";
+    char bprefix[sizeof s_burst_prefix] = "";
+    unsigned bn = 0;
+
+    (void)arg;
+    (void)new_frame;
+    xbox_log_thread_role("present", 0);
+    for (;;) {
+        uint64_t seq, timeout_ns;
+        unsigned ctl;
+        int w, ok = __atomic_load_n(&s_win_ok, __ATOMIC_ACQUIRE)
+                    && !__atomic_load_n(&s_app_away, __ATOMIC_ACQUIRE);
+        int filter = nv2a_host_opts()->present_filter;
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        s_overlay_open = xbox_OverlayOpen();
+        s_overlay_note = xbox_OverlayNotice();
+        dirty |= s_overlay_open || s_overlay_note;
+#endif
+        /* How long to wait for work: not at all with a present to make;
+         * an open overlay is redrawn every turn (the present paces it), a
+         * notice at 60; a skipped Metal frame is tried again in 4 ms, a
+         * failed present (no drawable, no surface yet) in 16. */
+        if (!ok)
+            timeout_ns = 100000000ull;   /* the main thread asks again when it is */
+        else if (s_overlay_open)
+            timeout_ns = s_pt_vsync ? 1000000ull : 8000000ull;
+        else if (retry_soon)
+            timeout_ns = 4000000ull;
+        else if (s_overlay_note || (dirty && failed))
+            timeout_ns = 16000000ull;
+        else if (dirty)
+            timeout_ns = 0;
+        else
+            timeout_ns = 100000000ull;
+
+        pthread_mutex_lock(&s_lock);
+        w = fw_wait_work(&s_lock, &s_pub_cv, &s_ready_seq, shown_seq, &s_pt_ctl, timeout_ns);
+        ctl = s_pt_ctl;
+        s_pt_ctl = 0;
+        if (s_shot_req[0]) {
+            memcpy(req, s_shot_req, sizeof req);
+            s_shot_req[0] = 0;
+        }
+        if (s_burst_n) {
+            memcpy(bprefix, s_burst_prefix, sizeof bprefix);
+            bn = s_burst_n;
+            s_burst_n = 0;
+        }
+        seq = s_ready_seq;
+        if (seq != shown_seq) {
+            int t = s_front;
+            uint64_t h = now_ns(CLOCK_MONOTONIC) - s_pub_ns[seq & 7];
+            s_front = s_ready;
+            s_ready = t;
+            s_cnt.picked++;
+            if (h > s_cnt.hand_max_ns && h < 10000000000ull)
+                s_cnt.hand_max_ns = h;
+        }
+        pthread_mutex_unlock(&s_lock);
+        if (ctl & FW_CTL_QUIT)
+            break;
+        if (w == FW_WORK_FRAME)
+            s_cnt.wake_frame++;
+        else if (w == FW_WORK_CTL)
+            s_cnt.wake_other++;
+        else if (timeout_ns)
+            s_cnt.wake_timeout++;
+        if (ctl & FW_CTL_DIRTY)
+            dirty = 1;
+        if (w == FW_WORK_NONE)
+            retry_soon = 0;              /* its time is up: try again below */
+
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        /* The title is paused behind an open overlay, so no new frame comes
+         * to take a pending RECOMP_WINDOW_SHOT: any pending one is taken now,
+         * of what is shown (the overlay over the last frame). */
+        if (s_overlay_open && shown_seq)
+            shoot |= s_shot_n && shot_due(0xFFFFFFFFu);
+#endif
+        if (req[0]) {
+            shoot = 1;                  /* of whatever the next present shows */
+            dirty = 1;
+        }
+        if (s_trace_drops < 0) {
+            const char *tr = recomp_env(RENV_PACING_TRACE);
+            s_trace_drops = tr && !strcmp(tr, "all");
+        }
+        if (s_trace_drops && seq > shown_seq + 1 && shown_seq) {
+            uint64_t now = now_ns(CLOCK_MONOTONIC);
+            fprintf(stderr, "[PACING] window dropped %llu at t_us %llu: published"
+                    " %.2f and %.2f ms ago, last pickup %.2f ms ago, last present"
+                    " %.2f ms\n", (unsigned long long)(seq - shown_seq - 1),
+                    (unsigned long long)(now / 1000u),
+                    (now - s_pub_ns[(shown_seq + 1) & 7]) / 1e6,
+                    (now - s_pub_ns[seq & 7]) / 1e6,
+                    (now - s_last_pickup_ns) / 1e6, s_last_present_ns / 1e6);
+        }
+        if (seq != shown_seq) {
+            /* The slot is already a GPU texture. */
+            s_last_pickup_ns = now_ns(CLOCK_MONOTONIC);
+            new_frame = 1;
+            s_dropped += seq - shown_seq - 1;
+            shown_flip = s_slot[s_front].flip;
+            /* A shot still pending (no drawable yet) is taken of this frame,
+             * under its own flip number, as for a dropped flip. */
+            shoot |= s_shot_n && shot_due(shown_flip);
+            burst = bn > 0 && !req[0];
+            shoot |= burst;
+            shown_seq = seq;
+            __atomic_store_n(&s_shown_seq, seq, __ATOMIC_RELAXED);
+            dirty = 1;
+            retry_soon = 0;
+        }
+
+        if (dirty && ok && !retry_soon) {
+            struct fb_slot *f = &s_slot[s_front];
+            uint64_t t0 = now_ns(CLOCK_MONOTONIC);
+            char path[512];
+            int rc = 0;
+            if (shoot && req[0])
+                snprintf(path, sizeof path, "%s", req);
+            else if (shoot && burst)
+                snprintf(path, sizeof path, "%s%05u.bmp", bprefix, shown_flip);
+            else if (shoot)
+                shot_path(path, sizeof path, shown_flip);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+            if (s_vk)
+                rc = fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
+                                 filter, shoot ? path : NULL, shown_flip);
+#endif
+#if defined(__APPLE__)
+            if (!s_vk) {
+                /* A frame's own vblank goes with its first present only: a
+                 * redraw (the overlay, an expose) shows it again. */
+                uint64_t vbl = shown_seq && new_frame ? f->vbl_ns : 0;
+                rc = fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
+                                 filter, shoot ? path : NULL, shown_flip, vbl);
+                if (rc == 2) {
+                    /* Skipped (present timing: no drawable without a wait).
+                     * The next frame replaces it; should none come (the
+                     * title stopped on this picture), it is shown as a
+                     * redraw. */
+                    new_frame = 0;
+                    retry_soon = 1;
+                    rc = 0;
+                } else if (rc) {
+                    s_last_present_ns = now_ns(CLOCK_MONOTONIC) - t0;
+                }
+            }
+#endif
+            (void)filter;
+            if (rc) {
+                new_frame = 0;
+                dirty = 0;
+                failed = 0;
+                if (shoot && burst && bn)
+                    bn--;
+                shoot = 0;
+                burst = 0;
+                req[0] = 0;
+                s_presents++;
+#if defined(__ANDROID__)
+                {
+                    /* The hot threads' work for this frame (android_perf.c). */
+                    extern void xbox_AndroidPerfFrame(void);
+                    xbox_AndroidPerfFrame();
+                }
+#endif
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                xbox_OverlayFramePresented();
+#endif
+            } else if (!retry_soon) {
+                /* No drawable (display asleep, window occluded), no surface
+                 * yet, a lost device: tried again in a while. */
+                failed = 1;
+            }
+            s_upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
+        }
+        counters_tick(now_ns(CLOCK_MONOTONIC), s_dropped, s_presents,
+                      __atomic_load_n(&s_win_ok, __ATOMIC_ACQUIRE));
+        if (s_pt_stats)
+            stats_tick("present thread");
+    }
+    return NULL;
+}
+
+static int present_thread_start(SDL_Window *win, int vsync, int stats)
+{
+    pthread_attr_t attr;
+    int rc;
+    s_pt_win = win;
+    s_pt_vsync = vsync;
+    s_pt_stats = stats;
+    pthread_attr_init(&attr);
+#if defined(__APPLE__)
+    /* The main thread's class: the presents were made there. */
+    {
+        qos_class_t qos;
+        int rel;
+        if (pthread_get_qos_class_np(pthread_self(), &qos, &rel) == 0
+                && qos != QOS_CLASS_UNSPECIFIED)
+            pthread_attr_set_qos_class_np(&attr, qos, rel);
+    }
+#endif
+    rc = pthread_create(&s_pt_th, &attr, present_thread, NULL);
+    pthread_attr_destroy(&attr);
+    return rc == 0;
+}
+
+/* Before the presenter goes: the present thread returns (it is woken
+ * whether or not a frame ever came). */
+static void present_thread_stop(void)
+{
+    pt_request(FW_CTL_QUIT);
+    pthread_join(s_pt_th, NULL);
+}
+
+/* ── the mouse cursor ─────────────────────────────────────────────────
+ * Hidden in play, so that it does not sit over the picture; shown by a
+ * mouse move or click, hidden again after CURSOR_IDLE_MS without one and at
+ * once by a key or a pad input. The settings overlay is the mouse's: the
+ * cursor is shown while it is open whatever else comes in, and hidden the
+ * turn it closes. SDL_ShowCursor is the thread that pumps events', so all of
+ * this runs in xbox_HostWindowMain's loop and never on the present thread;
+ * the overlay's ImGui backend does not touch the cursor either
+ * (ImGuiConfigFlags_NoMouseCursorChange, overlay_ui.cpp), or it would show
+ * it on every frame of a notice or the perf panel. A touch is not a mouse:
+ * SDL's synthetic touch-mouse events (Android, a Deck's screen) are
+ * ignored, and the calls are harmless where there is no pointer. */
+#define CURSOR_IDLE_MS 2500u
+
+struct cursor_state {
+    Uint32 last_move;       /* SDL_GetTicks() of the last mouse move or click */
+    int shown;              /* what this code last asked SDL for */
+    int want;               /* from the events of this turn: +1 show, -1 hide */
+    int ov_was_open;
+};
+
+static void cursor_event(struct cursor_state *c, const SDL_Event *ev)
+{
+    switch (ev->type) {
+    case SDL_MOUSEMOTION:
+        if (ev->motion.which != SDL_TOUCH_MOUSEID && (ev->motion.xrel || ev->motion.yrel)) {
+            c->last_move = SDL_GetTicks();
+            c->want = 1;
+        }
+        break;
+    case SDL_MOUSEBUTTONDOWN:
+        if (ev->button.which != SDL_TOUCH_MOUSEID) {
+            c->last_move = SDL_GetTicks();
+            c->want = 1;
+        }
+        break;
+    case SDL_KEYDOWN:
+    case SDL_CONTROLLERBUTTONDOWN:
+    case SDL_JOYBUTTONDOWN:
+        c->want = -1;
+        break;
+    case SDL_CONTROLLERAXISMOTION:
+        if (ev->caxis.value > 8000 || ev->caxis.value < -8000)
+            c->want = -1;
+        break;
+    default:
+        break;
+    }
+}
+
+static void cursor_set(struct cursor_state *c, int show, const char *why)
+{
+    if (show == c->shown)
+        return;
+    SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
+    c->shown = show;
+    XR_NOTICE("[PRESENT] cursor %s (%s)\n", show ? "shown" : "hidden", why);
+}
+
+/* Once per turn of the loop, after the events were read. */
+static void cursor_tick(struct cursor_state *c, int ov_open)
+{
+    int want = c->want;
+
+    c->want = 0;
+    if (ov_open) {
+        cursor_set(c, 1, "overlay open");
+    } else if (c->ov_was_open) {
+        cursor_set(c, 0, "overlay closed");
+    } else if (want < 0) {
+        cursor_set(c, 0, "key or pad input");
+    } else if (want > 0) {
+        cursor_set(c, 1, "mouse moved");
+    } else if (c->shown && SDL_GetTicks() - c->last_move >= CURSOR_IDLE_MS) {
+        cursor_set(c, 0, "mouse idle");
+    }
+    c->ov_was_open = ov_open;
+    /* Whoever else asked SDL for the cursor (the window system on a focus
+     * change, a driver): it stays as this code decided. */
+    if (!c->shown && SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE)
+        SDL_ShowCursor(SDL_DISABLE);
+}
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
     SDL_Renderer *ren = NULL;
     SDL_Texture *tex = NULL;
     uint32_t tex_w = 0, tex_h = 0, tex_bpp = 0;
-    uint64_t shown_seq = 0, presents = 0, dropped_base = 0;
-    uint64_t t_start, cpu_start, t_stat, cpu_stat, pres_stat = 0, flips_stat = 0;
+    uint64_t shown_seq = 0;      /* the SDL renderer path's (s_shown_seq) */
+    uint64_t t_start, cpu_start;
     struct xbox_title_clock title_clock = {0};
     int title_stats = recomp_env_on(RENV_TITLE_STATS);
-    uint64_t upload_ns = 0;
     int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
     int win_w, win_pos, win_pw, win_ph;
-    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, burst = 0, had_pads, new_frame = 0, retry_soon = 0;
+    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, had_pads;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
@@ -1346,7 +1908,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             } else if (win) {
                 fit_window(win);   /* before the swapchain takes the size */
                 if (fbv_create(win, vsync, shots_wanted(), why, sizeof why))
-                    s_layer = s_vk = dirty = 1;   /* paint black before the first frame */
+                    s_layer = s_vk = 1;   /* the present thread paints black first */
             }
             if (!s_vk) {
                 if (win) {
@@ -1377,11 +1939,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                              " will run on the processor, which is far too slow to play.");
                     if (!android_offer_driver_reset(msg))
 #else
+                    /* BO-231 (GitHub #37): no loader, a loader older than
+                     * Vulkan 1.3, or no device that has it. */
                     snprintf(msg, sizeof msg,
-                             "No usable Vulkan 1.3 graphics driver:\n%s\n\n"
-                             "The game will draw on the CPU, which is very slow. "
-                             "Update the graphics driver (Vulkan 1.3 is needed); the "
-                             "game's log says which device was tried.", why);
+                             "Takedawn needs a Vulkan 1.3 graphics driver. Update the driver "
+                             "from Intel, AMD or NVIDIA.\n\n%s\n\n"
+                             "Until then the game draws on the CPU, which is far too slow "
+                             "to play. The log says which device was tried.", why);
 #endif
                         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
                                                  "Graphics driver", msg, NULL);
@@ -1403,7 +1967,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             else {
                 fit_window(win);
                 if (fbm_create(win, vsync, shots_wanted(), why, sizeof why))
-                    s_layer = dirty = 1;   /* paint black before the first frame */
+                    s_layer = 1;   /* the present thread paints black first */
             }
             if (!s_layer) {
                 fbm_destroy();
@@ -1491,8 +2055,36 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     xbox_InputInit();
     xbox_log_thread_role("sdl-main", 0);
     s_running = 1;
+    if (s_layer) {
+#if defined(__APPLE__)
+        /* The layer's size, the display and the timing strategy before the
+         * first present (then each turn of the loop). */
+        if (!s_vk)
+            fbm_main_tick(win);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        if (s_vk) {
+            int dw = 0, dh = 0;
+            SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+            fbv_note_drawable(dw, dh);
+        }
+#endif
+#endif
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        xbox_OverlayPlatformFrame(s_vk);   /* the ImGui context, on this thread */
+#endif
+        if (!present_thread_start(win, vsync, stats)) {
+            XR_ERROR( "[PRESENT] cannot start the present thread; running headless\n");
+            s_running = 0;
+            xbox_InputSetMainPump(0);
+            close_present(ren);
+            SDL_DestroyWindow(win);
+            return guest_main();
+        }
+    }
     if (!start_guest()) {
         XR_ERROR( "[PRESENT] cannot start the guest thread; running headless\n");
+        if (s_layer)
+            present_thread_stop();
         s_running = 0;
         xbox_InputSetMainPump(0);
         close_present(ren);
@@ -1500,8 +2092,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     }
 
-    t_start = t_stat = now_ns(CLOCK_MONOTONIC);
-    cpu_start = cpu_stat = now_ns(CLOCK_THREAD_CPUTIME_ID);
+    t_start = now_ns(CLOCK_MONOTONIC);
+    cpu_start = now_ns(CLOCK_THREAD_CPUTIME_ID);
 
 #if defined(XBOXRECOMP_HAVE_VULKAN)
     {
@@ -1510,6 +2102,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         nvk_set_lost_handler(gfx_lost_handler);
     }
 #endif
+    /* The mouse cursor starts hidden (cursor_tick, above the main loop). */
+    struct cursor_state cur = {0, 0, 0, 0};
+    SDL_ShowCursor(SDL_DISABLE);
     while (!quit && !guest_done) {
         display_rate_poll(win);
         if (__atomic_load_n(&s_gfx_lost, __ATOMIC_ACQUIRE) == 1) {
@@ -1520,17 +2115,42 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
         SDL_Event ev;
         uint64_t seq;
+        int have_ev, ov_open = 0, ov_note = 0;
+        int stall_ms = pump_stall_ms();
+        int flowing = fw_flowing(__atomic_load_n(&s_last_pub_ns, __ATOMIC_ACQUIRE),
+                                 now_ns(CLOCK_MONOTONIC));
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
         /* The overlay's Display page changes the filter while running. */
         filter = nv2a_host_opts()->present_filter;
         xbox_OverlayPoll();
+        ov_open = s_layer && xbox_OverlayOpen();
+        ov_note = s_layer && xbox_OverlayNotice();
 #endif
 
         /* One event loop for the window and the controllers: SDL_PumpEvents
          * (inside the wait) also updates the game controllers, which
-         * xinput_device.c then only reads. */
-        if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8)
-                                      : retry_soon ? 4 : s_overlay_note ? 16 : 100)) {
+         * xinput_device.c then only reads. No frame wakes this loop (the
+         * present thread takes them, frame_wake.h): while frames come it
+         * reads the events at least every FW_TICK_NS, as often as the loop
+         * that took the frames did, and an open overlay's mouse as often as
+         * it is redrawn. */
+        if (stall_ms)
+            pump_stall_sleep(stall_ms);
+        if (s_layer) {
+            have_ev = SDL_WaitEventTimeout(&ev, ov_open ? (vsync ? 1 : 8)
+                                           : flowing ? (int)(FW_TICK_NS / 1000000ull)
+                                           : ov_note ? 16 : 100);
+        } else {
+            /* The SDL renderer path takes and presents the frames here: the
+             * wait is on the slot's condition variable, then SDL's events
+             * are read without blocking. */
+            pthread_mutex_lock(&s_lock);
+            fw_wait_new(&s_lock, &s_pub_cv, &s_ready_seq, s_shown_seq,
+                        flowing ? FW_TICK_NS : 10000000ull);
+            pthread_mutex_unlock(&s_lock);
+            have_ev = SDL_PollEvent(&ev);
+        }
+        if (have_ev) {
             do {
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 if (s_layer)
@@ -1543,144 +2163,143 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 xbox_InputSdlEvent(&ev);
                 /* Controllers come and go, and take a port, here. */
                 xbox_InputPadEvent(&ev);
+                cursor_event(&cur, &ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
                     guest_done = 1;
-                else if (ev.type == s_frame_event)
-                    __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
                 else if (ev.type == SDL_WINDOWEVENT
                          && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
-                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
-                    dirty = 1;
+                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)) {
+                    if (s_layer)
+                        pt_request(FW_CTL_DIRTY);
+                    else
+                        dirty = 1;
+                }
             } while (SDL_PollEvent(&ev));
         }
-
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
-        /* An open overlay is redrawn on every turn (it animates, and the
-         * title behind it is paused, so no frame would wake the loop). */
-        s_overlay_open = s_layer && xbox_OverlayOpen();
-        s_overlay_note = s_layer && xbox_OverlayNotice();
-        dirty |= s_overlay_open || s_overlay_note;
-        /* The title is paused behind an open overlay, so no new frame comes
-         * to take a pending RECOMP_WINDOW_SHOT: any pending one is taken now,
-         * of what is shown (the overlay over the last frame). */
-        if (s_overlay_open && shown_seq)
-            shoot |= s_shot_n && shot_due(0xFFFFFFFFu);
+        ov_open = s_layer && xbox_OverlayOpen();    /* a key in this batch may have opened it */
 #endif
-        if (s_shot_req[0] && s_layer) {
-            shoot = 1;                  /* of whatever the next present shows */
-            dirty = 1;
-        }
-        pthread_mutex_lock(&s_lock);
-        seq = s_ready_seq;
-        if (seq != shown_seq) {
-            int t = s_front;
-            s_front = s_ready;
-            s_ready = t;
-        }
-        pthread_mutex_unlock(&s_lock);
+        cursor_tick(&cur, ov_open);
 
-        if (s_trace_drops < 0) {
-            const char *tr = recomp_env(RENV_PACING_TRACE);
-            s_trace_drops = tr && !strcmp(tr, "all");
-        }
-        if (s_trace_drops && seq > shown_seq + 1 && shown_seq) {
-            /* The frames between were overwritten unseen: when they and
-             * this one were published, and how long the last present took. */
-            uint64_t now = now_ns(CLOCK_MONOTONIC);
-            fprintf(stderr, "[PACING] window dropped %llu at t_us %llu: published"
-                    " %.2f and %.2f ms ago, last pickup %.2f ms ago, last present"
-                    " %.2f ms\n", (unsigned long long)(seq - shown_seq - 1),
-                    (unsigned long long)(now / 1000u),
-                    (now - s_pub_ns[(shown_seq + 1) & 7]) / 1e6,
-                    (now - s_pub_ns[seq & 7]) / 1e6,
-                    (now - s_last_pickup_ns) / 1e6, s_last_present_ns / 1e6);
-        }
-        if (seq != shown_seq)
-            s_last_pickup_ns = now_ns(CLOCK_MONOTONIC);
-        (void)new_frame;               /* read by the Metal present only */
-        if (seq != shown_seq && s_layer) {
-            /* Layer mode: the slot is already a GPU texture. */
-            new_frame = 1;
-            dropped_base += seq - shown_seq - 1;
-            shown_flip = s_slot[s_front].flip;
-            /* A shot still pending (no drawable yet) is taken of this frame,
-             * under its own flip number, as for a dropped flip. */
-            shoot |= s_shot_n && shot_due(shown_flip);
-            burst = s_burst_n > 0 && !s_shot_req[0];
-            shoot |= burst;
-            shown_seq = seq;
-            dirty = 1;
-        } else if (seq != shown_seq) {
-            struct fb_slot *f = &s_slot[s_front];
-            uint64_t t0 = now_ns(CLOCK_MONOTONIC);
-
-            dropped_base += seq - shown_seq - 1;
-            shown_flip = f->flip;
-            shoot = s_shot_n && shot_due(shown_flip);
-            shown_seq = seq;
-            if (!tex || f->w != tex_w || f->h != tex_h || f->bpp != tex_bpp) {
-                if (tex)
-                    SDL_DestroyTexture(tex);
-                tex = SDL_CreateTexture(ren, f->bpp == 4 ? SDL_PIXELFORMAT_RGB888
-                                                         : SDL_PIXELFORMAT_RGB565,
-                                        SDL_TEXTUREACCESS_STREAMING,
-                                        (int)f->w, (int)f->h);
-                tex_w = f->w;
-                tex_h = f->h;
-                tex_bpp = f->bpp;
-                if (filter == NV2A_PRESENT_INTEGER) {
-                    dst_ok = 0;          /* new frame size: place it again */
-                } else {
-                    /* At the present.aspect shape: the copy fills it. */
-                    SDL_RenderSetLogicalSize(ren, (int)nv2a_present_width(f->w, f->h),
-                                             (int)f->h);
-                    if (tex && filter == NV2A_PRESENT_LINEAR)
-                        SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
-                }
-            }
-            if (tex)
-                SDL_UpdateTexture(tex, NULL, f->px, (int)(f->w * f->bpp));
-            upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
-            dirty = 1;
-        }
+        if (s_layer) {
+#if defined(__APPLE__)
+            /* The layer's size, the display, HDR headroom: AppKit's. */
+            if (!s_vk)
+                fbm_main_tick(win);
 #if defined(XBOXRECOMP_HAVE_VULKAN)
-        if (dirty && s_vk
-                && !(SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
-            struct fb_slot *f = &s_slot[s_front];
-            uint64_t t0 = now_ns(CLOCK_MONOTONIC);
-            char path[512];
-            if (shoot && s_shot_req[0])
-                snprintf(path, sizeof path, "%s", s_shot_req);
-            else if (shoot && burst)
-                snprintf(path, sizeof path, "%s%05u.bmp", s_burst_prefix, shown_flip);
-            else if (shoot)
-                shot_path(path, sizeof path, shown_flip);
-            if (fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                            filter, shoot ? path : NULL, shown_flip)) {
-                new_frame = 0;
-                dirty = 0;
-                if (shoot && burst && s_burst_n)
-                    s_burst_n--;
-                shoot = 0;
-                burst = 0;
-                s_shot_req[0] = 0;
-                presents++;
-#if defined(__ANDROID__)
-                {
-                    /* The hot threads' work for this frame (android_perf.c). */
-                    extern void xbox_AndroidPerfFrame(void);
-                    xbox_AndroidPerfFrame();
-                }
+            if (s_vk) {
+                int dw = 0, dh = 0;
+                SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+                fbv_note_drawable(dw, dh);
+            }
+#endif
 #endif
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
-                xbox_OverlayFramePresented();
-#endif
+            {
+                /* ImGui's SDL half for the next overlay frame; the present
+                 * thread is told when the overlay opens, closes or shows a
+                 * notice, since no game frame may come to wake it (the title
+                 * is paused behind it). */
+                static int was_open, was_note;
+                xbox_OverlayPlatformFrame(s_vk);
+                ov_open = xbox_OverlayOpen();
+                ov_note = xbox_OverlayNotice();
+                if (ov_open != was_open || (ov_note && !was_note))
+                    pt_request(FW_CTL_DIRTY);
+                was_open = ov_open;
+                was_note = ov_note;
             }
-            upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
-        }
 #endif
+        } else {
+            pthread_mutex_lock(&s_lock);
+            seq = s_ready_seq;
+            if (seq != s_shown_seq) {
+                int t = s_front;
+                uint64_t h = now_ns(CLOCK_MONOTONIC) - s_pub_ns[seq & 7];
+                s_front = s_ready;
+                s_ready = t;
+                s_cnt.picked++;
+                s_cnt.wake_frame++;
+                if (h > s_cnt.hand_max_ns && h < 10000000000ull)
+                    s_cnt.hand_max_ns = h;
+            } else if (have_ev) {
+                s_cnt.wake_other++;
+            } else {
+                s_cnt.wake_timeout++;
+            }
+            pthread_mutex_unlock(&s_lock);
+            shown_seq = s_shown_seq;
+            if (seq != shown_seq) {
+                struct fb_slot *f = &s_slot[s_front];
+                uint64_t t0 = now_ns(CLOCK_MONOTONIC);
+
+                s_dropped += seq - shown_seq - 1;
+                shown_flip = f->flip;
+                shoot = s_shot_n && shot_due(shown_flip);
+                shown_seq = seq;
+                if (!tex || f->w != tex_w || f->h != tex_h || f->bpp != tex_bpp) {
+                    if (tex)
+                        SDL_DestroyTexture(tex);
+                    tex = SDL_CreateTexture(ren, f->bpp == 4 ? SDL_PIXELFORMAT_RGB888
+                                                             : SDL_PIXELFORMAT_RGB565,
+                                            SDL_TEXTUREACCESS_STREAMING,
+                                            (int)f->w, (int)f->h);
+                    tex_w = f->w;
+                    tex_h = f->h;
+                    tex_bpp = f->bpp;
+                    if (filter == NV2A_PRESENT_INTEGER) {
+                        dst_ok = 0;          /* new frame size: place it again */
+                    } else {
+                        /* At the present.aspect shape: the copy fills it. */
+                        SDL_RenderSetLogicalSize(ren, (int)nv2a_present_width(f->w, f->h),
+                                                 (int)f->h);
+                        if (tex && filter == NV2A_PRESENT_LINEAR)
+                            SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+                    }
+                }
+                if (tex)
+                    SDL_UpdateTexture(tex, NULL, f->px, (int)(f->w * f->bpp));
+                s_upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
+                dirty = 1;
+            }
+            s_shown_seq = shown_seq;
+            if (dirty && !s_layer) {
+                dirty = 0;
+                SDL_RenderClear(ren);
+                if (tex && filter == NV2A_PRESENT_INTEGER) {
+                    int ow = 0, oh = 0;
+                    if (SDL_GetRendererOutputSize(ren, &ow, &oh) == 0
+                            && (!dst_ok || ow != out_w || oh != out_h)) {
+                        struct nv2a_rect r;
+                        int whole = nv2a_present_rect(tex_w, tex_h, (uint32_t)ow, (uint32_t)oh,
+                                                      NV2A_PRESENT_INTEGER, &r);
+                        dst.x = r.x;
+                        dst.y = r.y;
+                        dst.w = r.w;
+                        dst.h = r.h;
+                        out_w = ow;
+                        out_h = oh;
+                        dst_ok = 1;
+                        /* A frame that does not fit even at 1x is shrunk:
+                         * linear there, nearest for whole multiples. Set on
+                         * every placement: a new texture starts nearest. */
+                        SDL_SetTextureScaleMode(tex, whole ? SDL_ScaleModeNearest
+                                                           : SDL_ScaleModeLinear);
+                    }
+                    SDL_RenderCopy(ren, tex, NULL, &dst);
+                } else if (tex)
+                    SDL_RenderCopy(ren, tex, NULL, NULL);
+                if (shoot) {
+                    shoot = 0;
+                    shot_save(ren, shown_flip);
+                }
+                SDL_RenderPresent(ren);
+                s_presents++;
+            }
+
+        }
         {
             /* Said once per change: a hidden window presents nothing, and a
              * measured run that shows no on-glass times should say why. */
@@ -1707,87 +2326,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 xbox_PacingSetVisible(!(fl & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN
                                               | 0x80000000u)));
             }
-        }
-#if defined(__APPLE__)
-        /* Not while minimised or hidden: nextDrawable then blocks for up to
-         * its 1 s timeout, and the event pump and pad poll with it. */
-        if (dirty && s_layer && !s_vk
-                && !(SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
-            /* Before the first frame this paints the window black. */
-            struct fb_slot *f = &s_slot[s_front];
-            uint64_t t0 = now_ns(CLOCK_MONOTONIC);
-            char path[512];
-            if (shoot && s_shot_req[0])
-                snprintf(path, sizeof path, "%s", s_shot_req);
-            else if (shoot && burst)
-                snprintf(path, sizeof path, "%s%05u.bmp", s_burst_prefix, shown_flip);
-            else if (shoot)
-                shot_path(path, sizeof path, shown_flip);
-            /* A frame's own vblank goes with its first present only: a
-             * redraw (the overlay, an expose) shows it again. */
-            uint64_t vbl = shown_seq && new_frame ? f->vbl_ns : 0;
-            int rc = fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                                 filter, shoot ? path : NULL, shown_flip, vbl);
-            retry_soon = 0;
-            if (rc == 2) {
-                /* Skipped (present timing: no drawable without a wait). The
-                 * next frame replaces it; should none come (the title
-                 * stopped on this picture), it is shown as a redraw. */
-                new_frame = 0;
-                retry_soon = 1;
-            } else if (rc
-                    && ((s_last_present_ns = now_ns(CLOCK_MONOTONIC) - t0), 1)) {
-                new_frame = 0;
-                dirty = 0;
-                if (shoot && burst && s_burst_n)
-                    s_burst_n--;
-                shoot = 0;
-                burst = 0;
-                s_shot_req[0] = 0;
-                presents++;
-#if defined(XBOXRECOMP_HAVE_OVERLAY)
-                xbox_OverlayFramePresented();
-#endif
-            }
-            /* else no drawable (display asleep, window occluded): try again
-             * at the next event or the 100 ms wake. */
-            upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
-        }
-#endif
-        if (dirty && !s_layer) {
-            dirty = 0;
-            SDL_RenderClear(ren);
-            if (tex && filter == NV2A_PRESENT_INTEGER) {
-                int ow = 0, oh = 0;
-                if (SDL_GetRendererOutputSize(ren, &ow, &oh) == 0
-                        && (!dst_ok || ow != out_w || oh != out_h)) {
-                    struct nv2a_rect r;
-                    int whole = nv2a_present_rect(tex_w, tex_h, (uint32_t)ow, (uint32_t)oh,
-                                                  NV2A_PRESENT_INTEGER, &r);
-                    dst.x = r.x;
-                    dst.y = r.y;
-                    dst.w = r.w;
-                    dst.h = r.h;
-                    out_w = ow;
-                    out_h = oh;
-                    dst_ok = 1;
-                    /* A frame that does not fit even at 1x is shrunk:
-                     * linear there, nearest for whole multiples. Set on
-                     * every placement: a new texture starts nearest. */
-                    SDL_SetTextureScaleMode(tex, whole ? SDL_ScaleModeNearest
-                                                       : SDL_ScaleModeLinear);
+            {
+                /* The present thread's view of it: presents are made only
+                 * while it is neither minimised nor hidden (nextDrawable
+                 * then blocks for up to its 1 s timeout). Back: repainted. */
+                int ok = !(fl & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN));
+                if (ok != __atomic_load_n(&s_win_ok, __ATOMIC_ACQUIRE)) {
+                    __atomic_store_n(&s_win_ok, ok, __ATOMIC_RELEASE);
+                    if (ok && s_layer)
+                        pt_request(FW_CTL_DIRTY);
                 }
-                SDL_RenderCopy(ren, tex, NULL, &dst);
-            } else if (tex)
-                SDL_RenderCopy(ren, tex, NULL, NULL);
-            if (shoot) {
-                shoot = 0;
-                shot_save(ren, shown_flip);
             }
-            SDL_RenderPresent(ren);
-            presents++;
         }
-
         if (win) {                     /* title bar: name, or 1 Hz stats */
             double fps;
             if (xbox_title_due(&title_clock, title_stats,
@@ -1810,36 +2360,31 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             SDL_PushEvent(&q);
             quit_after = 0;
         }
-        if (stats) {
-            uint64_t t = now_ns(CLOCK_MONOTONIC);
-            if (t - t_stat >= 5000000000ull) {
-                uint64_t cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
-                double dt = (double)(t - t_stat) / 1e9;
-                uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
-                fprintf(stderr, "[PRESENT] %.1f flips/s copied, %.1f presents/s,"
-                        " main thread %.1f%% of a core, ack copy %.3f ms/flip\n",
-                        (double)(fl - flips_stat) / dt,
-                        (double)(presents - pres_stat) / dt,
-                        100.0 * (double)(cpu - cpu_stat) / (double)(t - t_stat),
-                        fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
-#if defined(XBOXRECOMP_HAVE_VULKAN)
-                if (s_vk)
-                    fbv_timing_report("presents");
-#endif
-                t_stat = t;
-                cpu_stat = cpu;
-                pres_stat = presents;
-                flips_stat = fl;
-            }
+        if (quit_after > 0 && (double)(now_ns(CLOCK_MONOTONIC) - t_start) / 1e9
+                                  >= quit_after) {
+            SDL_Event q;
+            memset(&q, 0, sizeof q);
+            q.type = SDL_QUIT;
+            SDL_PushEvent(&q);
+            quit_after = 0;
+        }
+        if (!s_layer) {
+            counters_tick(now_ns(CLOCK_MONOTONIC), s_dropped, s_presents,
+                          !(SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)));
+            if (stats)
+                stats_tick("main thread");
         }
     }
 
+    /* The present thread first: nothing presents once the loop has ended. */
+    if (s_layer)
+        present_thread_stop();
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
     /* Let the title go if the overlay had it paused, and write the settings. */
     if (s_layer)
         xbox_OverlayShutdown();
 #endif
-    /* No present may be mid-publish (it pushes an SDL event) once SDL goes. */
+    /* No present may be mid-publish once the presenter goes. */
     __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
         sched_yield();
@@ -1853,10 +2398,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 quit ? "window closed" : "guest returned", dt,
                 s_vk ? "Vulkan swapchain" : s_layer ? "CAMetalLayer" : "SDL renderer",
                 (unsigned long long)fl, dt > 0 ? (double)fl / dt : 0.0,
-                (unsigned long long)presents, dt > 0 ? (double)presents / dt : 0.0,
-                (unsigned long long)dropped_base,
+                (unsigned long long)s_presents, dt > 0 ? (double)s_presents / dt : 0.0,
+                (unsigned long long)s_dropped,
                 t > t_start ? 100.0 * (double)(cpu - cpu_start) / (double)(t - t_start) : 0.0,
-                shown_seq ? (double)upload_ns / (double)shown_seq / 1e6 : 0.0,
+                s_shown_seq ? (double)s_upload_ns / (double)s_shown_seq / 1e6 : 0.0,
                 fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
     }
     fflush(stdout);

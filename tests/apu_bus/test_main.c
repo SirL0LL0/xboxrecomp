@@ -303,7 +303,7 @@ static float lv_run(apu_level_state *st, float e_db, float secs, float target, f
     float gl = 1.0f;
     for (int f = 0; f < frames; f++) {
         for (int i = 0; i < 32; i++) { blk[i][0] = a * frand(); blk[i][1] = a * frand(); }
-        gl = apu_level_frame(st, blk, 2, target);
+        gl = apu_level_frame_old(st, blk, 2, target);
         for (int k = 0; k < n_at; k++)
             if (f + 1 == (int)(at_s[k] * 1500.0f)) gain_at[k] = st->gain_db;
     }
@@ -314,9 +314,10 @@ static float lv_run(apu_level_state *st, float e_db, float secs, float target, f
 static int lv_fill(void *ctx, apu_bus_voice *v) { v->stream = 1; v->nstack = *(int *)ctx; return 1; }
 static int lv_class(const apu_bus_voice *v) { return v->nstack == 7; }
 
-static void test_leveller(void)
+/* The first leveller (BO-132, RECOMP_AUDIO_CUSTOM_AGC=old): kept for comparison. */
+static void test_leveller_old(void)
 {
-    const float T = APU_LEVEL_TARGET_DB;
+    const float T = APU_LEVEL_OLD_TARGET_DB;
     apu_level_state st;
     float g;
 
@@ -324,22 +325,22 @@ static void test_leveller(void)
     apu_level_state_init(&st, -1000.0f);
     g = lv_run(&st, -7.5f, 20.0f, T, NULL, NULL, 0);
     CHECK(fabsf(g - (T + 7.5f)) < 0.5f, "loud song: gain %.2f dB, expected %.2f", g, T + 7.5f);
-    printf("leveller: noise at E = -7.5 dB, 20 s: gain %+.2f dB (envelope %.2f dB, target %.1f)\n", g, st.env_db, T);
+    printf("leveller (old): noise at E = -7.5 dB, 20 s: gain %+.2f dB (envelope %.2f dB, target %.1f)\n", g, st.env_db, T);
 
     /* A quiet one is brought up, never past +6 dB. */
     apu_level_state_init(&st, -1000.0f);
     g = lv_run(&st, -30.0f, 20.0f, T, NULL, NULL, 0);
-    CHECK(g <= APU_LEVEL_MAX_DB + 1e-4f && g > APU_LEVEL_MAX_DB - 0.3f, "quiet song: gain %.2f dB, expected +6 at the limit", g);
+    CHECK(g <= APU_LEVEL_OLD_MAX_DB + 1e-4f && g > APU_LEVEL_OLD_MAX_DB - 0.3f, "quiet song: gain %.2f dB, expected +6 at the limit", g);
     apu_level_state_init(&st, -1000.0f);
     g = lv_run(&st, T - 4.0f, 20.0f, T, NULL, NULL, 0);
     CHECK(fabsf(g - 4.0f) < 0.5f, "song 4 dB under: gain %.2f dB, expected +4", g);
-    printf("leveller: -30 dB-like noise: gain %+.2f dB (limit +6); 4 dB under the target: %+.2f dB\n",
+    printf("leveller (old): -30 dB-like noise: gain %+.2f dB (limit +6); 4 dB under the target: %+.2f dB\n",
            lv_run(&(apu_level_state){0}, -30.0f, 1.0f, T, NULL, NULL, 0), g);
 
     /* A very loud one is limited to -15 dB. */
     apu_level_state_init(&st, -1000.0f);
     g = lv_run(&st, 3.0f, 10.0f, T, NULL, NULL, 0);
-    CHECK(g >= APU_LEVEL_MIN_DB - 1e-4f && g < APU_LEVEL_MIN_DB + 0.3f, "very loud song: gain %.2f dB, expected -15", g);
+    CHECK(g >= APU_LEVEL_OLD_MIN_DB - 1e-4f && g < APU_LEVEL_OLD_MIN_DB + 0.3f, "very loud song: gain %.2f dB, expected -15", g);
 
     /* Silence, a very quiet intro and a fade out do not move the gain. */
     apu_level_state_init(&st, -1000.0f);
@@ -349,7 +350,7 @@ static void test_leveller(void)
         CHECK(fabsf(g1 - g0) < 0.05f, "silence moved the gain: %.4f -> %.4f", g0, g1);
         g2 = lv_run(&st, -48.0f, 15.0f, T, NULL, NULL, 0);      /* a very quiet passage */
         CHECK(fabsf(g2 - g0) < 0.1f, "a quiet passage (-48) moved the gain: %.3f -> %.3f", g0, g2);
-        printf("leveller: gain %+.3f dB; after 15 s of silence %+.3f; after 15 s at -48 dB %+.3f\n", g0, g1, g2);
+        printf("leveller (old): gain %+.3f dB; after 15 s of silence %+.3f; after 15 s at -48 dB %+.3f\n", g0, g1, g2);
     }
     /* A fade out over 8 s from -7.5 to -60: the gain stays. */
     apu_level_state_init(&st, -1000.0f);
@@ -360,11 +361,11 @@ static void test_leveller(void)
             const float e = -7.5f - 52.5f * (float)f / (8.0f * 1500.0f);
             const float a = noise_amp(e);
             for (int i = 0; i < 32; i++) { blk[i][0] = a * frand(); blk[i][1] = a * frand(); }
-            apu_level_frame(&st, blk, 2, T);
+            apu_level_frame_old(&st, blk, 2, T);
             if (st.gain_db > gmax) gmax = st.gain_db;
         }
         CHECK(gmax - g0 < 0.5f, "a fade out wound the gain up by %.2f dB", gmax - g0);
-        printf("leveller: 8 s fade out (-7.5 to -60): the gain's highest point %+.2f dB over where it was\n", gmax - g0);
+        printf("leveller (old): 8 s fade out (-7.5 to -60): the gain's highest point %+.2f dB over where it was\n", gmax - g0);
     }
 
     /* A step from a quiet passage to a loud one is caught. */
@@ -376,7 +377,7 @@ static void test_leveller(void)
         lv_run(&st, -7.5f, 2.0f, T, at, ga, 4);
         g10 = lv_run(&st, -7.5f, 8.0f, T, NULL, NULL, 0);
         CHECK(fabsf(g10 - want) < 1.0f, "step: %.2f dB ten seconds after, settles at %.2f", g10, want);
-        printf("leveller: quiet to loud step (+14.5 dB): gain %+.2f dB before; after 0.1 / 0.3 / 0.6 / 1.5 s: %+.2f / %+.2f / %+.2f / %+.2f (settles at %+.2f, reached %+.2f after 10 s)\n",
+        printf("leveller (old): quiet to loud step (+14.5 dB): gain %+.2f dB before; after 0.1 / 0.3 / 0.6 / 1.5 s: %+.2f / %+.2f / %+.2f / %+.2f (settles at %+.2f, reached %+.2f after 10 s)\n",
                g0, ga[0], ga[1], ga[2], ga[3], want, g10);
         /* The gain follows with a 0.3 s time constant: 63 % of the way is a
          * time constant after the envelope has seen the step. */
@@ -398,7 +399,7 @@ static void test_leveller(void)
             if (st.gain_db > hi) hi = st.gain_db;
         }
         CHECK(hi - lo < 1.5f, "a 1 s break pumped the gain by %.2f dB", hi - lo);
-        printf("leveller: 1 s breaks 8 dB down every 4 s: the gain moved within %.2f dB\n", hi - lo);
+        printf("leveller (old): 1 s breaks 8 dB down every 4 s: the gain moved within %.2f dB\n", hi - lo);
     }
     /* The offsets of the three levels. */
     CHECK(apu_level_mode_offset_db(APU_LEVEL_QUIETER) == -4.0f && apu_level_mode_offset_db(APU_LEVEL_MATCH) == 0.0f
@@ -416,6 +417,7 @@ static void test_leveller(void)
         const float amp = noise_amp(-7.5f);
         apu_level_set_classifier(lv_class);
         apu_level_set_mode(APU_LEVEL_MATCH);
+        apu_level_set_old(1);
         for (int i = 0; i < 32; i++) { a[i][0] = amp * frand(); a[i][1] = amp * frand(); }
         memcpy(keep, a, sizeof(a));
         for (int f = 0; f < 15 * 1500; f++) {
@@ -437,7 +439,7 @@ static void test_leveller(void)
             first = 10.0f * log10f((float)(ra / rb));
         }
         CHECK(fabsf(first - gain1) < 0.3f, "a new song starts at %.2f dB, the last settled at %.2f", first, gain1);
-        printf("leveller: voice path: song 1 settled at %+.2f dB, song 2 starts at %+.2f dB\n", gain1, first);
+        printf("leveller (old): voice path: song 1 settled at %+.2f dB, song 2 starts at %+.2f dB\n", gain1, first);
         /* another kind of voice: untouched */
         memcpy(a, b, sizeof(a));
         apu_level_voice(6, 1, lv_fill, &other, a, 2);
@@ -450,8 +452,239 @@ static void test_leveller(void)
         CHECK(!memcmp(a, b, sizeof(a)), "off touched a voice");
         apu_level_set_mode(APU_LEVEL_MATCH);
         apu_level_set_classifier(NULL);
+        apu_level_set_old(0);
         CHECK(!apu_level_active(), "no classifier but active");
         (void)keep;
+    }
+}
+
+
+/* ── the loudness chain (BO-246) ── */
+
+/* A 1 kHz sine of the same amplitude on both channels reads its peak level
+ * in LUFS (the K weighting is +0.69 dB there, which the -0.691 of BS.1770
+ * takes back): amplitude 10^(L/20). */
+static double s_ph;
+static void sine_frame(float blk[32][2], float lufs)
+{
+    const float a = lufs <= -200.0f ? 0.0f : powf(10.0f, lufs / 20.0f);
+    for (int i = 0; i < 32; i++) {
+        const float v = a * sinf((float)s_ph);
+        s_ph += 2.0 * M_PI * 1000.0 / 48000.0;
+        blk[i][0] = blk[i][1] = v;
+    }
+    if (s_ph > 2.0 * M_PI * 1000.0) s_ph = fmod(s_ph, 2.0 * M_PI);
+}
+
+/* secs of a sine at L LUFS through the chain; lo/hi: the gain's range */
+static float ch_run(apu_level_state *st, float lufs, float secs, float target, float *lo, float *hi)
+{
+    static float blk[32][2];
+    const int frames = (int)(secs * 1500.0f);
+    for (int f = 0; f < frames; f++) {
+        sine_frame(blk, lufs);
+        apu_level_frame(st, blk, 2, target);
+        if (lo && st->gain_db < *lo) *lo = st->gain_db;
+        if (hi && st->gain_db > *hi) *hi = st->gain_db;
+    }
+    return st->gain_db;
+}
+
+/* the next song: as the voice path starts one */
+static void ch_next(apu_level_state *st)
+{
+    const float g = st->gain_db, r = st->run_db;
+    apu_level_state_init(st, g);
+    st->run_db = st->prior_db = r;
+}
+
+static void test_leveller(void)
+{
+    const float T = APU_LEVEL_TARGET_DB;
+    apu_level_state st;
+    float g, lo, hi;
+
+    /* The meter: a sine at -20 LUFS reads -20. */
+    apu_level_state_init(&st, -1000.0f);
+    ch_run(&st, -20.0f, 5.0f, T, NULL, NULL);
+    CHECK(fabsf(st.st_db + 20.0f) < 0.2f, "K-weighted reading of a -20 LUFS sine: %.2f", st.st_db);
+
+    /* A loud master is brought down to the target; the first song jumps
+     * to its gain at its first reading. */
+    apu_level_state_init(&st, -1000.0f);
+    g = ch_run(&st, -7.0f, 30.0f, T, NULL, NULL);
+    CHECK(fabsf(g - (T + 7.0f)) < 0.3f, "loud song: gain %.2f dB, expected %.2f", g, T + 7.0f);
+    printf("leveller: a -7 LUFS song: gain %+.2f dB (target %.1f LUFS), short-term %.2f LUFS\n", g, T, st.st_db);
+
+    /* A quiet one is brought up, up to +15 dB; a louder one than +3 LUFS
+     * is cut by at most 20. */
+    apu_level_state_init(&st, -1000.0f);
+    g = ch_run(&st, T - 12.0f, 30.0f, T, NULL, NULL);
+    CHECK(fabsf(g - 12.0f) < 0.3f, "song 12 LU under: gain %.2f dB, expected +12", g);
+    apu_level_state_init(&st, -1000.0f);
+    g = ch_run(&st, T - 25.0f, 30.0f, T, NULL, NULL);
+    CHECK(g <= APU_LEVEL_MAX_DB + 1e-4f && g > APU_LEVEL_MAX_DB - 0.3f, "very quiet song: gain %.2f dB, expected +15", g);
+    apu_level_state_init(&st, -1000.0f);
+    g = ch_run(&st, 5.0f, 30.0f, T, NULL, NULL);
+    CHECK(g >= APU_LEVEL_MIN_DB - 1e-4f && g < APU_LEVEL_MIN_DB + 0.3f, "very loud song: gain %.2f dB, expected -20", g);
+
+    /* Silence and a passage far under the song hold the gain. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g0 = ch_run(&st, -7.0f, 30.0f, T, NULL, NULL), g1, g2;
+        g1 = ch_run(&st, -200.0f, 15.0f, T, NULL, NULL);
+        g2 = ch_run(&st, -30.0f, 30.0f, T, NULL, NULL);
+        /* (the 3 s window's tail of the song, read as it goes quiet, moves
+         * the song's level by a few hundredths) */
+        CHECK(fabsf(g1 - g0) < 0.1f && fabsf(g2 - g1) < 0.01f, "silence / a quiet passage moved the gain: %.3f -> %.3f -> %.3f", g0, g1, g2);
+        printf("leveller: gain %+.3f dB; after 15 s of silence %+.3f; after 30 s at -30 LUFS %+.3f\n", g0, g1, g2);
+    }
+
+    /* A breakdown 6 LU down for 20 s, a minute into a song: the gain moves
+     * under 1 dB (the song's level has settled). */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g0 = ch_run(&st, -9.0f, 60.0f, T, NULL, NULL);
+        lo = hi = g0;
+        ch_run(&st, -15.0f, 20.0f, T, &lo, &hi);
+        ch_run(&st, -9.0f, 20.0f, T, &lo, &hi);
+        CHECK(hi - lo < 1.0f, "a 20 s breakdown 6 LU down moved the gain by %.2f dB", hi - lo);
+        printf("leveller: 20 s breakdown 6 LU down, a minute in: the gain moved within %.2f dB\n", hi - lo);
+    }
+
+    /* The next song starts at the last gain. A quiet intro (-28 LUFS,
+     * under any song's level) holds it; the body then sets it. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g0 = ch_run(&st, -10.0f, 60.0f, T, NULL, NULL), g20;
+        ch_next(&st);
+        lo = hi = g0;
+        ch_run(&st, -28.0f, 20.0f, T, &lo, &hi);
+        CHECK(hi - lo < 0.01f, "a 20 s quiet intro moved the gain by %.2f dB", hi - lo);
+        g20 = ch_run(&st, -14.0f, 20.0f, T, NULL, NULL);
+        CHECK(fabsf(g20 - (T + 14.0f)) < 1.0f, "after the intro: %.2f dB 20 s into the body, expected %.2f", g20, T + 14.0f);
+        printf("leveller: next song, 20 s intro at -28 LUFS: gain held at %+.2f (moved %.3f); 20 s into its body at -14: %+.2f (wants %+.2f)\n",
+               g0, hi - lo, g20, T + 14.0f);
+    }
+
+    /* A quiet song after a loud one: 13 LU under, gated at first, then
+     * taken as the new level; within 30 s it is within 1 dB. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g30;
+        ch_run(&st, -7.0f, 60.0f, T, NULL, NULL);
+        ch_next(&st);
+        g30 = ch_run(&st, -20.0f, 30.0f, T, NULL, NULL);
+        CHECK(fabsf(g30 - (T + 20.0f)) < 1.0f, "a quiet song after a loud one: %.2f dB after 30 s, expected %.2f", g30, T + 20.0f);
+        g = ch_run(&st, -20.0f, 30.0f, T, NULL, NULL);
+        printf("leveller: a -20 LUFS song after a -7 one: gain %+.2f after 30 s, %+.2f after 60 s (wants %+.2f)\n", g30, g, T + 20.0f);
+    }
+
+    /* The ceiling: a loud song after a quiet one is brought within 3 dB
+     * of the target in about a second (its first reading, then 0.5 s). */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g15, g30;
+        ch_run(&st, -20.0f, 60.0f, T, NULL, NULL);
+        ch_next(&st);
+        ch_run(&st, -7.0f, 1.0f, T, NULL, NULL);
+        g15 = ch_run(&st, -7.0f, 1.0f, T, NULL, NULL);
+        g30 = ch_run(&st, -7.0f, 28.0f, T, NULL, NULL);
+        CHECK(g15 < T + APU_LEVEL_CEIL_DB + 7.0f + 1.5f, "a loud song after a quiet one: %.2f dB after 2 s, ceiling %.2f",
+              g15, T + APU_LEVEL_CEIL_DB + 7.0f);
+        CHECK(fabsf(g30 - (T + 7.0f)) < 0.3f, "a loud song after a quiet one: %.2f dB after 30 s, expected %.2f", g30, T + 7.0f);
+        printf("leveller: a -7 LUFS song after a -20 one: gain %+.2f after 2 s (ceiling %+.2f), %+.2f after 30 s (wants %+.2f)\n",
+               g15, T + APU_LEVEL_CEIL_DB + 7.0f, g30, T + 7.0f);
+    }
+
+    /* A song that goes up a level for good (4 LU over for 2 s) is followed
+     * within seconds, not over its history. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float at[3];
+        ch_run(&st, -20.0f, 60.0f, T, NULL, NULL);
+        at[0] = ch_run(&st, -10.0f, 5.0f, T, NULL, NULL);
+        at[1] = ch_run(&st, -10.0f, 5.0f, T, NULL, NULL);
+        at[2] = ch_run(&st, -10.0f, 20.0f, T, NULL, NULL);
+        CHECK(fabsf(at[1] - (T + 10.0f)) < 1.5f && fabsf(at[2] - (T + 10.0f)) < 0.3f,
+              "step up by 10 LU: %.2f after 10 s, %.2f after 30 s, expected %.2f", at[1], at[2], T + 10.0f);
+        printf("leveller: a minute at -20 LUFS, then -10: gain %+.2f / %+.2f / %+.2f after 5 / 10 / 30 s (wants %+.2f)\n",
+               at[0], at[1], at[2], T + 10.0f);
+    }
+
+    /* The compressor: nothing at the target; a burst 12 dB over is turned
+     * down within 30 ms, at 2:1 over the threshold. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        static float blk[32][2];
+        float c_steady, c_30ms = 0.0f, c_end;
+        ch_run(&st, T, 30.0f, T, NULL, NULL);
+        c_steady = -st.comp_db;
+        for (int f = 0; f < 1500; f++) {
+            sine_frame(blk, T + 12.0f);
+            apu_level_frame(&st, blk, 2, T);
+            if (f == 45) c_30ms = -st.comp_db;
+        }
+        c_end = -st.comp_db;
+        CHECK(c_steady < 0.01f, "the compressor works at the target: %.2f dB", c_steady);
+        CHECK(c_30ms > 1.0f, "a burst 12 dB over: %.2f dB of compression after 30 ms", c_30ms);
+        /* After a second the ceiling has the gain down too: the burst comes
+         * out no more than 3 dB over the target (the reading is 3 s long,
+         * so 1 s of it is the burst averaged with the 2 s before). */
+        CHECK(st.gain_db + st.comp_db < T + APU_LEVEL_CEIL_DB - (T + 12.0f) + 6.0f,
+              "a burst 12 dB over: gain %.2f + compressor %.2f after 1 s", st.gain_db, st.comp_db);
+        printf("leveller: compressor %.2f dB at the target; a burst 12 dB over: %.2f dB after 30 ms, %.2f dB after 1 s"
+               " (gain then %+.2f dB)\n", c_steady, c_30ms, c_end, st.gain_db);
+    }
+
+    /* The offsets of the three levels. */
+    CHECK(apu_level_mode_offset_db(APU_LEVEL_QUIETER) == -4.0f && apu_level_mode_offset_db(APU_LEVEL_MATCH) == 0.0f
+          && apu_level_mode_offset_db(APU_LEVEL_LOUDER) == 4.0f, "mode offsets");
+    apu_level_state_init(&st, -1000.0f);
+    g = ch_run(&st, -7.0f, 30.0f, T + 4.0f, NULL, NULL);
+    CHECK(fabsf(g - (T + 4.0f + 7.0f)) < 0.3f, "louder: gain %.2f", g);
+
+    /* Voices: only the classifier's voices are touched, off touches none,
+     * and a new song starts at the gain the last one settled on. */
+    {
+        static float a[32][2], b[32][2];
+        int custom = 7, other = 3;
+        float gain1 = 0, first = 0;
+        apu_level_set_classifier(lv_class);
+        apu_level_set_mode(APU_LEVEL_MATCH);
+        apu_level_set_old(0);
+        for (int f = 0; f < 30 * 1500; f++) {
+            sine_frame(b, -7.0f);
+            memcpy(a, b, sizeof(a));
+            apu_level_voice(9, 1, lv_fill, &custom, a, 2);                  /* song 1 */
+        }
+        {
+            double ra = 0, rb = 0;
+            for (int i = 0; i < 32; i++) { ra += a[i][0] * a[i][0]; rb += b[i][0] * b[i][0]; }
+            gain1 = 10.0f * log10f((float)(ra / rb));
+        }
+        CHECK(fabsf(gain1 - (T + 7.0f)) < 0.4f, "voice path: gain %.2f dB", gain1);
+        sine_frame(b, -7.0f);
+        memcpy(a, b, sizeof(a));
+        apu_level_voice(9, 2, lv_fill, &custom, a, 2);                      /* song 2 starts */
+        {
+            double ra = 0, rb = 0;
+            for (int i = 0; i < 32; i++) { ra += a[i][0] * a[i][0]; rb += b[i][0] * b[i][0]; }
+            first = 10.0f * log10f((float)(ra / rb));
+        }
+        CHECK(fabsf(first - gain1) < 0.2f, "a new song starts at %.2f dB, the last settled at %.2f", first, gain1);
+        printf("leveller: voice path: song 1 settled at %+.2f dB, song 2 starts at %+.2f dB\n", gain1, first);
+        memcpy(a, b, sizeof(a));
+        apu_level_voice(10, 1, lv_fill, &other, a, 2);
+        CHECK(!memcmp(a, b, sizeof(a)), "a voice the classifier refuses was touched");
+        apu_level_set_mode(APU_LEVEL_OFF);
+        CHECK(!apu_level_active(), "off is active");
+        memcpy(a, b, sizeof(a));
+        apu_level_voice(9, 2, lv_fill, &custom, a, 2);
+        CHECK(!memcmp(a, b, sizeof(a)), "off touched a voice");
+        apu_level_set_mode(APU_LEVEL_MATCH);
+        apu_level_set_classifier(NULL);
+        CHECK(!apu_level_active(), "no classifier but active");
     }
 }
 
@@ -1056,6 +1289,7 @@ int main(void)
     test_limiter_identity();
     test_limiter();
     test_leveller();
+    test_leveller_old();
     test_cost();
     test_controls();
     test_output();

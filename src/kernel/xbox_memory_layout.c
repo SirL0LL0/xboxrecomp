@@ -1614,6 +1614,11 @@ static void pgraph_fence_tick(volatile uint32_t *regs)
 }
 
 static int s_nv2a_trace = 0;
+/* The per-segment DMA_PUT/GET line and its flush (RECOMP_NV2A_TRACE only).
+ * They rode on s_nv2a_trace, which RECOMP_PB_EXEC (every run) turns on, so
+ * with diagnostic_log the walker printed and flushed ~16 times a frame
+ * (BO-277, WPR: ~0.3-0.45 ms a frame of the render thread on Windows). */
+static int s_nv2a_put_trace = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1722,6 +1727,7 @@ static uint32_t g_scanned_put;   /* DMA_PUT the walker has executed up to */
 static uint64_t g_kick_wait_ns;
 
 uint64_t nv2a_pb_now_ns(void);
+int nv2a_pb_idle_spin(void);
 
 static void kick_nap_us(unsigned us)
 {
@@ -1985,7 +1991,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * with the completed fence, so two hosts' logs can be lined up
                  * by time and by GPU progress (Proton's fence was seen
                  * advancing ~100x slower than macOS's). */
-                if (s_nv2a_trace) {
+                if (s_nv2a_put_trace) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     uint32_t fv = 0;
@@ -1998,8 +2004,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     else
                         fprintf(stderr, "-");
                     fprintf(stderr, "%s\n", g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
@@ -2073,7 +2079,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     Sleep(1);
                     break;
                 }
-                kick_nap_us(50);
+                /* hr_spin (default on, the host grid only): poll without
+                 * sleeping (nv2a_pb_exec.c, hr_spin_asked). */
+                if (nv2a_pb_idle_spin())
+                    xbox_CpuRelax();
+                else
+                    kick_nap_us(50);
                 now = nv2a_pb_now_ns();
             }
         }
@@ -3776,6 +3787,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
         s_pb_exec = recomp_env(RENV_PB_EXEC) != NULL;
+        s_nv2a_put_trace = recomp_env(RENV_NV2A_TRACE) != NULL;
         s_nv2a_trace = recomp_env(RENV_NV2A_TRACE) != NULL
                     || recomp_env(RENV_PB_SCAN) != NULL
                     || recomp_env(RENV_PB_EXEC) != NULL;

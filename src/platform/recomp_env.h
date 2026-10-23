@@ -83,10 +83,10 @@ extern "C" {
     X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off, open: starts open, toggle=<s>,...: opens and closes at those seconds, file=<path>: whenever that file appears, aa_cycle=<s>: steps the AA setting every s seconds (scripted runs)") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, vulkan, d3d11, null") \
     X(EXEC_UCLAMP,       CONFIG, "RECOMP_EXEC_UCLAMP",       NULL, "Linux: the executor thread's minimum utilisation clamp, 0..1024 (CPU clock boost without spinning)") \
-    X(PRESENT_OVERSCAN,  CONFIG, "RECOMP_PRESENT_OVERSCAN",  NULL, "crop: show the 640x448 area a TV showed (y 16..464), cropping the sides alike so the aspect holds (Vulkan, Metal windows)") \
+    X(PRESENT_OVERSCAN,  CONFIG, "RECOMP_PRESENT_OVERSCAN",  NULL, "crop: show the 640x448 area a TV showed (y 16..464), cropping the sides alike so the aspect holds; fill: that area at the full 640 width, stretched to the picture's height (about 7% taller, no side crop) (Vulkan, Metal, D3D11 windows)") \
     X(PRESENT_FIT,       CONFIG, "RECOMP_PRESENT_FIT",       NULL, "fill16x10: fill the window's height, cropping the frame's sides (the Deck's 16:10 panel) (Vulkan, Metal windows)") \
     X(PRESENT_EARLY,     CONFIG, "RECOMP_PRESENT_EARLY",     NULL, "1: frames go to the host at FLIP_STALL, before the vblank hold (lower latency, same pacing)") \
-    X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); host:<Hz>: the same, and the rate of the host grid a title asks for (xbox_FlipHostRate) in place of the display's, for a run without a display; default off") \
+    X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); host:<Hz>: the same, and the rate of the host grid a title asks for (xbox_FlipHostRate) in place of the display's, for a run without a display; default off. =ab with zbias_ab=n: three pictures, n flips each in turn: no offsets, front faces only, both faces") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
     X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
@@ -100,11 +100,12 @@ extern "C" {
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
     X(VBLANK_SYNC,       CONFIG, "RECOMP_VBLANK_SYNC",       NULL, "=display: the emulated vblank follows the display's refresh (reported by the present path) when within 5% of 60 Hz; default: its own 60.000 Hz timer") \
     X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default 2)") \
-    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; default) or auto (each frame aimed at one refresh; the vblank locked to a fixed-rate display, timed presents under variable refresh); lock, timed force one (Metal)") \
+    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; the default except on macOS) or auto (each frame aimed at one refresh; the vblank locked to a fixed-rate display, timed presents under variable refresh; the default on macOS, BO-239); lock, timed force one (Metal)") \
     X(FRAME_PACING,      CONFIG, "RECOMP_FRAME_PACING",      NULL, "display.frame_pacing: auto (smooth under gamescope, low_latency elsewhere; default), low_latency (each frame at the first refresh it can make) or smooth (one finished frame kept queued: +1 refresh of latency, a late frame no longer shows as a repeated one). Linux and Windows Vulkan with FIFO and present_wait (or present_wait2); on Windows the keeper stands down under variable refresh and away from 60 Hz; elsewhere no effect yet (BO-110, BO-207)") \
     X(PRESENT_MODE,      CONFIG, "RECOMP_PRESENT_MODE",      NULL, "display.present_mode, Vulkan with vsync: auto or fifo (FIFO; default) or mailbox (MAILBOX where offered; never picked by itself, BO-110)") \
     X(PRESENT_PHASE,     CONFIG, "RECOMP_PRESENT_PHASE",     NULL, "present timing, a locked display: ms the emulated vblank sits before a display refresh (default 5)") \
     X(PRESENT_LEAD,      CONFIG, "RECOMP_PRESENT_LEAD",      NULL, "present timing, a variable-refresh display: ms from the emulated vblank to the frame's present time (default 12)") \
+    X(PRESENT_HANDOVER,  CONFIG, "RECOMP_PRESENT_HANDOVER",  NULL, "present timing, a locked display: ms after the refresh before a frame's own at which the frame is handed to the system, 0.5-16, at most half a refresh used (default 3, BO-239)") \
     X(PRESENT_DEPTH,     CONFIG, "RECOMP_PRESENT_DEPTH",     NULL, "present timing, a locked display: refreshes from the vblank's refresh to the frame's, 0-3 (default 1; raised by itself when frames slip)") \
     X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 1)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
@@ -137,6 +138,8 @@ extern "C" {
     X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \
     X(GFX_SCENERY_DETAIL, CONFIG, "RECOMP_GFX_SCENERY_DETAIL", NULL, "how far from the camera the title's scenery objects keep their detailed models, for a title whose build has that distance behind a patch (--patches, recomp_patch.h): original (default, as shipped), far") \
     X(GAME_RACE_CLOCK,   CONFIG, "RECOMP_GAME_RACE_CLOCK",   NULL, "1: a race keeps real time from its start on a host that cannot hold 60 (the title's own catch-up stepping, which it otherwise starts at the first crash camera), for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
+    X(DISPLAY_CRASHNAV_MAP, CONFIG, "RECOMP_DISPLAY_CRASHNAV_MAP", NULL, "with RECOMP_GFX_HUD_FIX=1 in 16:9, a title's map screen (Burnout 3: Crash Nav, Select Location), for a title whose build has that behind a switch (recomp_patch.h): stretched (default: the map, its route and markers across the picture), native (4:3, with the menu)") \
+    X(GFX_RIVAL_MARKER,  CONFIG, "RECOMP_GFX_RIVAL_MARKER",  NULL, "where the marker over a rival changes its look with distance, for a title whose build has that behind a patch (--patches, recomp_patch.h): original (default, as shipped), farther") \
     X(GFX_SCORE_BOARD,   CONFIG, "RECOMP_GFX_SCORE_BOARD",   NULL, "the title's score board in a race's HUD, for a title whose build has a hook for them: original (default, as shipped), smooth (the board fades as one)") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
@@ -160,6 +163,10 @@ extern "C" {
     X(GFX_SHARPEN,       CONFIG, "RECOMP_GFX_SHARPEN",       NULL, "post-process sharpening (AMD FidelityFX CAS) strength, 0..1 (default 0, off) (Metal, Vulkan windows)") \
     X(GFX_LOD_BIAS,      CONFIG, "RECOMP_GFX_LOD_BIAS",      NULL, "extra mip LOD bias of mipmapped textures, added to the title's own: 0 (default, off), auto (-log2(render scale) / 2: -0.5 at 2x, -1.0 at 4x, so the texture detail keeps up with the supersampled frame), or a number such as -0.5; an alpha-tested draw (foliage, fences) takes no negative bias (Metal, Vulkan)") \
     X(GFX_UI_SCALE,      CONFIG, "RECOMP_GFX_UI_SCALE",      NULL, "the title's 2D art (HUD, menus, fonts: textures of one level that a draw without depth test binds) scaled on the CPU before upload: off (default), 2x, 4x (Metal, Vulkan)") \
+    X(GFX_TEXUP,         CONFIG, "RECOMP_GFX_TEXTURE_UPSCALE", NULL, "the world's textures upscaled on the GPU while playing (BO-245, nv2a_texup.h): off (default), fsrcnnx, nnedi3 (Metal)") \
+    X(GFX_TEXUP_SCALE,   CONFIG, "RECOMP_GFX_TEXTURE_UPSCALE_SCALE", NULL, "graphics.texture_upscale's factor: 2x (default) or 4x (4x: textures up to 256 a side; larger ones get 2x)") \
+    X(GFX_TEXUP_ROADS,   CONFIG, "RECOMP_GFX_TEXUP_ROADS",   NULL, "1: graphics.texture_upscale upscales the road surfaces too (default 0: the title's road skip list leaves them as they are)") \
+    X(GFX_TEXUP_PRELOAD, CONFIG, "RECOMP_GFX_TEXTURE_UPSCALE_PRELOAD", NULL, "graphics.texture_upscale_preload: 1 (default) the upscaler works through the title's loading screen and countdown with a larger budget (BO-272); 0 spreads the jobs through the race as before") \
     X(GFX_DITHER,        CONFIG, "RECOMP_GFX_DITHER",        NULL, "1: noise dither of +-0.5 LSB (interleaved gradient noise) in the Metal presenter's scale to the window, against banding of smooth gradients (default 0, off)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
@@ -173,9 +180,12 @@ extern "C" {
     X(CONSOLE_HDKEY,     CONFIG, "RECOMP_CONSOLE_HDKEY",     NULL, "console.hdd_key: the HDD key of an original Xbox, 32 hex digits, so its saves load as they are (kernel_console_keys.h); default empty, the port's own zero keys") \
     X(CONSOLE_EEPROM,    CONFIG, "RECOMP_CONSOLE_EEPROM",    NULL, "console.eeprom: the path of an eeprom.bin to take the HDD key from (the HDD key wins when both are set); default empty") \
     X(AUDIO_MUSIC_DIR,   CONFIG, "RECOMP_AUDIO_MUSIC_DIR",   NULL, "audio.custom_music_dir: a folder of the user's music (mp3, flac, ogg, wav) offered to the title as Xbox custom soundtracks, for a title that plays them (xbox_soundtrack.h); default empty, off") \
+    X(AUDIO_CUSTOM_AT_START, CONFIG, "RECOMP_AUDIO_CUSTOM_AT_START", NULL, "audio.custom_music_at_start: 1 (default) with a music folder set, the title starts with the custom soundtrack the player last chose in its EA GAMES TRAX screen (the first one if none was chosen yet); 0 starts on EA GAMES TRAX every time, as the original does. For a title whose port registered the folder row (xbox_OverlaySetMusicFolder)") \
+    X(AUDIO_CUSTOM_SOUNDTRACK, CONFIG, "RECOMP_AUDIO_CUSTOM_SOUNDTRACK", NULL, "audio.custom_music_soundtrack: the name of the custom soundtrack the player last confirmed in the title's EA GAMES TRAX screen; empty when EA GAMES TRAX was the last choice (nothing is switched at start); absent until a choice is made. Written by the port, not meant to be set by hand") \
     X(AUDIO_CUSTOM_LEVEL, CONFIG, "RECOMP_AUDIO_CUSTOM_LEVEL", NULL, "audio.custom_music_level: the level of the user's own music (custom soundtracks) against the title's music: off (the title's sends as they are), quieter (-4 dB), match (default: brought to the level of the title's own music), louder (+4 dB); for a title whose port names its custom-soundtrack voices (apu_level.h)") \
     X(AUDIO_SAFETY_LIMITER, CONFIG, "RECOMP_AUDIO_SAFETY_LIMITER", NULL, "0: the peak limiter in front of the 16-bit clamp (-0.5 dBFS, no look-ahead; apu_limit.h) is off and the clamp alone cuts a mix past full scale, as before it existed (default 1, on; it changes nothing while the mix stays under the ceiling)") \
-    X(AUDIO_LEVEL_LOG,   CONFIG, "RECOMP_AUDIO_LEVEL_LOG",   NULL, "1: the custom-music leveller logs its envelope and gain once a second (default 0)") \
+    X(AUDIO_CUSTOM_AGC,  CONFIG, "RECOMP_AUDIO_CUSTOM_AGC",  NULL, "old: the custom-music level is the first leveller (BO-132: unweighted 3 s envelope, -15..+6 dB, 0.3 s down / 4 s up) instead of the loudness chain (BO-246: K-weighted short-term loudness, gated, slow gain, gentle compressor), for comparison (default: the chain)") \
+    X(AUDIO_LEVEL_LOG,   CONFIG, "RECOMP_AUDIO_LEVEL_LOG",   NULL, "1: the custom-music level logs its readings, gain, compressor and the safety limiter's count once a second (default 0)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
     X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count") \
     X(CMDLINE,           CONFIG, "RECOMP_CMDLINE",           NULL, "launch-data command line handed to the title") \
@@ -249,6 +259,7 @@ extern "C" {
     X(PB_BILINEAR,       DEBUG, "pb_bilinear",     "RECOMP_PB_BILINEAR",       "=0: CPU raster samples nearest, whatever the filter") \
     X(PB_MIPS,           DEBUG, "pb_mips",         "RECOMP_PB_MIPS",           "=0: CPU raster samples mip level 0 only") \
     X(PB_CLIP,           DEBUG, "pb_clip",         "RECOMP_PB_CLIP",           "=0: no near-plane clipping") \
+    X(ALPHA_KILL,        DEBUG, "alpha_kill",      "RECOMP_ALPHA_KILL",        "=0: GPU backends ignore TEXTURE_CONTROL0 ALPHA_KILL (BO-226)") \
     X(PB_CULL_FLIP,      DEBUG, "pb_cull_flip",    "RECOMP_PB_CULL_FLIP",      "CPU raster culls the other winding") \
     X(PB_VSH_AB,         DEBUG, "pb_vsh_ab",       "RECOMP_PB_VSH_AB",         "compare vertex-program paths per batch") \
     X(PB_VSH_AB_DUMP,    DEBUG, "pb_vsh_ab_dump",  "RECOMP_PB_VSH_AB_DUMP",    "=prefix: pb_vsh_ab differing batches") \
@@ -328,6 +339,7 @@ extern "C" {
     X(ALPHA_MIPS_AB,     DEBUG, "alpha_mips_ab",   NULL,                       "=n: alpha_mips on for n flips, then off for n, and so on, the textures made again at each change: both pictures in one run (comparisons)") \
     X(ZBIAS,             DEBUG, "zbias",           NULL,                       "BO-176: =0 the depth offsets a title registers for its decal textures (nv2a_texrep_register_zbias) are not applied (Metal, Vulkan)") \
     X(ZBIAS_AB,          DEBUG, "zbias_ab",        NULL,                       "=n: the registered depth offsets on for n flips, then off for n, and so on: both pictures in one run (comparisons)") \
+    X(ZBIAS_ALL,         DEBUG, "zbias_all",       NULL,                       "BO-253: =1 the depth offsets also apply to the face the title treats as the back one (BO-176 as released: LED words show through a sign's board from behind); default off. =ab with zbias_ab=n: three pictures, n flips each in turn: no offsets, front faces only, both faces") \
     X(ZBIAS_PROBE,       DEBUG, "zbias_probe",     NULL,                       "BO-204, =<flip>[+<flip>...]: or =@file: from each, four flips a texture: its depth-tested draws unmoved, 512 units back, unmoved, 4 back, logged per texture (Vulkan): finds decals drawn just in front of a surface in a paused scene") \
     X(ZBIAS_ADD,         DEBUG, "zbias_add",       NULL,                       "BO-204, =<hash>[+<hash>...]: those textures (texrep_dump hashes) take a -512 depth offset as if the title had registered them (Metal, Vulkan): trying a candidate") \
     X(ZTINT,             DEBUG, "ztint",           NULL,                       "BO-204, =<hash>[+<hash>...]: those textures (texrep_dump hashes) uploaded magenta, alpha kept (Metal, Vulkan): count a decal's pixels per frame") \
@@ -350,6 +362,21 @@ extern "C" {
     X(UI_SCALE_HOLD,     DEBUG, "ui_scale_hold",   NULL,                       "graphics.ui_scale held off whatever the setting and the environment say: =1 on any platform (a way to rule the upscaling out when a GPU fault is chased); not held by default anywhere") \
     X(UI_SCALE_CACHE_MB, DEBUG, "ui_scale_cache_mb", NULL,                     "=n: size bound of graphics.ui_scale's disk cache of scaled textures, in MB (default 256); 0: no disk cache") \
     X(UI_SCALE_LOG,      DEBUG, "ui_scale_log",    NULL,                       "one line per texture and kind of draw that binds it (use 1: a 2D draw, 2: another, 3: both), with texrep_dump's hash and the factor it is uploaded at: what graphics.ui_scale's rule catches (Metal, Vulkan)") \
+    X(TEXUP_LOG,         DEBUG, "texup_log",       NULL,                       "graphics.texture_upscale: one line per job (found on disk, computed, swapped, dropped) and the governor's pauses (nv2a_texup.h)") \
+    X(TEXUP_CTL,         DEBUG, "texup_ctl",       NULL,                       "=file: every 30 flips the file's first line is graphics.texture_upscale (0 off, 1 fsrcnnx, 2 nnedi3, optional second number the scale): a test's live switch") \
+    X(TEXUP_SHADERS,     DEBUG, "texup_shaders",   NULL,                       "=dir: graphics.texture_upscale's shader files from this folder (luma, fsrcnnx_00..12, nnedi3, recombine .metal/.comp and VERSION)") \
+    X(TEXUP_MAX,         DEBUG, "texup_max",       NULL,                       "=n: the largest texture side graphics.texture_upscale takes (default 1024; handhelds 512)") \
+    X(TEXUP_CAP_MB,      DEBUG, "texup_cap_mb",    NULL,                       "=n: memory cap of the upscaled textures in use, MB (default 1024; handhelds 192)") \
+    X(TEXUP_CACHE_MB,    DEBUG, "texup_cache_mb",  NULL,                       "=n: size bound of graphics.texture_upscale's disk cache, MB (default 2048); 0: no disk cache") \
+    X(TEXUP_STORE_MBPS,  DEBUG, "texup_store_mbps", NULL,                      "=n: write rate of graphics.texture_upscale's disk cache, MB/s, each piece synced (default 16); 0: unpaced, unsynced (before BO-245's cold-hitch fix)") \
+    X(TEXUP_COST,        DEBUG, "texup_cost",      NULL,                       "=x: graphics.texture_upscale's predicted chunk costs multiplied by x (a slower GPU than the table's)") \
+    X(TEXUP_CAP_MS,      DEBUG, "texup_cap_ms",    NULL,                       "=racing[,idle[,prestart[,loading]]]: the governor's GPU ms of compute a frame (default 0.5 while drawing 3D, 4 otherwise; before the GO 4 and on the loading screen 6, within the frame's GPU room: BO-272)") \
+    X(TEXUP_SLOTS,       DEBUG, "texup_slots",     NULL,                       "=n: graphics.texture_upscale's job slots, 1..8 (default 8; a stress test of the slot paths)") \
+    X(TEXUP_FREE_FLIPS,  DEBUG, "texup_free_flips", NULL,                      "=n: flips after which graphics.texture_upscale gives back a finished or unread slot (default 600; a stress test)") \
+    X(TEXUP_STRESS,      DEBUG, "texup_stress",    NULL,                       "=n: every n flips the running upscale job's texture is taken as changed by the title (uploaded again at its next bind; Vulkan; a stress test)") \
+    X(TEXUP_FP32,        DEBUG, "texup_fp32",      NULL,                       "1: the upscalers' intermediate images are 32-bit float instead of 16 (Metal; a precision check)") \
+    X(TEXUP_DUMP,        DEBUG, "texup_dump",      NULL,                       "=dir: the first 3 FSRCNNX jobs' luma in and last model image out as <hash>_<w>x<h>_w<wrap>_luma.f32 / _model.f32 (RGBA float), for tests/nv2a_texup/check_fsrcnnx.py (Vulkan)") \
+    X(TEXUP_SKIP,        DEBUG, "texup_skip",      NULL,                       "=file: the road skip list (texrep hashes, one a line) instead of the title's") \
     X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips; =@file: the list in that file, read again when it grows") \
     X(FB_DUMP_FLIPS,     DEBUG, "fb_dump_flips",   "RECOMP_FB_DUMP_FLIPS",     "=n: fb_dump every nth flip") \
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
@@ -402,6 +429,11 @@ extern "C" {
     X(DPC_LAG,           DEBUG, "dpc_lag",         NULL,                       "=ms: the timer thread drains queued DPCs at most once per that many ms (a test: widens the window between an ISR and its DPC)") \
     X(DPC_PROMPT,        DEBUG, "dpc_prompt",      NULL,                       "=0: queued DPCs wait for the timer thread's next pass, as before (A/B; default: the timer thread is woken where the console would run them: a queue below DISPATCH_LEVEL, the one-CPU gate's release)") \
     X(DPC_STATS,         DEBUG, "dpc_stats",       NULL,                       "[DPC] queue-to-run latency p50/p99/max and the timer-thread wakes, with the [IRQ] summary and at exit") \
+    X(PUMP_STALL,        DEBUG, "pump_stall",      NULL,                       "=ms: a test of BO-210: every turn of the SDL main loop sleeps that many ms before reading events, as a blocking X11 pump would (default off)") \
+    X(FLIP_COST,         DEBUG, "flip_cost",       NULL,                       "=us: a test of BO-241: the executor works that much longer on each frame held to the host grid (graphics.high_refresh), so a fast machine misses the grid's edges as a slow one does (default off)") \
+    X(FLIP_COST_JITTER,  DEBUG, "flip_cost_jitter", NULL,                      "=us: flip_cost spread evenly by up to this either way (default 0)") \
+    X(HR_SPIN,           DEBUG, "hr_spin",         NULL,                       "=0: BO-241: while frames are held to the host grid (graphics.high_refresh) the executor spins instead of napping when idle (waiting for the title's next kick, holding a frame for its edge), so the CPU keeps its clock up; =0 naps as before (default on, with the grid only)") \
+    X(PUMP_STALL_AFTER,  DEBUG, "pump_stall_after", NULL,                      "=s: seconds after the first frame before pump_stall starts (default 0)") \
     /* ── the enhancements layer's keys (RECOMP_ENV_ENHANCE_KEYS, below) ── */ \
     RECOMP_ENV_ENHANCE_KEYS(X) \
     /* ── the game's own keys (RECOMP_ENV_GAME_KEYS, below) ──────────────── */ \
@@ -470,6 +502,13 @@ const char *recomp_env_legacy_name(recomp_env_id id);
 /* The list variable a key belongs to ("RECOMP_TRACE", "RECOMP_DEBUG"), or
  * NULL for a config-tier variable, whose name is the variable. */
 const char *recomp_env_list_var(recomp_env_id id);
+
+/* The machine is a Steam Deck: SteamDeck=1 (Steam sets it for what it
+ * launches there, Game Mode and Desktop Mode), or on Linux the DMI board,
+ * vendor "Valve", product "Jupiter" (LCD) or "Galileo" (OLED), for a start
+ * outside Steam. The rule Burnout 3's Deck defaults use (its main.c,
+ * host_is_steam_deck). Never on Android. */
+int recomp_host_is_steam_deck(void);
 
 #ifdef __cplusplus
 }

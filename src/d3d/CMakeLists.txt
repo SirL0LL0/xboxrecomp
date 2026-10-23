@@ -89,18 +89,24 @@ else()
         target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
-        target_link_libraries(xbox_d3d8 PUBLIC Vulkan::Vulkan glslang::glslang
+        target_link_libraries(xbox_d3d8 PUBLIC xr_vulkan glslang::glslang
                               glslang::glslang-default-resource-limits)
+        if(XR_VK_DYNAMIC_HOST)
+            # Android, Windows, Linux: every Vulkan call goes through pointers
+            # filled from the loader vk_dyn.c opens at run time (on Android
+            # the system's, or a replacement driver through libadrenotools).
+            # The header is force-included, so the Vulkan sources are the ones
+            # every host compiles. XR_VK_DYN_H is for the other libraries that
+            # call Vulkan (video, overlay).
+            set(XR_VK_DYN_H ${CMAKE_CURRENT_SOURCE_DIR}/vk_dyn.h
+                CACHE INTERNAL "the run-time Vulkan dispatch header")
+            target_sources(xbox_d3d8 PRIVATE vk_dyn.c)
+            target_compile_options(xbox_d3d8 PRIVATE -include ${XR_VK_DYN_H})
+            if(NOT WIN32 AND NOT ANDROID)
+                target_link_libraries(xbox_d3d8 PUBLIC ${CMAKE_DL_LIBS})
+            endif()
+        endif()
         if(ANDROID)
-            # Android: every Vulkan call goes through pointers filled from the
-            # loader android_vk.c opens (the system's, or a replacement driver
-            # through libadrenotools). The header is force-included, so the
-            # Vulkan sources are the ones every host compiles. XR_ANDROID_VK_H
-            # is for the other libraries that call Vulkan (video, overlay).
-            set(XR_ANDROID_VK_H ${CMAKE_CURRENT_SOURCE_DIR}/android_vk.h
-                CACHE INTERNAL "the Android Vulkan dispatch header")
-            target_sources(xbox_d3d8 PRIVATE android_vk.c)
-            target_compile_options(xbox_d3d8 PRIVATE -include ${XR_ANDROID_VK_H})
             # libadrenotools, built for the same ABI: <prefix>/include and
             # <prefix>/lib/libadrenotools.a, liblinkernsbypass.a. Its hook
             # libraries go into the APK beside the game's. Empty: the system
@@ -150,7 +156,7 @@ endif()
         # The pushbuffer executor's Metal backend (RECOMP_PB_BACKEND=metal).
         # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
         # runtime, so no metallib build step.
-        target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
+        target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m nv2a_texup_metal.m)
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC
@@ -197,6 +203,13 @@ if(XBOXRECOMP_BUILD_TESTS)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texscale
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texscale)
 endif()
+
+# The world's textures upscaled on the GPU (src/kernel/nv2a_texup.c,
+# graphics.texture_upscale, BO-245): the rule, the keys, the governor and
+# the disk store (every host, no GPU); on macOS also the Metal upscalers on
+# a real texture against a CPU reference.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texup
+                 ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texup)
 
 # The lower levels of alpha-tested textures made again with their alpha
 # coverage (src/kernel/nv2a_texmip.c, BO-171), against synthetic textures

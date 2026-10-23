@@ -85,8 +85,18 @@ static int make_instance(const char *const *inst_exts, unsigned n)
      * instance: MoltenVK reads its configuration then. */
     setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
 #endif
-    if (vkEnumerateInstanceVersion(&ver) != VK_SUCCESS || ver < VK_API_VERSION_1_3)
-        return fail("Vulkan 1.3 loader required (have %s%s)", "", VK_ERROR_INCOMPATIBLE_DRIVER);
+#if defined(XR_VK_DYNAMIC)
+    /* BO-231: the loader is opened here, not by the system before main. */
+    if (!xr_vk_loader_ok()) {
+        snprintf(s_err, sizeof s_err, "%s", xr_vk_loader_error());
+        return 0;
+    }
+#endif
+    if (vkEnumerateInstanceVersion(&ver) != VK_SUCCESS || ver < VK_API_VERSION_1_3) {
+        snprintf(s_err, sizeof s_err, "the Vulkan loader is version %u.%u, Vulkan 1.3 is needed",
+                 VK_API_VERSION_MAJOR(ver), VK_API_VERSION_MINOR(ver));
+        return 0;
+    }
     vkEnumerateInstanceExtensionProperties(NULL, &navail, NULL);
     avail = (VkExtensionProperties *)calloc(navail ? navail : 1, sizeof *avail);
     if (!avail)
@@ -180,7 +190,7 @@ static int make_device(void)
     uint32_t npd = 8, i, best_q = 0, navail = 0, ne = 0;
     int best = -1;
     VkExtensionProperties *avail;
-    const char *exts[10];
+    const char *exts[16];
     VkPhysicalDevicePresentIdFeaturesKHR pid, have_pid;
     VkPhysicalDevicePresentWaitFeaturesKHR pw, have_pw;
     int want_pw = 0;
@@ -239,6 +249,12 @@ static int make_device(void)
     if (s_core.surface && has_ext(avail, navail, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
         exts[ne++] = VK_EXT_HDR_METADATA_EXTENSION_NAME;
         s_core.hdr_metadata = 1;
+    }
+    /* BO-210: the window system's refresh cycle (gamescope's WSI layer has
+     * it), for Smooth's guard and the vblank lock. */
+    if (s_core.surface && has_ext(avail, navail, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME)) {
+        exts[ne++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
+        s_core.display_timing = 1;
     }
     want_pw = s_core.surface && has_ext(avail, navail, VK_KHR_PRESENT_ID_EXTENSION_NAME)
               && has_ext(avail, navail, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
@@ -365,6 +381,20 @@ static int make_device(void)
     r = vkCreateDevice(s_core.phys, &dci, NULL, &s_core.dev);
     if (r != VK_SUCCESS)
         return fail("vkCreateDevice on %s failed: %s", s_core.name, r);
+#if defined(XR_VK_DYNAMIC)
+    {
+        /* An old loader that does not know the Vulkan 1.3 names, and a driver
+         * that does not hand them to the device either. */
+        const char *missing = xr_vk_missing_core13();
+        if (missing) {
+            vkDestroyDevice(s_core.dev, NULL);
+            s_core.dev = VK_NULL_HANDLE;
+            snprintf(s_err, sizeof s_err, "%s has no %s: the Vulkan loader or the driver is older"
+                     " than Vulkan 1.3", s_core.name, missing);
+            return 0;
+        }
+    }
+#endif
     vkGetDeviceQueue(s_core.dev, s_core.qfam, 0, &s_core.queue);
 
     vkGetPhysicalDeviceFormatProperties(s_core.phys, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
@@ -396,8 +426,7 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
                     if (f) {
                         uint32_t dv = s_core.props.driverVersion;
                         const char *drv = getenv("RECOMP_ANDROID_DRIVER_NAME");
-                        extern const char *xr_android_vk_driver(void);
-                        fprintf(f, "driver=%s\ndevice=%s\nvulkan=%u.%u.%u\n",
+                                                fprintf(f, "driver=%s\ndevice=%s\nvulkan=%u.%u.%u\n",
                                 xr_android_vk_driver(), s_core.name,
                                 VK_API_VERSION_MAJOR(s_core.props.apiVersion),
                                 VK_API_VERSION_MINOR(s_core.props.apiVersion),
@@ -667,6 +696,8 @@ void nvk_buffer_free(struct nvk_buffer *b)
     memset(b, 0, sizeof *b);
 }
 
+static uint64_t s_img_bytes;   /* BO-240: nvk_image_bytes (render thread) */
+
 static int image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
                      uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect,
                      int cube)
@@ -709,6 +740,8 @@ static int image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
         return 0;
     }
     vkBindImageMemory(s_core.dev, im->img, im->mem, 0);
+    im->bytes = mr.size;
+    s_img_bytes += mr.size;
     memset(&vi, 0, sizeof vi);
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = im->img;
@@ -742,8 +775,15 @@ int nvk_image_new_cube(struct nvk_image *im, VkFormat fmt, uint32_t side, uint32
     return image_new(im, fmt, side, side, levels, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1);
 }
 
+uint64_t nvk_image_bytes(void)
+{
+    return s_img_bytes;
+}
+
 void nvk_image_free(struct nvk_image *im)
 {
+    if (im->mem)
+        s_img_bytes -= im->bytes;
     if (im->view)
         vkDestroyImageView(s_core.dev, im->view, NULL);
     if (im->img)

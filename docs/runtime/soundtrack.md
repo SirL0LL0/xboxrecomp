@@ -196,10 +196,20 @@ Latin-1 (above), as far as its font goes.
 `xbox_SettingsText`), `RECOMP_AUDIO_MUSIC_DIR` in the environment. Empty is
 off. Read at start: a change shows after a restart.
 
+Custom music at start (BO-230): `audio.custom_music_at_start` (bool, on) and
+`audio.custom_music_soundtrack` (a text setting: the name of the soundtrack
+the player last confirmed in the title's own screen; `""` kept in the file
+means the title's own music was chosen, no key means nothing chosen yet,
+`xbox_SettingsTextIsSet`). The port writes the second and acts on both; the
+toolkit offers the lookups a name needs, since the list changes with the
+folder: `xbox_SoundtrackNameOf(i, ...)` (UTF-8, as the title lists it) and
+`xbox_SoundtrackIndexOfName(name)`. The Audio page's row sits under the folder
+row and is greyed out while no folder is set.
+
 ## Test
 
 `tests/soundtrack`: the natural order, the names, a scan of a folder tree it
-makes, the ST.DB image read back the way the XDK library reads it, the
+makes, the soundtrack names and the lookup by name, the ST.DB image read back the way the XDK library reads it, the
 limits, and the decoders (pass-through at 44.1 kHz; a 1 kHz tone through the
 resampler from 22.05, 48 and 96 kHz and through mp3, FLAC and Ogg: frequency
 and level; a 30 kHz tone at 96 kHz filtered out). The encoded fixtures in

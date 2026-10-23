@@ -33,10 +33,12 @@ else()
     if(XBOXRECOMP_HAVE_VULKAN)
         # The window's Vulkan swapchain for the Vulkan backend.
         target_sources(xbox_video PRIVATE fb_present_vulkan.c)
-        target_link_libraries(xbox_video PUBLIC Vulkan::Vulkan)
+        target_link_libraries(xbox_video PUBLIC xr_vulkan)
+        if(XR_VK_DYNAMIC_HOST)
+            # Vulkan through vk_dyn.h's pointers (src/d3d/CMakeLists.txt).
+            target_compile_options(xbox_video PRIVATE -include ${XR_VK_DYN_H})
+        endif()
         if(ANDROID)
-            # Vulkan through android_vk.h's pointers (src/d3d/CMakeLists.txt).
-            target_compile_options(xbox_video PRIVATE -include ${XR_ANDROID_VK_H})
             # The display's refresh times from the Choreographer.
             target_sources(xbox_video PRIVATE android_vsync.c)
             # The 60 fps frame rate and the ADPF performance hints.
@@ -50,7 +52,8 @@ else()
         target_sources(xbox_video PRIVATE fb_present_metal.m host_probe_metal.m)
         target_link_libraries(xbox_video PUBLIC
             "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
-            "-framework Foundation" "-framework CoreVideo" "-framework AppKit")
+            "-framework Foundation" "-framework CoreVideo" "-framework AppKit"
+            "-framework IOKit")
     endif()
 endif()
 target_include_directories(xbox_video PUBLIC

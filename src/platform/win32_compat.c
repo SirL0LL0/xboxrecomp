@@ -33,6 +33,9 @@
 #endif
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
@@ -630,6 +633,7 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    DWORD           taker;          /* the thread whose wait took it last */
 
     /* semaphore */
     long            sem_count;
@@ -671,6 +675,9 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+    dev_t           fd_dev;           /* what fd was opened on (BO-221) */
+    ino_t           fd_ino;
+    int             fd_told;
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -704,11 +711,151 @@ static w32_object *obj_alloc(w32_kind kind)
     return o;
 }
 
+/* ---- host descriptor ownership (BO-221) ---------------------------------
+ *
+ * A file handle's descriptor must stay the file it was opened on until the
+ * handle closes it. Something else closing that number (a double close,
+ * a close of a stale number) lets the next open take it, and the handle
+ * then reads another file: the bank loader that read the end of a file it
+ * had just opened. Checked here, cheaply: each handle notes its file's
+ * device and inode, a table names the handle that owns each descriptor
+ * number, and a read, a seek and the close compare. A mismatch is logged
+ * once per handle with a backtrace; an open that is handed a number a live
+ * handle still owns is logged as REUSED. RECOMP_FD_TRACE=1 also logs every
+ * open and close of a handle's descriptor. */
+#if defined(__APPLE__) || defined(__GLIBC__)
+#include <execinfo.h>
+#define FD_HAVE_BT 1
+#endif
+#define FD_OWN_MAX 4096
+static w32_object *s_fd_owner[FD_OWN_MAX];
+static pthread_mutex_t s_fd_mu = PTHREAD_MUTEX_INITIALIZER;
+static int s_fd_trace = -1;
+
+int w32_fd_trace_on(void)
+{
+    if (s_fd_trace < 0) {
+        const char *v = getenv("RECOMP_FD_TRACE");
+        s_fd_trace = v && *v && *v != '0';
+    }
+    return s_fd_trace;
+}
+
+static void fd_now_names(int fd, char *out, size_t n)
+{
+    out[0] = 0;
+#if defined(__APPLE__)
+    char buf[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, buf) == 0) snprintf(out, n, "%s", buf);
+    else snprintf(out, n, "(fcntl: %s)", strerror(errno));
+#else
+    char link[64];
+    ssize_t k;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    k = readlink(link, out, n - 1);
+    if (k >= 0) out[k] = 0; else snprintf(out, n, "(readlink: %s)", strerror(errno));
+#endif
+}
+
+static void fd_backtrace(void)
+{
+#ifdef FD_HAVE_BT
+    void *f[24];
+    int n = backtrace(f, 24);
+    backtrace_symbols_fd(f, n, 2);
+#endif
+}
+
+/* fd still names the file it was opened on? 1 yes, 0 no (and said so). */
+static int fd_matches(w32_object *o, const char *where)
+{
+    struct stat st;
+    char now[1024];
+    if (o->fd < 0 || (!o->fd_dev && !o->fd_ino))
+        return 1;
+    if (fstat(o->fd, &st) == 0 && st.st_dev == o->fd_dev && st.st_ino == o->fd_ino)
+        return 1;
+    if (!o->fd_told) {
+        o->fd_told = 1;
+        fd_now_names(o->fd, now, sizeof now);
+        fprintf(stderr, "  [FD] MISMATCH at %s: obj %p fd %d was %s, now %s\n",
+                where, (void *)o, o->fd, o->file_path ? o->file_path : "?", now);
+        fd_backtrace();
+    }
+    return 0;
+}
+
+/* A descriptor some other code just got: no live handle may still own it. */
+void w32_fd_note_foreign(int fd, const char *who)
+{
+    w32_object *o;
+    if (fd < 0 || fd >= FD_OWN_MAX)
+        return;
+    pthread_mutex_lock(&s_fd_mu);
+    o = s_fd_owner[fd];
+    pthread_mutex_unlock(&s_fd_mu);
+    if (o) {
+        fprintf(stderr, "  [FD] STOLEN: %s got fd %d, still owned by obj %p (%s)\n",
+                who, fd, (void *)o, o->file_path ? o->file_path : "?");
+        fd_backtrace();
+    } else if (w32_fd_trace_on()) {
+        fprintf(stderr, "  [FD] foreign %s fd %d\n", who, fd);
+    }
+}
+
+int w32_handle_check(HANDLE h, const char *where)
+{
+    w32_object *o = (w32_object *)h;
+    if (!h || (uintptr_t)h < 0x10000u || o->kind != K_FILE)
+        return 1;
+    return fd_matches(o, where);
+}
+
+static void fd_own(w32_object *o)
+{
+    struct stat st;
+    w32_object *prev = NULL;
+    if (fstat(o->fd, &st) == 0) { o->fd_dev = st.st_dev; o->fd_ino = st.st_ino; }
+    if (o->fd >= 0 && o->fd < FD_OWN_MAX) {
+        pthread_mutex_lock(&s_fd_mu);
+        prev = s_fd_owner[o->fd];
+        s_fd_owner[o->fd] = o;
+        pthread_mutex_unlock(&s_fd_mu);
+    }
+    if (prev && prev != o) {
+        fprintf(stderr, "  [FD] REUSED: fd %d opened for %s (obj %p) is still owned by obj %p (%s): "
+                "closed behind its owner's back\n", o->fd, o->file_path ? o->file_path : "?",
+                (void *)o, (void *)prev, prev->file_path ? prev->file_path : "?");
+        fd_backtrace();
+    }
+    if (w32_fd_trace_on())
+        fprintf(stderr, "  [FD] open fd %d obj %p %s\n", o->fd, (void *)o, o->file_path ? o->file_path : "?");
+}
+
+static void fd_disown(w32_object *o)
+{
+    fd_matches(o, "close");
+    if (o->fd >= 0 && o->fd < FD_OWN_MAX) {
+        pthread_mutex_lock(&s_fd_mu);
+        if (s_fd_owner[o->fd] == o) s_fd_owner[o->fd] = NULL;
+        pthread_mutex_unlock(&s_fd_mu);
+    }
+    if (w32_fd_trace_on())
+        fprintf(stderr, "  [FD] close fd %d obj %p %s\n", o->fd, (void *)o, o->file_path ? o->file_path : "?");
+}
+
 static void obj_release(w32_object *o)
 {
-    if (InterlockedDecrement(&o->refcount) > 0)
+    LONG left = InterlockedDecrement(&o->refcount);
+    if (left < 0) {
+        fprintf(stderr, "  [FD] RELEASE of a dead object %p (refcount %ld, kind %d)\n",
+                (void *)o, (long)left, (int)o->kind);
+        fd_backtrace();
+    }
+    if (left > 0)
         return;
     if (o->kind == K_FILE) {
+        fd_disown(o);
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
@@ -719,6 +866,7 @@ static void obj_release(w32_object *o)
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->gate);
+    o->refcount = -1000;               /* BO-221 trace: a release after this says so */
     free(o);
 }
 
@@ -728,6 +876,7 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     w32_object *o = obj_alloc(K_FILE);
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
+    fd_own(o);
     return (HANDLE)o;
 }
 
@@ -891,7 +1040,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_EVENT: if (!o->manual_reset) o->signaled = 0; o->taker = GetCurrentThreadId(); break;
         case K_WAITABLE_TIMER:
             if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
             break;
@@ -991,9 +1140,24 @@ BOOL SetEvent(HANDLE h)
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
+    o->taker = 0;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
+}
+
+/* Diagnostics: an event's state without taking it (-1: no event). */
+int w32_event_peek(HANDLE h, DWORD *taker)
+{
+    w32_object *o = (w32_object *)h;
+    int v;
+    if (taker) *taker = 0;
+    if (!o || o->kind != K_EVENT) return -1;
+    pthread_mutex_lock(&o->lock);
+    v = o->signaled;
+    if (taker) *taker = o->taker;
+    pthread_mutex_unlock(&o->lock);
+    return v;
 }
 
 BOOL ResetEvent(HANDLE h)

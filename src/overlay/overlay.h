@@ -3,8 +3,11 @@
  * presenter sees it.
  *
  * The presenter (src/video/fb_present_sdl.c and its Metal and Vulkan halves)
- * owns the window, its one event loop and the present, all on the process
- * main thread, and so does the overlay: ImGui is used from that thread only.
+ * owns the window and its one event loop on the process main thread, and
+ * presents on a thread of its own (BO-210). The overlay's events, its poll
+ * and ImGui's SDL half come from the main thread, its frame is built and
+ * drawn on the present thread; one mutex in overlay_ui.cpp keeps ImGui to
+ * one thread at a time.
  *
  *   events    every SDL event of the main loop goes to xbox_OverlayEvent
  *             first. It watches for the hotkeys (Back+Start on a pad, F1,
@@ -40,6 +43,12 @@ int  xbox_OverlayEvent(const SDL_Event *ev);
 /* Once per turn of the main loop: held directions repeat, a saved change
  * reaches the file, the window follows the fullscreen setting. */
 void xbox_OverlayPoll(void);
+
+/* Once per turn of the main loop, after its events: ImGui's SDL half (the
+ * window's size, the mouse, the cursor), which must run on the window's
+ * thread, for the next frame the present thread draws; at the first call
+ * also the ImGui context. `vulkan`: the Vulkan presenter (else Metal). */
+void xbox_OverlayPlatformFrame(int vulkan);
 
 /* Open, fading, or showing the frame-time graph: the presenter draws it, and
  * while it is open (xbox_OverlayOpen) it presents on every turn, not only on

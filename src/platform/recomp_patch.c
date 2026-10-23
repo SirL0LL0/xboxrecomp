@@ -71,8 +71,12 @@ uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
 }
 
 /* The names a float patch's expression reads. Set before the guest runs,
- * read from its threads: a slot is written whole before the count moves. */
-#define VAR_MAX 16
+ * read from its threads: a slot is written whole before the count moves.
+ * A name that finds the table full is said on stderr: a dropped name reads
+ * 0 in every expression (BO-245: int027's two rival-marker names filled the
+ * old 16 slots and fe_dw, registered last, read 0, so the front end's
+ * full-frame decoration and the films drew at the left in 16:9). */
+#define VAR_MAX 64
 static struct {
     const char *name;
     double value;
@@ -89,8 +93,11 @@ static void var_set(const char *name, double value, double (*fn)(void))
             s_var[i].fn = fn;
             return;
         }
-    if (s_nvar == VAR_MAX)
+    if (s_nvar == VAR_MAX) {
+        fprintf(stderr, "[PATCH] name table full (%d): %s is not registered, its expressions read 0\n",
+                VAR_MAX, name);
         return;
+    }
     s_var[s_nvar].name = name;
     s_var[s_nvar].value = value;
     s_var[s_nvar].fn = fn;
@@ -125,8 +132,9 @@ double recomp_patch_var(const char *name)
     return 0.0;
 }
 
-/* Marks: written before the guest runs, as the settings are. */
-#define MARK_MAX 16
+/* Marks: written before the guest runs, as the settings are. A mark that
+ * finds the table full is said on stderr, as a name is. */
+#define MARK_MAX 64
 static struct {
     const char *name;
     void (*fn)(void);
@@ -135,8 +143,10 @@ static volatile int s_nmark;
 
 void recomp_patch_on_mark(const char *name, void (*fn)(void))
 {
-    if (s_nmark == MARK_MAX)
+    if (s_nmark == MARK_MAX) {
+        fprintf(stderr, "[PATCH] mark table full (%d): %s is not registered\n", MARK_MAX, name);
         return;
+    }
     s_mark[s_nmark].name = name;
     s_mark[s_nmark].fn = fn;
     s_nmark = s_nmark + 1;

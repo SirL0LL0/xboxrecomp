@@ -6,6 +6,7 @@
 #include "recomp_env.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -281,11 +282,34 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
         mode = n == 0 ? 1 : 0;
     t->raw_mode = mode;
     t->on = on;
+    t->alpha_kill = (int)((ctl0 >> 2) & 1u);
     /* PASSTHRU and CLIPPLANE have no texture to be valid: they stay. The
      * GPU backends drop CLIPPLANE to 0 themselves (no per-pixel kill yet). */
     if (mode != 4 && mode != 5 && (!on || !t->valid))
         mode = 0;
     t->mode = mode;
+}
+
+uint32_t nv2a_alpha_kill_mask(const struct nv2a_stage *s, uint32_t flips)
+{
+    static int on = -1;
+    static uint32_t ab_n;
+    uint32_t m = 0;
+    int n;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_ALPHA_KILL);
+        on = !(e && e[0] == '0');
+        if (e && !strncmp(e, "ab", 2)) {   /* =ab:N: off in even N-flip windows, for paused A/B */
+            on = 2;
+            ab_n = (e[2] == ':' && atoi(e + 3) > 0) ? (uint32_t)atoi(e + 3) : 1u;
+        }
+    }
+    if (!on || (on == 2 && !((flips / ab_n) & 1u)))
+        return 0;
+    for (n = 0; n < 4; n++)
+        if (s[n].alpha_kill && s[n].mode && s[n].mode != 4 && s[n].mode != 5)
+            m |= 1u << n;
+    return m;
 }
 
 uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
@@ -791,6 +815,14 @@ void nv2a_host_set_lod_bias(int mode, float value)
 static volatile int   s_hdr_on = -1;          /* -1: not read yet */
 static volatile float s_hdr_peak = -1.0f, s_hdr_paper = -1.0f, s_hdr_hud = -1.0f;
 static volatile float s_hdr_pot, s_hdr_now;
+/* BO-227: the headroom the levels use. macOS's current headroom reads 1.0
+ * until the EDR layer is on screen, then what macOS grants; the levels
+ * took it raw every present, so the peak went 1000 / 508 / 1000 (the
+ * "Display" value, the shoulder, the patch with it). Now: the granted one,
+ * held (nv2a_host_hdr_display). */
+static volatile float s_hdr_cap;
+static volatile float s_hdr_edid;      /* BO-244: the display's EDID peak, nits (macOS) */
+void nv2a_host_hdr_display_peak(float edid_nits) { s_hdr_edid = edid_nits; }
 static void *(*s_hdr_patch_fn)(float);
 
 static float env_f(recomp_env_id id, float def)
@@ -842,16 +874,30 @@ void nv2a_host_hdr_levels(float *peak_nits, float *paper_nits, float *hud_nits)
     hw = s_hdr_hud >= 10.0f ? s_hdr_hud : pw;
     pk = s_hdr_peak;
     if (pk < 10.0f) {
-        /* The display's: on macOS its EDR headroom now, x 100 nits; on
-         * Vulkan the peak its EDID reports / 100 (fb_present_vulkan.c); with
-         * no display known (headless) 1000. */
-        pk = s_hdr_now > 1.0f ? s_hdr_now * 100.0f : 1000.0f;
-    }
+        /* The display's: on Vulkan the peak its EDID reports / 100
+         * (fb_present_vulkan.c); on macOS (BO-244) the potential EDR
+         * headroom x 100 nits = the panel's peak (fb_present_metal.m's
+         * metadata puts the content's nits on the panel as they are,
+         * whatever the brightness slider), else its EDID's peak; with no
+         * display known (headless) 1000. A peak set by the player is taken
+         * as it is, as on Vulkan. */
+        pk = s_hdr_pot > 1.0f ? s_hdr_pot * 100.0f : 1000.0f;
 #if defined(__APPLE__)
-    else if (s_hdr_now > 1.0f && pk > s_hdr_now * 100.0f) {
-        pk = s_hdr_now * 100.0f;     /* never past what the display shows now (EDR headroom) */
-    }
+        if (s_hdr_pot <= 1.0f && s_hdr_edid >= 100.0f)
+            pk = s_hdr_edid;
+        {
+            static float said;
+            const char *src = s_hdr_pot > 1.0f ? "the potential EDR headroom x 100 (the panel's peak)"
+                            : s_hdr_edid >= 100.0f ? "the EDID" : "none known";
+            if (pk != said) {
+                said = pk;
+                fprintf(stderr, "[HDR] default peak %.0f nits from %s (EDID %.1f, potential %.0f, granted %.3fx:"
+                        " SDR white %.0f nits)\n", pk, src, s_hdr_edid, s_hdr_pot * 100.0f, s_hdr_cap,
+                        s_hdr_cap > 1.0f && s_hdr_pot > s_hdr_cap ? s_hdr_pot / s_hdr_cap * 100.0f : 100.0f);
+            }
+        }
 #endif
+    }
     if (pk < pw) pk = pw;
     if (pk < hw) pk = hw;
     *peak_nits = pk;
@@ -899,13 +945,46 @@ void nv2a_host_hdr_shape(float *shoulder, float *black_nits)
 
 void nv2a_host_hdr_display(float potential, float now)
 {
+    /* BO-227: the headroom macOS grants (on the PG32UCDP 1.92x of 5.08x,
+     * steady), ignoring the 1.0 it reads while the layer is not on screen
+     * and changes of 5% or less; the potential until a real reading. */
+    float cap = s_hdr_cap;
+    if (potential != s_hdr_pot || cap <= 0.0f)
+        cap = potential;
+    if (now > 1.0f && now < potential) {
+        if (cap > now * 1.05f || cap < now * 0.95f)
+            cap = now;
+    } else if (now >= potential) {
+        cap = potential;
+    }
+    if (cap != s_hdr_cap)
+        fprintf(stderr, "[HDR] display headroom %.2fx (potential %.2fx, now %.2fx)\n",
+                cap, potential, now);
     s_hdr_pot = potential;
     s_hdr_now = now;
+    s_hdr_cap = cap;
 }
 
 float nv2a_host_hdr_potential(void) { return s_hdr_pot; }
+float nv2a_host_hdr_granted(void) { return s_hdr_cap; }
 
 void nv2a_host_set_hdr_patch_fn(void *(*fn)(float)) { s_hdr_patch_fn = fn; }
+/* BO-227: where the overlay drew the patch (window pixels), for a probe. */
+static volatile float s_patch_at[4];
+static volatile uint32_t s_patch_at_ms;
+void nv2a_host_hdr_patch_at(float x0, float y0, float x1, float y1)
+{
+    s_patch_at[0] = x0; s_patch_at[1] = y0; s_patch_at[2] = x1; s_patch_at[3] = y1;
+    s_patch_at_ms++;
+}
+int nv2a_host_hdr_patch_where(float *x0, float *y0, float *x1, float *y1)
+{
+    static uint32_t seen;
+    int fresh = s_patch_at_ms != seen;
+    seen = s_patch_at_ms;
+    *x0 = s_patch_at[0]; *y0 = s_patch_at[1]; *x1 = s_patch_at[2]; *y1 = s_patch_at[3];
+    return fresh;
+}
 void *nv2a_host_hdr_patch(float nits) { return s_hdr_patch_fn ? s_hdr_patch_fn(nits) : NULL; }
 
 /* The overlay's request for a pattern this frame (a presenter that cannot
@@ -1040,15 +1119,16 @@ uint32_t nv2a_present_width(uint32_t src_w, uint32_t src_h)
     return (uint32_t)(((uint64_t)src_h * aw + ah / 2) / ah);
 }
 
-/* RECOMP_PRESENT_OVERSCAN=crop / RECOMP_PRESENT_FIT=fill16x10 (see
- * nv2a_backend_common.h, nv2a_present_layout). */
+/* RECOMP_PRESENT_OVERSCAN=crop|fill / RECOMP_PRESENT_FIT=fill16x10 (see
+ * nv2a_backend_common.h, nv2a_present_layout). The overscan is
+ * NV2A_OVERSCAN_OFF / CROP / FILL; the fit 0 / 1. */
 static volatile int s_crop = -1, s_fill = -1;   /* -1: not read yet */
 
 /* The same two, live (the overlay's Display page); the next present uses
  * them. */
-void nv2a_present_set_overscan(int crop)
+void nv2a_present_set_overscan(int mode)
 {
-    s_crop = crop != 0;
+    s_crop = mode == NV2A_OVERSCAN_CROP || mode == NV2A_OVERSCAN_FILL ? mode : NV2A_OVERSCAN_OFF;
 }
 
 void nv2a_present_set_fit(int fill)
@@ -1065,6 +1145,14 @@ static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, in
                           int aspect, double fa, struct nv2a_rect *src, struct nv2a_rect *dst);
 static int present_rect(uint32_t src_w, uint32_t src_h, int aspect, double fa,
                         uint32_t dst_w, uint32_t dst_h, int filter, struct nv2a_rect *r);
+
+int nv2a_present_layout_cuts(void)
+{
+    struct nv2a_rect s, d;
+    /* Reads the environment on the first call, as the layout does. */
+    present_layout(640, 480, 640, 480, NV2A_PRESENT_NEAREST, s_host_opts.present_aspect, 0.0, &s, &d);
+    return s_crop != NV2A_OVERSCAN_OFF || s_fill > 0;
+}
 
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst)
@@ -1137,7 +1225,8 @@ static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, in
     int whole, crop, fill;
     if (s_crop < 0) {
         const char *e = recomp_env(RENV_PRESENT_OVERSCAN);
-        s_crop = e && !strcmp(e, "crop");
+        s_crop = e && !strcmp(e, "crop") ? NV2A_OVERSCAN_CROP
+               : e && !strcmp(e, "fill") ? NV2A_OVERSCAN_FILL : NV2A_OVERSCAN_OFF;
     }
     if (s_fill < 0) {
         const char *e = recomp_env(RENV_PRESENT_FIT);
@@ -1148,7 +1237,17 @@ static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, in
     src->x = src->y = 0;
     src->w = (int32_t)fw;
     src->h = (int32_t)fh;
-    if (crop && fw && fh) {
+    if (crop == NV2A_OVERSCAN_FILL && fw && fh) {
+        /* The 640x448 band (16 of 480 rows off the top and bottom) at the
+         * full width, into the box the whole frame has: a vertical stretch of
+         * 480/448, nothing cut at the sides. The box is the frame's, as with
+         * no overscan, so the aspect and the fit rules are the same ones. */
+        int32_t cy = (int32_t)((fh * 16u + 240u) / 480u);
+        src->y = cy;
+        src->h = (int32_t)fh - 2 * cy;
+        present_rect(fw, fh, aspect, fa, dw, dh, filter, dst);
+        whole = 0;      /* not a whole multiple of the band: filtered, not nearest */
+    } else if (crop && fw && fh) {
         /* 16 of 480 rows top and bottom (a TV's overscan: the 640x448 the
          * title keeps its picture in), the same share of the width. */
         int32_t cy = (int32_t)((fh * 16u + 240u) / 480u);
@@ -1158,7 +1257,8 @@ static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, in
         src->w = (int32_t)fw - 2 * cx;
         src->h = (int32_t)fh - 2 * cy;
     }
-    whole = present_rect((uint32_t)src->w, (uint32_t)src->h, aspect, fa, dw, dh, filter, dst);
+    if (crop != NV2A_OVERSCAN_FILL || !fw || !fh)
+        whole = present_rect((uint32_t)src->w, (uint32_t)src->h, aspect, fa, dw, dh, filter, dst);
     if (fill && dst->h > 0 && (uint32_t)dst->h < dh) {
         /* Fill the height; what is wider than the window is cropped from
          * the frame's sides. */

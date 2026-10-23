@@ -1,33 +1,42 @@
 /*
- * android_vk.h - Vulkan through function pointers, on Android only.
+ * vk_dyn.h - Vulkan through function pointers, on Android, Windows and Linux.
  *
- * Everywhere else the runtime calls the Vulkan loader it links (libvulkan,
- * vulkan-1.dll, MoltenVK). On Android the driver a title wants is often not
+ * The runtime does not link the Vulkan loader on these hosts. It opens it
+ * when the first Vulkan call is made (vulkan-1.dll, libvulkan.so.1), the way
+ * volk does, so that a PC without a loader, or with an old one that lacks the
+ * Vulkan 1.3 entry points, starts and says what is wrong instead of being
+ * stopped by the system before main ("The procedure entry point
+ * vkCmdBeginRendering could not be located", BO-231, GitHub #37). macOS keeps
+ * linking MoltenVK (the development path; the shipped Mac build is Metal).
+ *
+ * On Android there is a second reason: the driver a title wants is often not
  * the system's: a phone's stock Adreno driver stops at Vulkan 1.1, and a
  * replacement (Mesa Turnip) is loaded into the app through libadrenotools,
  * which hands back its own copy of the system loader. Calls into the
- * libvulkan.so this library links would still reach the stock driver, so on
- * Android every vk* name the runtime uses is a pointer filled from the loader
- * android_vk.c opened, the way volk does it.
+ * libvulkan.so this library links would still reach the stock driver.
  *
  * The build force-includes this header into the runtime's Vulkan sources
  * (-include, src/d3d/CMakeLists.txt): those sources are not edited, and a
  * call to a function missing from the list below does not compile (there
  * are no prototypes), so the list cannot fall behind unnoticed.
  *
- * vkGetInstanceProcAddr is the exception: a real, exported function of the
- * game's library (android_vk.c). The presenter asks SDL to use "the loader
- * linked into this binary" (dladdr on it, fb_present_vulkan.c), SDL finds
- * this one, and the surface it makes belongs to the same loader as the
- * instance.
+ * vkGetInstanceProcAddr is the exception: a real function of the game
+ * (vk_dyn.c). On Android the presenter asks SDL to use "the loader linked
+ * into this binary" (dladdr on it, fb_present_vulkan.c), SDL finds this one,
+ * and the surface it makes belongs to the same loader as the instance. On
+ * Windows and Linux SDL opens the same loader by its own name, which the OS
+ * hands out as the library already loaded.
  *
- * Which driver: android_vk.c reads RECOMP_ANDROID_DRIVER_DIR and
+ * Android: vk_dyn.c reads RECOMP_ANDROID_DRIVER_DIR and
  * RECOMP_ANDROID_DRIVER_NAME (android_host.h).
  */
-#ifndef RECOMP_ANDROID_VK_H
-#define RECOMP_ANDROID_VK_H
+#ifndef RECOMP_VK_DYN_H
+#define RECOMP_VK_DYN_H
 
-#if defined(__ANDROID__)
+/* XR_VK_FORCE_DYNAMIC: a build that is not one of these hosts takes the same
+ * path (tests/vk_dyn runs it on macOS, against MoltenVK). */
+#if defined(__ANDROID__) || defined(_WIN32) || defined(__linux__) || defined(XR_VK_FORCE_DYNAMIC)
+#define XR_VK_DYNAMIC 1
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES 1
@@ -46,7 +55,7 @@ extern "C" {
 #endif
 
 /* Every Vulkan command the runtime and Dear ImGui's backend call. */
-#define XR_ANDROID_VK_FUNCS(X) \
+#define XR_VK_FUNCS(X) \
     X(vkAcquireNextImageKHR) \
     X(vkAllocateCommandBuffers) \
     X(vkAllocateDescriptorSets) \
@@ -67,6 +76,7 @@ extern "C" {
     X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImage) \
     X(vkCmdCopyImageToBuffer) \
+    X(vkCmdDispatch) \
     X(vkCmdDraw) \
     X(vkCmdDrawIndexed) \
     X(vkCmdEndQuery) \
@@ -94,6 +104,7 @@ extern "C" {
     X(vkCmdWriteTimestamp) \
     X(vkCreateBuffer) \
     X(vkCreateCommandPool) \
+    X(vkCreateComputePipelines) \
     X(vkCreateDescriptorPool) \
     X(vkCreateDescriptorSetLayout) \
     X(vkCreateDevice) \
@@ -151,6 +162,7 @@ extern "C" {
     X(vkGetPhysicalDeviceFormatProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceProperties) \
+    X(vkGetPhysicalDeviceProperties2) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
@@ -175,17 +187,28 @@ extern "C" {
     X(vkWaitForPresentKHR) \
     X(vkWaitSemaphores)
 
-#define XR_ANDROID_VK_DECLARE(name) extern PFN_##name xr_##name;
-XR_ANDROID_VK_FUNCS(XR_ANDROID_VK_DECLARE)
-#undef XR_ANDROID_VK_DECLARE
+#define XR_VK_DECLARE(name) extern PFN_##name xr_##name;
+XR_VK_FUNCS(XR_VK_DECLARE)
+#undef XR_VK_DECLARE
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
                                                                const char *name);
 
+/* Whether the Vulkan loader could be opened, and if not why ("vulkan-1.dll
+ * could not be loaded (error 126)"). Opens it on the first call. */
+int xr_vk_loader_ok(void);
+const char *xr_vk_loader_error(void);
+
+/* After vkCreateDevice: the name of the first Vulkan 1.3 command the
+ * loader and driver did not hand out (an old loader), or NULL. */
+const char *xr_vk_missing_core13(void);
+
+#if defined(__ANDROID__)
 /* What the loader is: "system" or the replacement driver's file name; and
  * whether a replacement was asked for and could not be opened. */
 const char *xr_android_vk_driver(void);
 int xr_android_vk_driver_failed(void);
+#endif
 
 #ifdef __cplusplus
 }
@@ -211,6 +234,7 @@ int xr_android_vk_driver_failed(void);
 #define vkCmdCopyBufferToImage xr_vkCmdCopyBufferToImage
 #define vkCmdCopyImage xr_vkCmdCopyImage
 #define vkCmdCopyImageToBuffer xr_vkCmdCopyImageToBuffer
+#define vkCmdDispatch xr_vkCmdDispatch
 #define vkCmdDraw xr_vkCmdDraw
 #define vkCmdDrawIndexed xr_vkCmdDrawIndexed
 #define vkCmdEndQuery xr_vkCmdEndQuery
@@ -238,6 +262,7 @@ int xr_android_vk_driver_failed(void);
 #define vkCmdWriteTimestamp xr_vkCmdWriteTimestamp
 #define vkCreateBuffer xr_vkCreateBuffer
 #define vkCreateCommandPool xr_vkCreateCommandPool
+#define vkCreateComputePipelines xr_vkCreateComputePipelines
 #define vkCreateDescriptorPool xr_vkCreateDescriptorPool
 #define vkCreateDescriptorSetLayout xr_vkCreateDescriptorSetLayout
 #define vkCreateDevice xr_vkCreateDevice
@@ -295,6 +320,7 @@ int xr_android_vk_driver_failed(void);
 #define vkGetPhysicalDeviceFormatProperties xr_vkGetPhysicalDeviceFormatProperties
 #define vkGetPhysicalDeviceMemoryProperties xr_vkGetPhysicalDeviceMemoryProperties
 #define vkGetPhysicalDeviceProperties xr_vkGetPhysicalDeviceProperties
+#define vkGetPhysicalDeviceProperties2 xr_vkGetPhysicalDeviceProperties2
 #define vkGetPhysicalDeviceQueueFamilyProperties xr_vkGetPhysicalDeviceQueueFamilyProperties
 #define vkGetPhysicalDeviceSurfaceCapabilitiesKHR xr_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
 #define vkGetPhysicalDeviceSurfaceFormatsKHR xr_vkGetPhysicalDeviceSurfaceFormatsKHR
@@ -319,5 +345,5 @@ int xr_android_vk_driver_failed(void);
 #define vkWaitForPresentKHR xr_vkWaitForPresentKHR
 #define vkWaitSemaphores xr_vkWaitSemaphores
 
-#endif /* __ANDROID__ */
-#endif /* RECOMP_ANDROID_VK_H */
+#endif /* XR_VK_DYNAMIC */
+#endif /* RECOMP_VK_DYN_H */

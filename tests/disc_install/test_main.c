@@ -28,6 +28,7 @@
 #else
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 #define t_mkdir(p) mkdir((p), 0755)
 #define RMRF "rm -rf "
 #endif
@@ -472,6 +473,44 @@ static void test_reader(fx_disc *d)
     free(buf);
 }
 
+#if !defined(_WIN32)
+/* The source_open callback (an Android document tree): the folder at
+ * ctx, files opened by descriptor, rel matched as given. */
+static int tree_open(void *ctx, const char *rel, uint64_t *size)
+{
+    char path[700];
+    struct stat st;
+    int fd;
+
+    snprintf(path, sizeof path, "%s/%s", (const char *)ctx, rel);
+    if (stat(path, &st) != 0)
+        return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -2;
+    *size = (uint64_t)st.st_size;
+    return fd;
+}
+
+static int install_tree(const char *tree, const char *dest, const xr_manifest *m,
+                        xr_install_result *r, int identify_only)
+{
+    xr_install_opts o;
+
+    memset(&o, 0, sizeof o);
+    o.source = "ignored";
+    o.source_fd = -1;
+    o.source_open = tree_open;
+    o.ctx = (void *)tree;
+    o.dest = dest;
+    o.subdir = "Game Files";
+    o.manifest = m;
+    o.version = "test";
+    o.identify_only = identify_only;
+    return xr_install(&o, r);
+}
+#endif
+
 static void test_install(fx_disc *d)
 {
     xr_manifest m;
@@ -495,6 +534,11 @@ static void test_install(fx_disc *d)
         CHECK(xr_install(&o, &r) == XR_INSTALL_OK && r.image && !r.copied);
         CHECK(!exists(ROOT "/never/install.journal") && !exists(ROOT "/never/.complete"));
     }
+
+    /* BO-229: a destination several missing folders deep (made from the
+     * deepest one upward, no ancestor looked at first), with a trailing slash. */
+    CHECK(install(ROOT "/disc.iso", ROOT "/deep/x/y/z/", &m, &r, 0, 0) == XR_INSTALL_OK);
+    CHECK(installed(d, ROOT "/deep/x/y/z"));
 
     /* The whole install. */
     CHECK(install(ROOT "/disc.iso", ROOT "/a", &m, &r, 0, 0) == XR_INSTALL_OK);
@@ -580,6 +624,22 @@ static void test_install(fx_disc *d)
     CHECK(install(ROOT "/absent.iso", ROOT "/f", &m, &r, 0, 0) == XR_INSTALL_NO_SOURCE);
     CHECK(install(ROOT "/notes.iso", ROOT "/f", &m, &r, 0, 0) == XR_INSTALL_NOT_XBOX);
     CHECK(!strcmp(xr_install_code_name(r.code), "not-xbox-image") && strstr(r.message, "notes.iso"));
+
+#if !defined(_WIN32)
+    /* A source_open tree: the same checks and the same resume as a folder. */
+    CHECK(install_tree(ROOT "/wrap/GAME", ROOT "/t1", &m, &r, 1) == XR_INSTALL_OK && !r.copied);
+    CHECK(!exists(ROOT "/t1/.complete"));
+    CHECK(install_tree(ROOT "/wrap/GAME", ROOT "/t1", &m, &r, 0) == XR_INSTALL_OK);
+    CHECK(!r.image && r.copied == d->n && installed(d, ROOT "/t1"));
+    remove(ROOT "/t1/.complete");           /* stopped late: all checked in place */
+    CHECK(install_tree(ROOT "/wrap/GAME", ROOT "/t1", &m, &r, 0) == XR_INSTALL_OK);
+    CHECK(!r.copied && r.verified == d->n);
+    CHECK(install_tree(ROOT "/empty", ROOT "/t2", &m, &r, 0) == XR_INSTALL_NO_EXE);
+    CHECK(strstr(r.message, "not an extracted Xbox disc") != NULL);
+    CHECK(install_tree(ROOT "/e/Game Files", ROOT "/t3", &m, &r, 0) == XR_INSTALL_DAMAGED);
+    CHECK(strstr(r.message, "readme.txt") && strstr(r.message, "folder")
+          && !exists(ROOT "/t3/.complete"));
+#endif
 
     /* No room. */
     CHECK(install(ROOT "/disc.iso", ROOT "/g", &m, &r, 0, (uint64_t)1 << 60) == XR_INSTALL_DISK_FULL);

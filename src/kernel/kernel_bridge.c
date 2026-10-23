@@ -29,7 +29,9 @@
 #include "kernel_console_keys.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
+#include "kernel_wake.h"
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
 #include "platform/host_time.h"
 #include "platform/android_host.h"   /* the fastest core (Android) */
 #include "platform/latency_trace.h"
@@ -706,6 +708,7 @@ static uint32_t thobj_alloc(void)
         return 0;
     }
     memset(XBOX_TO_NATIVE(va), 0, THOBJ_SIZE);
+    xbox_WakeNewThreadObject(va);                 /* priority 0 again */
     BRIDGE_MEM8(va + 0) = 6;                      /* Type: ThreadObject */
     BRIDGE_MEM8(va + 2) = (uint8_t)(THOBJ_SIZE / 4);
     BRIDGE_MEM32(va + 8)  = va + 8;               /* WaitListHead, empty */
@@ -823,6 +826,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     g_thread_obj_va = s->obj_va;
+    xbox_WakeGuestThread(s->obj_va);
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (tib)
@@ -964,6 +968,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 /* Main game thread: run directly, inheriting register state */
                 xbox_log_thread_role("guest-main", start_routine);
                 xbox_GuestThreadPin("guest-main");
+                xbox_WakeGuestThread(thobj_current());
                 /* Its TLS too: the stack is already in use, so the block
                  * comes from the heap, and the main TIB's fs:[0x28] object
                  * gets the TlsData pointer (see bridge_layout_tls). */
@@ -1932,9 +1937,11 @@ static void bridge_KeSetEvent(void)
         h = bridge_resolve_handle(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
-    if (h)
+    if (h) {
         g_eax = (uint32_t)SetEvent(h);
-    else
+        if (g_eax)
+            xbox_WakeSignalled(h, g_xbox_kernel_caller);
+    } else
         g_eax = 0;
 }
 
@@ -1954,9 +1961,11 @@ static void bridge_KeWaitForSingleObject(void)
     if (!h)
         h = XBOX_TO_NATIVE(object);
 
+    xbox_WakeWaitBegin(h, g_xbox_kernel_caller);
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    xbox_WakeWaitEnd();
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -1972,8 +1981,10 @@ static void bridge_NtWaitForSingleObject(void)
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
+    xbox_WakeWaitBegin(handle, g_xbox_kernel_caller);
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    xbox_WakeWaitEnd();
 }
 
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
@@ -1995,6 +2006,9 @@ static void bridge_NtSetEvent(void)
     HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t prev   = STACK_ARG(1);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+    /* A guest thread of higher priority that waited on it runs first. */
+    if (g_eax == 0)
+        xbox_WakeSignalled(handle, g_xbox_kernel_caller);
 }
 
 /* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
@@ -2034,9 +2048,11 @@ static void bridge_NtWaitForSingleObjectEx(void)
         fflush(stderr);
     }
 
+    xbox_WakeWaitBegin(handle, g_xbox_kernel_caller);
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+    xbox_WakeWaitEnd();
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -4026,13 +4042,37 @@ static void handle_lock(void)
 
 static void handle_unlock(void) { InterlockedExchange(&s_handle_lock, 0); }
 
+/* Where the search for a free slot starts: the slot after the last one
+ * handed out. A slot that was just freed is the last one to be taken again.
+ *
+ * Taking the lowest free slot gave the next open the token of the handle
+ * closed just before it. A title whose threads overlap on one handle -- one
+ * closes it while another is still between two calls that name it (a seek
+ * made of a position query and a position set, a read queued on a stream
+ * whose close has run) -- then reached whatever file opened next, and on a
+ * host whose threads really run at once that window is open. Burnout 3 on
+ * the Steam Deck with a custom soundtrack (GitHub #17, BO-221): the loading
+ * screen's sound bank, sound\single.awd, read its first sector and then hit
+ * the end of the 706560-byte file at offset 2048; its header was parsed from
+ * the sector that never came and the bank loader took a float for a table
+ * index (SIGSEGV in sub_001F6B20). The same log has the race music's
+ * stream hit the end of a 9 MB wave bank after 260 KB, right after a car
+ * model was read to its end: the shape of one handle reaching another
+ * file. The title's main thread seeks and closes handles that its file
+ * thread opens and reads, and with a custom soundtrack it also opens the
+ * soundtrack database on every song. With the slots
+ * taken in turn, a stale token names no object for the next 16383 handles:
+ * its call fails with STATUS_INVALID_HANDLE, as a closed handle does on the
+ * console, and the file that opened since is left alone. */
+static int s_handle_next = 1;
+
 /* A token for h. The same HANDLE normally gets the same token. A duplicate
  * must not: on POSIX, DuplicateHandle returns its source pointer with one
  * more reference. If the duplicate shared the source's token, NtClose on
  * either one would clear the slot that both of them use. */
 static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
 {
-    int i;
+    int i, n;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
     handle_lock();
     for (i = 1; !fresh && i < BRIDGE_HANDLE_MAX; i++)
@@ -4040,12 +4080,15 @@ static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
             handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+    for (n = 1, i = s_handle_next; n < BRIDGE_HANDLE_MAX; n++) {
         if (s_handle_table[i] == NULL) {
             s_handle_table[i] = h;
+            s_handle_next = i + 1 < BRIDGE_HANDLE_MAX ? i + 1 : 1;
             handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
+        i = i + 1 < BRIDGE_HANDLE_MAX ? i + 1 : 1;
+    }
     handle_unlock();
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
@@ -4102,11 +4145,42 @@ static HANDLE bridge_read_handle(uint32_t va)
  * bridge_read_handle on it -- dereferencing the token as if it were an address.
  * Halo created its save file successfully and then failed the very next call,
  * which surfaced as "couldn't open or create saved game file". */
+static volatile LONG s_stale_uses;
+
+/* The count of stale uses, once, at the end of the run (atexit, and the exit
+ * hook for the ends that skip it). */
+static void bridge_stale_report(void)
+{
+    static volatile LONG done;
+    LONG n = s_stale_uses;
+    if (n > 0 && InterlockedExchange(&done, 1) == 0)
+        fprintf(stderr, "  [HANDLE] %ld stale handle use%s in this run\n",
+                (long)n, n == 1 ? "" : "s");
+}
+static void bridge_stale_exit_hook(const char *why) { (void)why; bridge_stale_report(); }
+
 static HANDLE bridge_resolve_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+        HANDLE h = (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+        if (!h) {
+            /* A tagged token that names no object: a handle the guest closed
+             * (or never opened) and still uses. With the slots handed out in
+             * turn this is how a stale token shows (BO-221). A few lines and
+             * a count at the end; the print is under the diagnostic gate,
+             * like [READ] and [FILE]. */
+            LONG n = InterlockedIncrement(&s_stale_uses);
+            if (n == 1) {
+                atexit(bridge_stale_report);
+                recomp_exit_hook_add(bridge_stale_exit_hook);
+            }
+            if (n <= 8)
+                fprintf(stderr, "  [HANDLE] stale handle 0x%08X used from 0x%06X"
+                        " (closed or never opened) -> INVALID_HANDLE\n",
+                        token, g_xbox_kernel_caller);
+        }
+        return h;
     }
     return bridge_untagged_handle(token);
 }
@@ -4712,6 +4786,10 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    /* The position before and after, for the [READ] line (BO-221): a read
+     * that ends at the end of the file and one that started past it differ
+     * only there. Two lseeks, so only with the line on. */
+    long long pos_was = XR_DIAG_ON() ? xbox_FileHandleTell(handle) : -1;
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
 
@@ -4726,19 +4804,22 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
+        const char *path = XR_DIAG_ON() ? xbox_FileHandlePath(handle) : NULL;
+        const char *base = path ? path : "?";
+        long long pos_now = XR_DIAG_ON() ? xbox_FileHandleTell(handle) : -1;
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X  %s pos %lld->%lld\n",
                     g_xbox_kernel_caller, buffer_va, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, base, pos_was, pos_now);
         else
-            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X  %s pos %lld->%lld\n",
                     g_xbox_kernel_caller, buffer_va,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, base, pos_was, pos_now);
         fflush(stderr);
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
@@ -5521,6 +5602,8 @@ static void bridge_KeQueryBasePriorityThread(void)
 
 static void bridge_KeSetBasePriorityThread(void)
 {
+    /* The guest priority, for the wake hand-off (kernel_wake.h). */
+    xbox_WakeSetPriority(STACK_ARG(0), (int32_t)STACK_ARG(1));
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
         XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
 }
@@ -9145,6 +9228,7 @@ static void bridge_PsCreateSystemThread(void)
             if (is_first_call) {
                 xbox_log_thread_role("guest-main", start_routine);
                 xbox_GuestThreadPin("guest-main");
+                xbox_WakeGuestThread(thobj_current());
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -10820,6 +10904,9 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+    /* Where the console could switch threads (kernel_wake.h). */
+    if (xbox_WakeOrdinalBlocks(ordinal))
+        xbox_WakeBlockingCall();
     if (xbox_ProfOn())
         xbox_ProfKernelCall(ordinal);
 

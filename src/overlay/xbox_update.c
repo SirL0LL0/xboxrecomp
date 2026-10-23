@@ -1,4 +1,4 @@
-/* The part of "Check for updates" that needs no network (xbox_update.h). */
+/* The part of "Controlla gli aggiornamenti" that needs no network (xbox_update.h). */
 #include "xbox_update.h"
 
 #include <ctype.h>

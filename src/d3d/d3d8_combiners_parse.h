@@ -257,6 +257,12 @@ typedef struct NV2ACombinerState {
      * x y z w (bit 0..3) kills the pixel at >= 0 when set, < 0 when clear
      * (xemu psh.c compare_mode). */
     uint8_t clip_mode[NV2A_MAX_TEXTURES];
+
+    /* Bit n: stage n has TEXTURE_CONTROL0 ALPHA_KILL_ENABLE: a sampled
+     * texel of alpha 0 kills the pixel, colour and depth (BO-226: the King
+     * of the Road truss bridge's reflection meshes are DXT1 cut-outs drawn
+     * with it and no alpha test). */
+    uint8_t alpha_kill;
 } NV2ACombinerState;
 
 /**

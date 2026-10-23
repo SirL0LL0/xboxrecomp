@@ -52,7 +52,8 @@ uint32_t recomp_patch_u32_latch(const char *key, const char *when,
  * use). What the float patches' macros test before they evaluate. */
 int recomp_patch_on(const char *key, const char *when, int mode);
 /* A name a float patch's expression may read. Call from the host's main,
- * before the guest runs. A name nobody set reads 0. */
+ * before the guest runs. A name nobody set reads 0. Up to 64 names (a
+ * name past that is said on stderr and reads 0). */
 void recomp_patch_set_var(const char *name, double value);
 /* The same for a value that can change while the title runs (what part of
  * the frame the window shows): `fn` is called at each evaluation, from the
@@ -63,7 +64,8 @@ double recomp_patch_var(const char *name);
 /* A "mark" patch (tools/recomp/patches.py): `fn` runs, on the guest's
  * thread, each time the title reaches a site marked `name`. Call from the
  * host's main, before the guest runs. recomp_patch_mark is what the
- * generated code calls; a name nobody registered costs a short loop. */
+ * generated code calls; a name nobody registered costs a short loop. Up
+ * to 64 marks. */
 void recomp_patch_on_mark(const char *name, void (*fn)(void));
 void recomp_patch_mark(const char *name);
 /* What the generated code calls. Safe from any thread. */

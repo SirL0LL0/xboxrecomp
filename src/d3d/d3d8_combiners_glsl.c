@@ -231,6 +231,8 @@ static int generate(const NV2ACombinerState *state, char *buf, int bufsize, int 
                     EMIT("    x%d.%c = max((x%d.%c * 255.0 - 128.0) / 127.0, -1.0);\n",
                          8 + i, ch[k], 8 + i, ch[k]);
         }
+        if (state->alpha_kill & (1u << i))
+            EMIT("    if (x%d.a == 0.0) discard;\n", 8 + i);
         EMIT("    if (pc.alpha_only[%d] != 0u) x%d.rgb = vec3(1.0);\n", i, 8 + i);
     }
     EMIT("    x12.a = x8.a;\n");

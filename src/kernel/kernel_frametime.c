@@ -57,6 +57,11 @@
  *                      only, 0 elsewhere
  *   m_game ... m_runq  the same buckets for the guest-main thread alone
  *                      (the one the executor waits for)
+ *   gpu_ms, tu_ms, tu_pred  the GPU backend's (xbox_FrametimeGpu, BO-245):
+ *                      GPU time of the last frame known complete (-1: not
+ *                      known; Metal: three flips back), the texture
+ *                      upscaler's chunks completed since the last flip, and
+ *                      the chunk ms it predicted for this flip
  *   ex_cpu             CPU time of the executor's own thread in the frame:
  *                      beside ex_busy it tells a frame the executor worked
  *                      through from one it sat out, blocked or descheduled
@@ -92,6 +97,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -131,6 +137,112 @@ typedef struct {
 
 static int s_state = -1;            /* -1 unread, 0 off, 1 on */
 static FILE *s_out;
+
+/* The rows reach the file from a thread of their own (BO-245): the executor
+ * only formats a row into this ring. Its own fflush every 64 flips was a
+ * write() on the executor, and on the Deck's SD card, busy writing back the
+ * texture upscaler's cache files, that write waited 70-240 ms: the cold-run
+ * hitches at flips 5696 and 7040 (both multiples of 64) were the trace's
+ * own. A full ring drops the row (counted, said once) rather than wait.
+ * Windows keeps the direct write. */
+#if defined(__APPLE__) || defined(__linux__)
+#define FT_RING_BYTES (1u << 20)    /* some 3800 rows, a minute at 60 fps */
+static char           *s_ring;
+static size_t          s_ring_head, s_ring_len;   /* the writer's start, bytes waiting */
+static int             s_ring_busy;               /* the writer is in fwrite */
+static unsigned long   s_ring_lost;
+static pthread_mutex_t s_ring_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_ring_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  s_ring_idle = PTHREAD_COND_INITIALIZER;
+
+static void *ring_writer(void *p)
+{
+    (void)p;
+    pthread_mutex_lock(&s_ring_mx);
+    for (;;) {
+        size_t n;
+        while (!s_ring_len)
+            pthread_cond_wait(&s_ring_cv, &s_ring_mx);
+        n = s_ring_len < FT_RING_BYTES - s_ring_head ? s_ring_len : FT_RING_BYTES - s_ring_head;
+        s_ring_busy = 1;
+        pthread_mutex_unlock(&s_ring_mx);
+        /* The bytes [head, head + n) are the writer's until it moves head. */
+        fwrite(s_ring + s_ring_head, 1, n, s_out);
+        pthread_mutex_lock(&s_ring_mx);
+        s_ring_head = (s_ring_head + n) % FT_RING_BYTES;
+        s_ring_len -= n;
+        if (!s_ring_len) {
+            pthread_mutex_unlock(&s_ring_mx);
+            fflush(s_out);
+            pthread_mutex_lock(&s_ring_mx);
+        }
+        s_ring_busy = 0;
+        pthread_cond_broadcast(&s_ring_idle);
+    }
+    return NULL;
+}
+
+/* At exit: what is still in the ring, written (at most 2 s). */
+static void ring_drain(void)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 2;
+    pthread_mutex_lock(&s_ring_mx);
+    pthread_cond_signal(&s_ring_cv);
+    while (s_ring_len || s_ring_busy)
+        if (pthread_cond_timedwait(&s_ring_idle, &s_ring_mx, &until) != 0)
+            break;
+    pthread_mutex_unlock(&s_ring_mx);
+}
+
+static void ring_start(void)
+{
+    pthread_t th;
+    s_ring = (char *)malloc(FT_RING_BYTES);
+    if (!s_ring)
+        return;
+    if (pthread_create(&th, NULL, ring_writer, NULL) != 0) {
+        free(s_ring);
+        s_ring = NULL;
+        return;
+    }
+    pthread_detach(th);
+    atexit(ring_drain);
+}
+
+/* 1: the row is the writer's now; 0: no ring, write it here. */
+static int ring_put(const char *row, size_t n, int wake)
+{
+    size_t at, first;
+    if (!s_ring)
+        return 0;
+    pthread_mutex_lock(&s_ring_mx);
+    if (s_ring_len + n > FT_RING_BYTES) {
+        if (!s_ring_lost++)
+            fprintf(stderr, "  [FRAMETIME] the file writer is behind: rows dropped\n");
+        pthread_mutex_unlock(&s_ring_mx);
+        return 1;
+    }
+    at = (s_ring_head + s_ring_len) % FT_RING_BYTES;
+    first = n < FT_RING_BYTES - at ? n : FT_RING_BYTES - at;
+    memcpy(s_ring + at, row, first);
+    memcpy(s_ring, row + first, n - first);
+    s_ring_len += n;
+    if (wake)
+        pthread_cond_signal(&s_ring_cv);
+    pthread_mutex_unlock(&s_ring_mx);
+    return 1;
+}
+#else
+static void ring_start(void) { }
+static int ring_put(const char *row, size_t n, int wake)
+{
+    (void)row; (void)n; (void)wake;
+    return 0;
+}
+#endif
+
 static FtFunc *s_funcs;
 static size_t s_nfuncs;
 static uintptr_t s_code_lo, s_code_hi;
@@ -510,7 +622,10 @@ static int frametime_on(void)
             s_nosample = 1;     /* the executor's columns only */
         fprintf(s_out, "flip,t_ms,frame_ms,iv,late,ex_hold,ex_busy,ex_draw,ex_present,"
                 "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc,"
-                "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq,ex_cpu\n");
+                "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq,ex_cpu,"
+                "gpu_ms,tu_ms,tu_pred\n");
+        fflush(s_out);
+        ring_start();
         build_table();
         {
             const char *hp = recomp_env(RENV_FRAMETIME_HOST);
@@ -686,6 +801,36 @@ static uint64_t self_cpu_ns(uint64_t now)
 }
 
 /* At FLIP_STALL, from the executor: its running totals in ns. */
+/* The backend's columns (xbox_FrametimeGpu): the latest values, written
+ * with the next line. Doubles as bits, so any thread may set them. */
+static volatile uint64_t s_gpu_bits, s_tu_bits, s_tup_bits;
+
+static uint64_t d2b(double d)
+{
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return b;
+}
+
+static double b2d(uint64_t b)
+{
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+
+void xbox_FrametimeGpu(double gpu_ms, double tu_ms, double tu_pred)
+{
+    s_gpu_bits = d2b(gpu_ms);
+    s_tu_bits = d2b(tu_ms);
+    s_tup_bits = d2b(tu_pred);
+}
+
+int xbox_FrametimeOn(void)
+{
+    return s_state > 0 || (s_state < 0 && frametime_on());
+}
+
 void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
                         uint64_t scan, uint64_t draw, uint64_t present)
 {
@@ -694,7 +839,8 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     LONG c[B_COUNT], m[B_COUNT];
     int64_t rq, mrq;
     const double per = 1.0 / 1000.0;   /* the buckets hold microseconds */
-    int b;
+    char row[768];
+    int b, n;
 
     if (s_state == 0 || (s_state < 0 && !frametime_on()))
         return;
@@ -722,9 +868,9 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     frame = now - last;
     d_hold = hold - p_hold;
     d_scan = scan - p_scan;
-    fprintf(s_out, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
+    n = snprintf(row, sizeof row, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f,"
-            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f\n",
+            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
             flip, (now - t0) / 1e6, frame / 1e6, iv, late,
             d_hold / 1e6, (double)(int64_t)(d_scan - d_hold) / 1e6,
             (draw - p_draw) / 1e6, (present - p_pres) / 1e6,
@@ -735,9 +881,13 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
             c[B_IO] * per, rq / 1e6,
             m[B_GAME] * per, m[B_D3D] * per, m[B_XDK] * per, m[B_SPIN] * per,
             m[B_HOST] * per, m[B_WAIT] * per, m[B_IO] * per, mrq / 1e6,
-            self > p_self && p_self ? (self - p_self) / 1e6 : 0.0);
-    if ((flip & 63) == 0)
-        fflush(s_out);
+            self > p_self && p_self ? (self - p_self) / 1e6 : 0.0,
+            b2d(s_gpu_bits), b2d(s_tu_bits), b2d(s_tup_bits));
+    if (n > 0 && (size_t)n < sizeof row && !ring_put(row, (size_t)n, (flip & 63) == 0)) {
+        fputs(row, s_out);
+        if ((flip & 63) == 0)
+            fflush(s_out);
+    }
     last = now;
     p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
     p_self = self;

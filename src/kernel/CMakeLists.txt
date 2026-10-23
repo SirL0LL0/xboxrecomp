@@ -14,6 +14,7 @@ set(KERNEL_SOURCES
     kernel_missing.c
     kernel_thread.c
     kernel_sync.c
+    kernel_wake.c
     kernel_hal.c
     kernel_prof.c
     kernel_pacing.c
@@ -42,6 +43,7 @@ set(KERNEL_SOURCES
     nv2a_texrep.c
     nv2a_texscale.c
     nv2a_texscale_store.c
+    nv2a_texup.c
     nv2a_vsh_cpu.c
     nv2a_combiner.c
 )
@@ -105,3 +107,8 @@ if(NOT MSVC)
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+# graphics.texture_upscale (BO-245): a build from source finds the shader
+# files in the tree when no packaged copy is there.
+set_source_files_properties(nv2a_texup.c PROPERTIES COMPILE_DEFINITIONS
+    "XBOXRECOMP_TEXUP_SRC_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/upscale_shaders\"")

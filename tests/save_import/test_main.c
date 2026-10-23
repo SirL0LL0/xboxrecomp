@@ -89,6 +89,10 @@ static int sig_ok(const unsigned char *d, size_t n)
 
 static void md(const char *path) { mkdir(path, 0755); }
 
+static int stop_now(void *ctx) { (void)ctx; return 1; }
+static int all_shallow(const char *dir, void *ctx) { (void)dir; (void)ctx; return 1; }
+static int shallow_udata(const char *dir, void *ctx) { (void)ctx; return strstr(dir, "4d53002a") != NULL; }
+
 int main(int argc, char **argv)
 {
     unsigned char prof[4300], *got;
@@ -202,6 +206,28 @@ int main(int argc, char **argv)
         put(P("notzip.zip"), "not a zip at all, really", 24);
         ok = xbox_SaveImportPrepare(P("notzip.zip"), ID, NULL, P("root"), out, sizeof out, info, sizeof info, err, sizeof err);
         CHECK("not a zip refused", !ok && strstr(err, "not a zip"));
+    }
+    {
+        /* BO-289: the browser's bounded look. A stop, a spent budget and a
+         * folder left unwalked (a network share) are "not known" (-1). */
+        xbox_save_check_limits lim;
+        memset(&lim, 0, sizeof lim);
+        CHECK("bounded: found", xbox_SaveImportCheckBounded(P("e"), ID, &lim) == 1);
+        CHECK("bounded: none", xbox_SaveImportCheckBounded(P("e/UDATA/4d53002a"), ID, &lim) == 0);
+        lim.stop = stop_now;
+        CHECK("bounded: stopped", xbox_SaveImportCheckBounded(P("e"), ID, &lim) == -1);
+        CHECK("bounded: plain check says no", xbox_SaveImportCheck(P("e/UDATA/4d53002a"), ID) == 0);
+        lim.stop = NULL;
+        lim.max_entries = 3;
+        CHECK("bounded: budget spent", xbox_SaveImportCheckBounded(P("e"), ID, &lim) == -1);
+        lim.max_entries = 0;
+        lim.shallow = all_shallow;
+        CHECK("bounded: a share is not walked", xbox_SaveImportCheckBounded(P("e"), ID, &lim) == -1);
+        CHECK("bounded: the save folder on a share is still seen",
+              xbox_SaveImportCheckBounded(P("e/UDATA/" ID "/" SAVE), ID, &lim) == 1);
+        lim.shallow = shallow_udata;
+        CHECK("bounded: a share below, the save beside it",
+              xbox_SaveImportCheckBounded(P("e/UDATA"), ID, &lim) == 1);
     }
     xbox_SaveImportCleanup(P("root"));
     CHECK("cleanup", !recomp_fs_is_dir(P("root/import-work")));

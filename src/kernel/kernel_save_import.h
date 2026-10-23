@@ -24,8 +24,25 @@ extern "C" {
 #endif
 
 /* Whether `path` (a folder, or a .zip file) holds an Xbox save of this
- * title: a quick look for a file list, no copy made. */
+ * title: a quick look for a file list, no copy made. Bounded as
+ * xbox_SaveImportCheckBounded with no limits given; "not known" is 0. */
 int xbox_SaveImportCheck(const char *path, const char *title_id);
+
+/* The same look with a bound (BO-289: a folder browser asks it of every
+ * row, and a network share must not hold it). It looks at most max_entries
+ * entries for at most max_ms (0: 50000 and 3000 ms), asks `stop` at each
+ * one, and below a folder `shallow` says is on a slow volume it does not
+ * look (the folder's own files it does). 1: a save of this title; 0: none;
+ * -1: not known (the bound ran out, `stop` said so, or a folder was left
+ * unwalked). */
+typedef struct xbox_save_check_limits {
+    int   max_entries;
+    int   max_ms;
+    int (*stop)(void *ctx);
+    int (*shallow)(const char *dir, void *ctx);
+    void *ctx;
+} xbox_save_check_limits;
+int xbox_SaveImportCheckBounded(const char *path, const char *title_id, const xbox_save_check_limits *lim);
 
 /*
  * Make the export-shaped folder <work_root>/import-work/out from `input`.

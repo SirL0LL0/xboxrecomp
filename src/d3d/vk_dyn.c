@@ -1,9 +1,14 @@
 /*
- * android_vk.c - the Vulkan loader the runtime calls on Android: the
- * system's, or a replacement driver opened through libadrenotools. See
- * android_vk.h.
+ * vk_dyn.c - the Vulkan loader the runtime calls on Android, Windows and
+ * Linux, opened at run time. See vk_dyn.h.
  *
- * The replacement (android_host.h has the variables; the activity sets them):
+ * Windows: vulkan-1.dll. Linux: libvulkan.so.1, then libvulkan.so. When
+ * neither opens, every call fails the way a loader with no driver does
+ * (VK_ERROR_INITIALIZATION_FAILED, no instance) and xr_vk_loader_error()
+ * says why, for the message the player sees (nv2a_vk_core.c, the presenter).
+ *
+ * Android: the system's loader, or a replacement driver opened through
+ * libadrenotools (android_host.h has the variables; the activity sets them):
  *   RECOMP_ANDROID_DRIVER_DIR   a directory in the app's own internal storage
  *                               or its native library directory (the dynamic
  *                               linker refuses anything on shared storage)
@@ -16,28 +21,44 @@
  * file; no root, nothing outside the app. Without the variables, or built
  * without libadrenotools, the loader is the system's.
  */
-#if defined(__ANDROID__)
+#include "vk_dyn.h"
 
-#include "android_vk.h"
+#if defined(XR_VK_DYNAMIC)
 
-#include <SDL.h>
-#include <SDL_system.h>
-#include <dlfcn.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <pthread.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#if defined(__ANDROID__)
+#include <SDL.h>
+#include <SDL_system.h>
 #if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
 #include <adrenotools/driver.h>
-#include "../platform/xr_log.h"   /* the print gate (also force-included) */
+#endif
+#endif
+
+/* Seen by the loader's users and, on Android, by SDL's dlsym. */
+#if defined(_WIN32)
+#define XR_VK_EXPORT
+#else
+#define XR_VK_EXPORT __attribute__((visibility("default")))
 #endif
 
 static pthread_once_t s_once = PTHREAD_ONCE_INIT;
 static PFN_vkGetInstanceProcAddr s_gipa;
+#if defined(__ANDROID__)
 static char s_driver[256] = "system";
 static int s_failed;
+#endif
+static char s_loader_err[256];
 
+#if defined(__ANDROID__)
 /* TU_DEBUG defaults, asked before the driver is opened; a TU_DEBUG the player
  * set (env.txt, even empty) is left as it is.
  *
@@ -93,6 +114,9 @@ static int same_dir(const char *a, const char *b)
     return na == nb && !strncmp(a, b, na);
 }
 
+#endif /* __ANDROID__ */
+
+#if defined(__ANDROID__)
 static void open_loader(void)
 {
     void *h = NULL;
@@ -154,10 +178,96 @@ static void open_loader(void)
         h = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
     if (h)
         s_gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
-    if (!s_gipa)
-        XR_ERROR( "[vulkan] no Vulkan loader: %s\n", dlerror());
+    if (!s_gipa) {
+        const char *e = dlerror();
+        snprintf(s_loader_err, sizeof s_loader_err, "libvulkan.so could not be opened%s%s",
+                 e ? ": " : "", e ? e : "");
+        XR_ERROR( "[vulkan] no Vulkan loader: %s\n", e ? e : "(no reason given)");
+    }
 }
 
+#elif defined(_WIN32)
+
+static void open_loader(void)
+{
+    const char *ovr = getenv("RECOMP_VULKAN_LOADER");
+    const char *name = ovr && *ovr ? ovr : "vulkan-1.dll";
+    HMODULE h = LoadLibraryA(name);
+
+    if (!h) {
+        snprintf(s_loader_err, sizeof s_loader_err,
+                 "%s could not be loaded (Windows error %lu): no Vulkan graphics driver"
+                 " is installed", name, (unsigned long)GetLastError());
+    } else {
+        s_gipa = (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(h, "vkGetInstanceProcAddr");
+        if (!s_gipa)
+            snprintf(s_loader_err, sizeof s_loader_err,
+                     "vulkan-1.dll has no vkGetInstanceProcAddr: it is not a Vulkan loader");
+    }
+    if (!s_gipa)
+        XR_ERROR( "[vulkan] no Vulkan loader: %s\n", s_loader_err);
+}
+
+#else /* Linux */
+
+static void open_loader(void)
+{
+    /* The versioned name first: a bare libvulkan.so is the development
+     * package's symlink, which most players do not have. RTLD_GLOBAL is not
+     * asked for; SDL opens the same file by its own call and gets this copy.
+     * RECOMP_VULKAN_LOADER=<file> opens that file instead (tests, a driver
+     * under development). */
+#if defined(__APPLE__)
+    static const char *const names[] = { "libvulkan.1.dylib", "libvulkan.dylib",
+                                         "/opt/homebrew/lib/libvulkan.1.dylib" };
+#else
+    static const char *const names[] = { "libvulkan.so.1", "libvulkan.so" };
+#endif
+    const char *ovr = getenv("RECOMP_VULKAN_LOADER");
+    void *h = NULL;
+    const char *e = NULL;
+    size_t i;
+
+    if (ovr && *ovr) {
+        h = dlopen(ovr, RTLD_NOW | RTLD_LOCAL);
+        if (!h)
+            e = dlerror();
+    } else {
+        for (i = 0; !h && i < sizeof names / sizeof names[0]; i++) {
+            h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+            if (!h && !e)
+                e = dlerror();
+        }
+    }
+    if (h)
+        s_gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+    if (h && !s_gipa)
+        e = "it has no vkGetInstanceProcAddr";
+    if (!s_gipa) {
+        snprintf(s_loader_err, sizeof s_loader_err,
+                 "%s could not be opened: no Vulkan loader is installed%s%s",
+                 ovr && *ovr ? ovr : names[0], e ? " (" : "", e ? e : "");
+        if (e && strlen(s_loader_err) + 2 < sizeof s_loader_err)
+            strcat(s_loader_err, ")");
+        XR_ERROR( "[vulkan] no Vulkan loader: %s\n", s_loader_err);
+    }
+}
+
+#endif
+
+int xr_vk_loader_ok(void)
+{
+    pthread_once(&s_once, open_loader);
+    return s_gipa != NULL;
+}
+
+const char *xr_vk_loader_error(void)
+{
+    pthread_once(&s_once, open_loader);
+    return s_gipa ? "" : s_loader_err;
+}
+
+#if defined(__ANDROID__)
 const char *xr_android_vk_driver(void)
 {
     pthread_once(&s_once, open_loader);
@@ -169,8 +279,9 @@ int xr_android_vk_driver_failed(void)
     pthread_once(&s_once, open_loader);
     return s_failed;
 }
+#endif
 
-__attribute__((visibility("default")))
+XR_VK_EXPORT
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
                                                                const char *name)
 {
@@ -181,7 +292,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instan
 /* The four commands that exist before an instance does start as these: they
  * open the loader and go on to its own. vkCreateInstance then fills in every
  * other pointer from the new instance (one instance and one device in this
- * runtime, so the instance-level entry points serve the device too). */
+ * runtime, so the instance-level entry points serve the device too). A
+ * second instance (the bug report's probe) fills them with the same loader
+ * functions again. */
 static VKAPI_ATTR VkResult VKAPI_CALL boot_vkEnumerateInstanceVersion(uint32_t *version)
 {
     PFN_vkEnumerateInstanceVersion f = (PFN_vkEnumerateInstanceVersion)
@@ -217,6 +330,60 @@ static VKAPI_ATTR VkResult VKAPI_CALL boot_vkEnumerateInstanceLayerProperties(
     return f(count, props);
 }
 
+/* vkCreateDevice as the loader has it, and the one the runtime calls: after
+ * it, any command the instance did not hand out (an old loader does not know
+ * the Vulkan 1.3 names, but the driver's device does) is asked of the device. */
+static PFN_vkCreateDevice s_real_create_device;
+
+static VKAPI_ATTR VkResult VKAPI_CALL boot_vkCreateDevice(
+    VkPhysicalDevice phys, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *alloc,
+    VkDevice *device)
+{
+    VkResult r = s_real_create_device ? s_real_create_device(phys, ci, alloc, device)
+                                      : VK_ERROR_INITIALIZATION_FAILED;
+    if (r != VK_SUCCESS || !xr_vkGetDeviceProcAddr)
+        return r;
+#define XR_VK_FILL(name) \
+    if (!xr_##name) \
+        xr_##name = (PFN_##name)xr_vkGetDeviceProcAddr(*device, #name);
+    XR_VK_FUNCS(XR_VK_FILL)
+#undef XR_VK_FILL
+    if (!xr_vkCmdBeginRenderingKHR) xr_vkCmdBeginRenderingKHR = xr_vkCmdBeginRendering;
+    if (!xr_vkCmdEndRenderingKHR)   xr_vkCmdEndRenderingKHR = xr_vkCmdEndRendering;
+    if (!xr_vkCmdBeginRendering)    xr_vkCmdBeginRendering = xr_vkCmdBeginRenderingKHR;
+    if (!xr_vkCmdEndRendering)      xr_vkCmdEndRendering = xr_vkCmdEndRenderingKHR;
+    return r;
+}
+
+const char *xr_vk_missing_core13(void)
+{
+    static const struct { const char *name; const void *const *ptr; } need[] = {
+#define XR_VK_NEED(n) { #n, (const void *const *)&xr_##n },
+        XR_VK_NEED(vkGetPhysicalDeviceFeatures2)
+        XR_VK_NEED(vkGetPhysicalDeviceProperties2)
+        XR_VK_NEED(vkCmdBeginRendering)
+        XR_VK_NEED(vkCmdEndRendering)
+        XR_VK_NEED(vkCmdPipelineBarrier2)
+        XR_VK_NEED(vkGetSemaphoreCounterValue)
+        XR_VK_NEED(vkWaitSemaphores)
+        XR_VK_NEED(vkCmdSetCullMode)
+        XR_VK_NEED(vkCmdSetFrontFace)
+        XR_VK_NEED(vkCmdSetDepthTestEnable)
+        XR_VK_NEED(vkCmdSetDepthWriteEnable)
+        XR_VK_NEED(vkCmdSetDepthCompareOp)
+        XR_VK_NEED(vkCmdSetStencilTestEnable)
+        XR_VK_NEED(vkCmdSetStencilOp)
+        XR_VK_NEED(vkCmdSetDepthBiasEnable)
+#undef XR_VK_NEED
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof need / sizeof need[0]; i++)
+        if (!*need[i].ptr)
+            return need[i].name;
+    return NULL;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL boot_vkCreateInstance(
     const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *instance)
 {
@@ -229,13 +396,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL boot_vkCreateInstance(
     r = f(ci, alloc, instance);
     if (r != VK_SUCCESS)
         return r;
-#define XR_ANDROID_VK_LOAD(name) \
+#define XR_VK_LOAD(name) \
     if (strcmp(#name, "vkCreateInstance") && strcmp(#name, "vkEnumerateInstanceVersion") \
             && strcmp(#name, "vkEnumerateInstanceExtensionProperties") \
             && strcmp(#name, "vkEnumerateInstanceLayerProperties")) \
         xr_##name = (PFN_##name)s_gipa(*instance, #name);
-    XR_ANDROID_VK_FUNCS(XR_ANDROID_VK_LOAD)
-#undef XR_ANDROID_VK_LOAD
+    XR_VK_FUNCS(XR_VK_LOAD)
+#undef XR_VK_LOAD
+    s_real_create_device = (PFN_vkCreateDevice)s_gipa(*instance, "vkCreateDevice");
+    xr_vkCreateDevice = boot_vkCreateDevice;
     /* The KHR names of what Vulkan 1.3 took in: the same commands. */
     if (!xr_vkCmdBeginRenderingKHR) xr_vkCmdBeginRenderingKHR = xr_vkCmdBeginRendering;
     if (!xr_vkCmdEndRenderingKHR)   xr_vkCmdEndRenderingKHR = xr_vkCmdEndRendering;
@@ -245,9 +414,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL boot_vkCreateInstance(
 }
 
 /* The pointers. Null until an instance exists, but for the four above. */
-#define XR_ANDROID_VK_DEFINE(name) PFN_##name xr_##name;
-XR_ANDROID_VK_FUNCS(XR_ANDROID_VK_DEFINE)
-#undef XR_ANDROID_VK_DEFINE
+#define XR_VK_DEFINE(name) PFN_##name xr_##name;
+XR_VK_FUNCS(XR_VK_DEFINE)
+#undef XR_VK_DEFINE
 
 __attribute__((constructor)) static void boot_pointers(void)
 {
@@ -258,5 +427,5 @@ __attribute__((constructor)) static void boot_pointers(void)
 }
 
 #else
-typedef int xr_android_vk_unused;
+typedef int xr_vk_dyn_unused;
 #endif

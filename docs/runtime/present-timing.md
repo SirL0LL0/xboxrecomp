@@ -5,7 +5,10 @@ Code: `src/kernel/present_cadence.{h,c}` (the arithmetic, tested by
 `tests/present_cadence`), `src/video/fb_present_metal.m` (the Metal
 presenter).
 
-The default is `legacy`: what the presenters did before. Measured numbers for
+The default is `auto` on macOS (BO-239: with `legacy`'s two drawables a
+fullscreen 60 Hz external display showed every other frame for one user) and
+`legacy`, what the presenters did before, elsewhere; only the Metal presenter
+reads the setting. Measured numbers for
 a title are in its own docs (Burnout 3: `docs/present-timing.md`); nothing on
 this page has been verified on a variable-refresh display, a ProMotion panel,
 or a host other than macOS.
@@ -39,7 +42,7 @@ adaptive-sync display with the option on, a ProMotion panel).
 
 | Display | Strategy | The emulated vblank | A frame is presented |
 |---|---|---|---|
-| fixed, a multiple of 60 (60, 120, 240 Hz; 59.94 and 119.88 count) | `lock` | moved onto the display's grid, 5 ms before a refresh (`RECOMP_PRESENT_PHASE`) | for one named refresh: the one after the refresh its vblank sits before (`presentDrawable:atTime:`, half a refresh ahead of it) |
+| fixed, a multiple of 60 (60, 120, 240 Hz; 59.94 and 119.88 count) | `lock` | moved onto the display's grid, 5 ms before a refresh (`RECOMP_PRESENT_PHASE`) | for one named refresh: the one after the refresh its vblank sits before (`presentDrawable:atTime:`, handed over 3 ms after the refresh before it) |
 | variable (VRR, ProMotion) | `timed` | its own 60.000 Hz timer | at its vblank + 12 ms (`RECOMP_PRESENT_LEAD`) |
 | fixed, not a multiple of 60 (75, 100, 144 Hz) | `timed` | its own timer | at the first refresh at or after vblank + 12 ms; cannot be even, and the overlay says so |
 | any, `legacy` | `legacy` | its own timer (or `RECOMP_VBLANK_SYNC=display`) | when ready, two drawables |
@@ -70,6 +73,24 @@ refresh: a frame committed 10 ms before a refresh is not shown at it
 glass, but only while that keeps a frame inside 30 ms: at 60 Hz it never does,
 because a second refresh would be two frames of latency and the skip rule
 would then drop every third frame.
+
+**When a frame is handed over (BO-239).** `presentDrawable:atTime:` shows
+a frame at the first refresh at or after the time it is given. Until 0.2.1
+that time was half a refresh before the frame's refresh (8.3 ms at 60 Hz),
+the point farthest from both refreshes. On a fullscreen external 60 Hz
+display (MacBook Pro M5 Max, macOS 27, LG HDR 4K) a quarter of the frames
+then missed their refresh with the commit timing identical for the frames on
+time and the late ones, which points at a compositor (direct scanout) flip
+deadline near that point. The time is now 3 ms after the refresh before the
+frame's own (`RECOMP_PRESENT_HANDOVER`, ms, 0.5 to 16, at most half a refresh
+is used): 13.7 ms ahead at 60 Hz, 5.3 ms at 120 Hz, half a refresh (2.1 ms)
+at 240 Hz. The pacer's grid (the last on-glass time) was off by at most
+1.2 ms in the traces, so the time still names the frame's own refresh
+(`tests/present_cadence`, "handover"). Nothing moves on the glass: the target
+refresh is the same, only the hand-over is earlier. Should a system take the
+time as "the nearest refresh" and show frames a refresh early, three such
+frames put the hand-over back at half a refresh for the session
+(`[PRESENT] timing: frames reached the glass a refresh early`).
 
 **Rejected:** `CAMetalDisplayLink` pinned to 60 (macOS 14+). Measured with a
 stand-alone probe on a 120 Hz display: 25 ms from callback to glass at
