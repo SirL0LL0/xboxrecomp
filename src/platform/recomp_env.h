@@ -171,6 +171,7 @@ extern "C" {
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
     X(MENU_ENTRY,        CONFIG, "RECOMP_MENU_ENTRY",        NULL, "interface.menu_entry: 1 (default) the game's own Settings menu lists an entry that opens this overlay, for a title that offers one (Burnout 3: TAKEDAWN SETTINGS); 0 not") \
+    X(UI_LANGUAGE,       CONFIG, "RECOMP_UI_LANGUAGE",       NULL, "interface.language, the language of the overlay's own words: english (default), french, german, italian") \
     X(LOG_DIAG,          CONFIG, "RECOMP_LOG_DIAG",          NULL, "advanced.diagnostic_log: 1 prints the diagnostic lines (the default of a developer build), 0 only errors and the start-up facts (the default of a release build); see xr_log.h for what else switches it on") \
     X(AUDIO_MIXER,       CONFIG, "RECOMP_AUDIO_MIXER",       NULL, "the host mixer (buses over the title's voices): off (default), on") \
     X(AUDIO_MENU_SOUNDS, CONFIG, "RECOMP_AUDIO_MENU_SOUNDS", NULL, "audio.menu_sounds: 1 (default) the overlay plays the title's own menu sounds, for a title whose port names them (xbox_OverlaySetMenuSounds); 0 silent") \

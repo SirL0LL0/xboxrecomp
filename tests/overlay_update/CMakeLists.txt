@@ -10,7 +10,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(XR_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src)
-add_executable(overlay_update_test test_main.c ${XR_SRC}/overlay/xbox_update.c)
+add_executable(overlay_update_test test_main.c ${XR_SRC}/overlay/xbox_update.c ${XR_SRC}/overlay/xbox_i18n.c)
 target_include_directories(overlay_update_test PRIVATE ${XR_SRC}/overlay)
 if(NOT MSVC)
     target_compile_options(overlay_update_test PRIVATE -Wall -Wextra)

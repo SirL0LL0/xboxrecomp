@@ -11,6 +11,7 @@
 #include "touch_pad.h"
 #include "kernel_pacing.h"
 #include "kernel.h"             /* xbox_SetLanguage: the EEPROM's language */
+#include "xbox_i18n.h"          /* the overlay's words in the interface's language */
 #include "nv2a_backend_common.h"
 #include "nv2a_texscale.h"
 #include "nv2a_texup.h"
@@ -68,6 +69,8 @@ static const char *const k_language[] = {
     "korean", "chinese_traditional", "chinese_simplified", "portuguese",
     "dutch", "swedish", NULL
 };
+/* The interface's languages: the ones the overlay has words in (xbox_i18n.h). */
+static const char *const k_ui_language[] = { "english", "french", "german", "italian", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
 static const char *const k_glyphs[]   = { "auto", "xbox", "xbox_modern", "playstation", "playstation5", "nintendo", "steam", "positional", "keyboard", NULL };
@@ -136,9 +139,14 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_DISPLAY_HUD_FIX]    = SETTING("display.hud_fix", XS_BOOL, 0, RENV_GFX_HUD_FIX, NULL, NULL, 0, 0, 0),
     [XS_DISPLAY_ULTRAWIDE]  = SETTING("display.ultrawide", XS_CHOICE, 0, RENV_DISPLAY_ULTRAWIDE, k_ultrawide, NULL, 0, 0, 0),
     /* The dashboard's language: the title reads it from the EEPROM at
-     * start-up and picks the text, the speech and the films of it. A
-     * language the disc does not carry falls back to the title's own. */
-    [XS_DISPLAY_LANGUAGE]   = SETTING("display.language", XS_CHOICE, 0, RENV_XBOX_LANGUAGE, k_language, NULL, 0, 0, 0),
+     * start-up and picks the text, the speech and the films of it, so a
+     * change shows after a restart. A language the disc does not carry
+     * falls back to the title's own; the overlay offers the disc's
+     * (xbox_SettingsSetLanguages). */
+    [XS_DISPLAY_LANGUAGE]   = SETTING("display.language", XS_CHOICE, XS_RESTART, RENV_XBOX_LANGUAGE, k_language, NULL, 0, 0, 0),
+    /* The overlay's own words (xbox_i18n.h): English, French, German or
+     * Italian. English as shipped. Live. */
+    [XS_INTERFACE_LANGUAGE] = SETTING("interface.language", XS_CHOICE, 0, RENV_UI_LANGUAGE, k_ui_language, NULL, 0, 0, 0),
     /* The title's own effects, full strength as shipped (BO-101, BO-212):
      * 0..1 in tenths, 1 the original, 0 not drawn. They were switches: a
      * file's or variable's true / false still reads as 1 / 0. */
@@ -570,6 +578,9 @@ static void apply(xs_id id)
         /* The title reads the language from the EEPROM at start-up, so a
          * change here shows after a restart. */
         xbox_SetLanguage(k_language[(int)v]);
+        break;
+    case XS_INTERFACE_LANGUAGE:
+        xbox_I18nSetLanguage(k_ui_language[(int)v]);
         break;
 #if defined(__ANDROID__)
     case XS_INPUT_TOUCH:
@@ -1014,9 +1025,33 @@ void xbox_SettingsFinish(void)
     xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
     xbox_InputSetControlScheme((int)s_set[XS_INPUT_CONTROL_SCHEME].value);
     xbox_InputSetGlyphMode((int)s_set[XS_INPUT_GLYPHS].value);
+    xbox_I18nSetLanguage(k_ui_language[(int)s_set[XS_INTERFACE_LANGUAGE].value]);
 #if defined(__ANDROID__)
     apply_touch();
 #endif
+}
+
+/* ── the disc's languages ──────────────────────────────────────────── */
+
+static unsigned s_languages;          /* bit i: k_language[i] is on the disc; 0: all */
+
+void xbox_SettingsSetLanguages(unsigned mask)
+{
+    s_languages = mask & ((1u << (sizeof k_language / sizeof k_language[0] - 1)) - 1u);
+}
+
+unsigned xbox_SettingsLanguages(void)
+{
+    return s_languages;
+}
+
+int xbox_SettingsLanguageIndex(const char *name)
+{
+    int i;
+    for (i = 0; name && k_language[i]; i++)
+        if (!sx_strcasecmp(name, k_language[i]))
+            return i;
+    return -1;
 }
 
 /* ── access ────────────────────────────────────────────────────────── */

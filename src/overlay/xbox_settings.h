@@ -109,7 +109,8 @@ typedef enum {
     XS_GRAPHICS_TEXUP_ROADS, /* and the road surfaces too (off: the title's road skip list) */
     XS_DISPLAY_CRASHNAV_MAP, /* BO-222: with the widescreen HUD, a title's map screen full width or 4:3 */
     XS_GRAPHICS_TEXUP_PRELOAD, /* BO-272: the upscaler works through the loading screen and countdown, on as shipped */
-    XS_DISPLAY_LANGUAGE,       /* the dashboard's language the title reads at start-up */
+    XS_DISPLAY_LANGUAGE,       /* the game's language: the dashboard's, the title reads it at start-up */
+    XS_INTERFACE_LANGUAGE,     /* the overlay's own words (xbox_i18n.h): English, French, German, Italian */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
@@ -193,6 +194,18 @@ void    xbox_SettingsSetHost(xs_host h);       /* tests */
 int     xbox_PowerStockHidden(xs_host h);
 /* The power mode (0 stock, 1 performance, 2 battery, 3 auto) a stored value means on h. */
 double  xbox_PowerModeAtLoad(xs_host h, double stored);
+
+/* The languages the title's disc carries, for the game's language
+ * (XS_DISPLAY_LANGUAGE): bit i for its choice i, in xbox_settings.c's order
+ * (english, french, german, italian, spanish, japanese, korean,
+ * chinese_traditional, chinese_simplified, portuguese, dutch, swedish). The
+ * overlay offers only those; 0 (the default) offers them all. Call it before
+ * xbox_SettingsFinish. The interface's language is not limited by it. */
+void     xbox_SettingsSetLanguages(unsigned mask);
+unsigned xbox_SettingsLanguages(void);
+/* A language's choice index (english 0 ... swedish 11), -1 when it is not
+ * one of them. */
+int      xbox_SettingsLanguageIndex(const char *name);
 
 /* The window is in the background: audio.mute_background silences it. */
 void xbox_SettingsSetBackground(int bg);

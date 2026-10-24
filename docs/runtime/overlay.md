@@ -343,6 +343,8 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.filter` | `RECOMP_PRESENT_FILTER` | yes |
 | `display.overscan` (`off`, `crop`, `fill`) | `RECOMP_PRESENT_OVERSCAN` | yes |
 | `display.fit` (`letterbox`, `fill16x10`) | `RECOMP_PRESENT_FIT` | yes |
+| `display.language` (`english`, `french`, `german`, `italian`, ... the dashboard's) | `RECOMP_XBOX_LANGUAGE` | restart: the title reads the EEPROM at boot. The row offers the languages the title's disc carries (`xbox_SettingsSetLanguages`) |
+| `interface.language` (`english`, `french`, `german`, `italian`) | `RECOMP_UI_LANGUAGE` | yes: the overlay's own words ([Text and fonts](#languages)) |
 | `graphics.render_scale` | `RECOMP_RENDER_SCALE` | restart |
 | `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
 | `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes |
@@ -584,6 +586,32 @@ it is drawn at, so there is no baked atlas and no list of ranges to keep:
 Roboto is made by `third_party/roboto_condensed/make_subset.py` from
 google/fonts' variable `RobotoCondensed[wght].ttf` (checked by SHA-256),
 pinned to wght 500.
+
+### Languages
+
+The overlay is written in English, and the words a player reads go through
+`TR()` (`xbox_i18n.h`): the page names, the rows' labels, help and choices,
+the action and info rows, the footer's keys, the Mixer page, the folder
+browser's places, the update check's answers. `interface.language` picks the
+words: French, German and Italian have a table each (`src/overlay/i18n/`,
+`fr.inc`, `de.inc`, `it.inc`: one `{ "English", "translation" },` pair a
+line); English is the code's own, and any text a table lacks shows in English.
+
+The English text is the key. A printf format is translated whole and filled
+afterwards, so a translation keeps the same `%` conversions in the same order;
+a text without arguments is printed through `"%s"`, so a `%` in a translation
+is never read as one. A plural is two texts (`"%d change"`, `"%d changes"`).
+Tables of names (k_meta, the `n_*` choices) stay English in the code and are
+translated where they are drawn, so a change of language shows at once. The
+row text the tests read (`RECOMP_OVERLAY_TEST`'s state) is the English.
+
+`tools/i18n_check.py` checks the tables against the code: the texts no table
+has (`--missing fr`), a text twice, a translation whose conversions differ.
+A title's own texts that go through it (a port's `BO3_TR`) are added with
+`--also <source>`.
+
+The labels are drawn in capitals: `caps()` raises Latin-1's letters too
+(`é` to `É`), so the translations' capitals are right.
 
 ### The title's own sprites and prompts
 

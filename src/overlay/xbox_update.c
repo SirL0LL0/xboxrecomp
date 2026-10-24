@@ -1,5 +1,6 @@
-/* The part of "Controlla gli aggiornamenti" that needs no network (xbox_update.h). */
+/* The part of "Check for updates" that needs no network (xbox_update.h). */
 #include "xbox_update.h"
+#include "xbox_i18n.h"          /* the player's words in the interface's language */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -251,41 +252,41 @@ void xbox_update_evaluate(int status, const char *transport_error, const char *b
     char tag[64], name[128], url[512], notes[4096];
     memset(r, 0, sizeof *r);
     if (!status) {
-        set_error(r, "Impossibile controllare: %s",
-                  transport_error && transport_error[0] ? transport_error : "nessuna risposta", 0);
+        set_error(r, TR("Could not check: %s"),
+                  transport_error && transport_error[0] ? transport_error : TR("no answer"), 0);
         return;
     }
     if (status == 404) {
         r->kind = XU_NONE;
-        snprintf(r->headline, sizeof r->headline, "Nessuna release pubblicata per ora");
+        snprintf(r->headline, sizeof r->headline, "%s", TR("No release published yet"));
         return;
     }
     if (status == 403 || status == 429) {
-        set_error(r, "Impossibile controllare: GitHub sta limitando le richieste (HTTP %d), riprova piu' tardi", NULL, status);
+        set_error(r, TR("Could not check: GitHub is limiting requests (HTTP %d), try again later"), NULL, status);
         return;
     }
     if (status != 200 || !body) {
-        set_error(r, "Impossibile controllare: GitHub ha risposto HTTP %d", NULL, status);
+        set_error(r, TR("Could not check: GitHub answered HTTP %d"), NULL, status);
         return;
     }
     if (!xbox_update_json_string(body, "tag_name", tag, sizeof tag)) {
-        set_error(r, "Impossibile controllare: %s", "la risposta non contiene nessuna release", 0);
+        set_error(r, TR("Could not check: %s"), TR("the answer has no release in it"), 0);
         return;
     }
     const char *shown = tag[0] == 'v' || tag[0] == 'V' ? tag + 1 : tag;
     int cmp = xbox_update_compare(tag, running_version);
     if (cmp == -2) {
-        set_error(r, "Impossibile controllare: il tag della release \"%s\" non e' una versione", tag, 0);
+        set_error(r, TR("Could not check: the release tag \"%s\" is not a version"), tag, 0);
         return;
     }
     if (cmp <= 0) {
         r->kind = XU_LATEST;
-        snprintf(r->headline, sizeof r->headline, "Hai l'ultima versione (%s)", running_version);
+        snprintf(r->headline, sizeof r->headline, TR("You have the latest version (%s)"), running_version);
         return;
     }
     r->kind = XU_NEWER;
     snprintf(r->tag, sizeof r->tag, "%s", tag);
-    snprintf(r->headline, sizeof r->headline, "La versione %.60s e' uscita (hai %.40s)", shown, running_version);
+    snprintf(r->headline, sizeof r->headline, TR("Version %.60s is out (you have %.40s)"), shown, running_version);
     if (xbox_update_json_string(body, "name", name, sizeof name) && name[0]
         && strcmp(name, tag) != 0 && strstr(r->headline, name) == NULL
         && strstr(name, shown) == NULL) {
